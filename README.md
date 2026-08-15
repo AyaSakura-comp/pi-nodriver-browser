@@ -60,6 +60,12 @@ export PI_NODRIVER_NO_SANDBOX=1
 
 Do not disable the sandbox on a normal workstation or server.
 
+Override the persistent profile directory when running concurrent or isolated sessions:
+
+```bash
+export PI_NODRIVER_PROFILE=/tmp/pi-browser-profile-$USER
+```
+
 ## Architecture
 
 ```mermaid

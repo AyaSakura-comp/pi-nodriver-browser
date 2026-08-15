@@ -6,7 +6,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import parse_command, format_snapshot, resolve_browser_executable, should_disable_sandbox
+from browser_logic import parse_command, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+
+
+class DevToolsPortTests(unittest.TestCase):
+    def test_parses_chrome_active_port_file(self):
+        self.assertEqual(parse_devtools_active_port('43127\n/devtools/browser/id\n'), 43127)
+
+    def test_rejects_invalid_active_port_file(self):
+        with self.assertRaises(ValueError):
+            parse_devtools_active_port('not-a-port\n')
 
 
 class ParseCommandTests(unittest.TestCase):
@@ -22,6 +31,10 @@ class ParseCommandTests(unittest.TestCase):
 
 
 class BrowserExecutableTests(unittest.TestCase):
+    def test_prefers_explicit_profile_directory(self):
+        with patch.dict(os.environ, {'PI_NODRIVER_PROFILE': '/tmp/custom-profile'}):
+            self.assertEqual(str(resolve_profile_dir()), '/tmp/custom-profile')
+
     def test_no_sandbox_is_opt_in(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(should_disable_sandbox())

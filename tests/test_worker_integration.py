@@ -2,6 +2,8 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,8 @@ MARKER = '__PI_NODRIVER__'
 class WorkerIntegrationTests(unittest.TestCase):
     def setUp(self):
         python = os.environ.get('NODRIVER_PYTHON', str(ROOT / '.venv/bin/python'))
+        self.temp_dir = tempfile.TemporaryDirectory()
+        env = {**os.environ, 'PI_NODRIVER_PROFILE': str(Path(self.temp_dir.name) / 'profile')}
         self.proc = subprocess.Popen(
             ['xvfb-run', '-a', '-s', '-screen 0 1280x900x24', python, str(ROOT / 'worker.py')],
             stdin=subprocess.PIPE,
@@ -21,15 +25,28 @@ class WorkerIntegrationTests(unittest.TestCase):
             text=True,
             bufsize=1,
             start_new_session=True,
+            env=env,
         )
 
     def tearDown(self):
-        if self.proc.poll() is None:
+        try:
             os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if self.proc.poll() is None:
             self.proc.wait(timeout=10)
+        for _ in range(20):
+            try:
+                os.killpg(self.proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.killpg(self.proc.pid, signal.SIGKILL)
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             if stream:
                 stream.close()
+        self.temp_dir.cleanup()
 
     def command(self, command):
         request_id = getattr(self, '_request_id', 0) + 1

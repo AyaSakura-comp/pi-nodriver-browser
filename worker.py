@@ -4,11 +4,12 @@ import json
 import logging
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import nodriver as uc
 
-from browser_logic import format_snapshot, parse_command, resolve_browser_executable, should_disable_sandbox
+from browser_logic import format_snapshot, parse_command, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 logging.basicConfig(level=logging.CRITICAL)
@@ -40,21 +41,65 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
 class BrowserWorker:
     def __init__(self):
         self.browser = None
+        self.launched_browser = None
         self.page = None
 
     async def ensure_browser(self):
         if self.browser is None:
-            profile = Path.home() / '.pi' / 'agent' / 'nodriver-profile'
+            profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
-            self.browser = await uc.start(
-                headless=False,
-                browser_executable_path=resolve_browser_executable(),
-                user_data_dir=str(profile),
-                browser_args=['--window-size=1440,1000', '--no-first-run', '--no-default-browser-check'],
-                sandbox=not should_disable_sandbox(),
-                lang='zh-TW',
-            )
+            try:
+                self.browser = await uc.start(
+                    headless=False,
+                    browser_executable_path=resolve_browser_executable(),
+                    user_data_dir=str(profile),
+                    browser_args=['--window-size=1440,1000', '--no-first-run', '--no-default-browser-check'],
+                    sandbox=not should_disable_sandbox(),
+                    lang='zh-TW',
+                )
+                self.launched_browser = self.browser
+            except Exception as startup_error:
+                # Nodriver 0.50.x waits less than three seconds for DevTools.
+                # On cold CI machines Chrome can become ready just after that
+                # deadline, so reconnect to the process Nodriver already started.
+                active_port_file = profile / 'DevToolsActivePort'
+                candidates = [
+                    browser for browser in uc.util.get_registered_instances()
+                    if getattr(browser.config, 'port', None)
+                    and Path(browser.config.user_data_dir) == profile
+                ]
+                if candidates:
+                    self.launched_browser = max(candidates, key=lambda browser: browser._process_pid or 0)
+                for _ in range(150):
+                    await asyncio.sleep(0.1)
+                    try:
+                        if self.launched_browser is not None:
+                            port = self.launched_browser.config.port
+                        else:
+                            port = parse_devtools_active_port(active_port_file.read_text())
+                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=0.2) as response:
+                            if not json.load(response).get('webSocketDebuggerUrl'):
+                                continue
+                        self.browser = await uc.start(host='127.0.0.1', port=port)
+                        break
+                    except Exception:
+                        continue
+                if self.browser is None:
+                    raise startup_error
         return self.browser
+
+    async def shutdown_browser(self):
+        if self.browser is not None:
+            try:
+                await self.browser.send(uc.cdp.browser.close())
+            except Exception:
+                pass
+            self.browser.stop()
+            if self.launched_browser is not None and self.launched_browser is not self.browser:
+                self.launched_browser.stop()
+            self.browser = None
+            self.launched_browser = None
+            self.page = None
 
     async def require_page(self):
         if self.page is None:
@@ -194,19 +239,13 @@ class BrowserWorker:
             return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
 
         if action == 'close':
-            if self.browser is not None:
-                self.browser.stop()
-            self.browser = None
-            self.page = None
+            await self.shutdown_browser()
             return {'text': 'Browser closed', 'action': action}
 
         raise ValueError(f'unsupported browser command: {action}')
 
     async def close(self):
-        if self.browser is not None:
-            self.browser.stop()
-            self.browser = None
-            self.page = None
+        await self.shutdown_browser()
 
 
 async def main():

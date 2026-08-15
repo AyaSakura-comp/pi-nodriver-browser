@@ -1,10 +1,23 @@
 import os
 import shlex
 import shutil
+from pathlib import Path
+
+
+def parse_devtools_active_port(content: str) -> int:
+    port = int(content.splitlines()[0])
+    if not 1 <= port <= 65535:
+        raise ValueError('DevTools port is out of range')
+    return port
 
 
 def should_disable_sandbox() -> bool:
     return os.environ.get('PI_NODRIVER_NO_SANDBOX', '').lower() in {'1', 'true', 'yes'}
+
+
+def resolve_profile_dir() -> Path:
+    configured = os.environ.get('PI_NODRIVER_PROFILE')
+    return Path(configured).expanduser() if configured else Path.home() / '.pi' / 'agent' / 'nodriver-profile'
 
 
 def resolve_browser_executable() -> str:
