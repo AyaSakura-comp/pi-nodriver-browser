@@ -49,6 +49,8 @@ def parse_command(command: str) -> list[str]:
     parts = shlex.split(command)
     if not parts:
         raise ValueError('empty browser command')
+    if any(token in {'&&', '||', ';', '|'} for token in parts):
+        raise ValueError('run exactly one browser command per tool call; command chaining is not supported')
     return parts
 
 

@@ -37,6 +37,8 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('createConnection', extension_source)
             self.assertIn('--server', extension_source)
             self.assertIn('worker.disconnect()', extension_source)
+            self.assertIn('ctx.sessionManager.getSessionId()', extension_source)
+            self.assertIn('sessionId', extension_source)
             updated = json.loads(settings.read_text())
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())

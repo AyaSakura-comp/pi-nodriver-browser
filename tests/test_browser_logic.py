@@ -41,6 +41,10 @@ class ParseCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'empty browser command'):
             parse_command('   ')
 
+    def test_rejects_shell_style_command_chaining(self):
+        with self.assertRaisesRegex(ValueError, 'one browser command'):
+            parse_command('wait 2000 && screenshot')
+
 
 class BrowserExecutableTests(unittest.TestCase):
     def test_prefers_explicit_profile_directory(self):

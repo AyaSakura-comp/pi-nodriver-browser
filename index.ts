@@ -30,7 +30,7 @@ Commands:
   wait <@ref|ms> - Wait for an element or milliseconds
   dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
   screenshot [--full] - Capture screenshot and return it inline
-  close - Close Chrome while leaving the daemon available
+  close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes.`;
 
@@ -141,7 +141,7 @@ class NodriverWorker {
     return this.connecting;
   }
 
-  async request(command: string, signal?: AbortSignal): Promise<WorkerResponse> {
+  async request(command: string, sessionId: string, signal?: AbortSignal): Promise<WorkerResponse> {
     const socket = await this.connection();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -158,7 +158,7 @@ class NodriverWorker {
       };
       signal?.addEventListener("abort", abort, { once: true });
 
-      socket.write(`${JSON.stringify({ id, command })}\n`, (error) => {
+      socket.write(`${JSON.stringify({ id, command, sessionId })}\n`, (error) => {
         if (error) {
           clearTimeout(timer);
           this.pending.delete(id);
@@ -187,13 +187,16 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes.",
+      "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
+      "Browser close affects only the current Pi session tab; browser shutdown stops the shared daemon for every session.",
     ],
     parameters: Type.Object({
       command: Type.String({ description: "Nodriver browser command, without a prefix" }),
     }),
 
-    async execute(_toolCallId, params, signal) {
-      const run = async () => worker.request(params.command.trim(), signal);
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const run = async () => worker.request(params.command.trim(), sessionId, signal);
       const responsePromise = queue.then(run, run);
       queue = responsePromise.catch(() => undefined);
       const response = await responsePromise;

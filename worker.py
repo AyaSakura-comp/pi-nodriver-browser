@@ -115,7 +115,7 @@ class BrowserWorker:
     def __init__(self):
         self.browser = None
         self.launched_browser = None
-        self.page = None
+        self.pages = {}
 
     async def ensure_browser(self):
         if self.browser is None:
@@ -172,22 +172,23 @@ class BrowserWorker:
                 self.launched_browser.stop()
             self.browser = None
             self.launched_browser = None
-            self.page = None
+            self.pages.clear()
 
-    async def require_page(self):
-        if self.page is None:
-            raise ValueError('browser has no open page; run open <url> first')
-        return self.page
+    async def require_page(self, session_id):
+        page = self.pages.get(session_id)
+        if page is None:
+            raise ValueError('this Pi session has no open page; run open <url> first')
+        return page
 
-    async def element(self, ref):
-        page = await self.require_page()
+    async def element(self, session_id, ref):
+        page = await self.require_page(session_id)
         normalized = ref.removeprefix('@')
         element = await page.select(f'[data-pi-ref="{normalized}"]')
         if not element:
             raise ValueError(f'element {ref} not found; run snapshot -i again')
         return element
 
-    async def execute(self, command):
+    async def execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
 
@@ -195,18 +196,25 @@ class BrowserWorker:
             if len(parts) != 2:
                 raise ValueError('usage: open <url>')
             browser = await self.ensure_browser()
-            self.page = await browser.get(parts[1])
-            await self.page.sleep(2)
-            return {'text': f'Opened {self.page.url or parts[1]}', 'action': action, 'url': self.page.url or parts[1]}
+            previous = self.pages.get(session_id)
+            page = await browser.get(parts[1], new_tab=True)
+            self.pages[session_id] = page
+            if previous is not None:
+                try:
+                    await previous.close()
+                except Exception:
+                    pass
+            await page.sleep(2)
+            return {'text': f'Opened {page.url or parts[1]}', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             return {'text': format_snapshot(elements or []), 'action': action, 'count': len(elements or [])}
 
         if action == 'dismiss':
             policy = parse_dismiss_options(parts)
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             dismissed = []
             remaining = 0
             script = DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', json.dumps(policy))
@@ -237,23 +245,25 @@ class BrowserWorker:
         if action == 'click':
             if len(parts) != 2:
                 raise ValueError('usage: click <@ref>')
-            element = await self.element(parts[1])
+            page = await self.require_page(session_id)
+            element = await self.element(session_id, parts[1])
             before_tabs = len(self.browser.tabs)
-            await self.page.bring_to_front()
+            await page.bring_to_front()
             await element.scroll_into_view()
-            await self.page.sleep(0.2)
+            await page.sleep(0.2)
             await element.mouse_click()
-            await self.page.sleep(2)
+            await page.sleep(2)
             if len(self.browser.tabs) > before_tabs:
-                self.page = self.browser.tabs[-1]
-                await self.page.bring_to_front()
-                await self.page.sleep(2)
-            return {'text': f'Clicked {parts[1]}\nURL: {self.page.url}', 'action': action, 'url': self.page.url}
+                page = self.browser.tabs[-1]
+                self.pages[session_id] = page
+                await page.bring_to_front()
+                await page.sleep(2)
+            return {'text': f'Clicked {parts[1]}\nURL: {page.url}', 'action': action, 'url': page.url}
 
         if action in ('fill', 'type'):
             if len(parts) < 3:
                 raise ValueError(f'usage: {action} <@ref> <text>')
-            element = await self.element(parts[1])
+            element = await self.element(session_id, parts[1])
             text = ' '.join(parts[2:])
             await element.focus()
             if action == 'fill':
@@ -264,7 +274,8 @@ class BrowserWorker:
         if action == 'select':
             if len(parts) < 3:
                 raise ValueError('usage: select <@ref> <value>')
-            select_element = await self.element(parts[1])
+            page = await self.require_page(session_id)
+            select_element = await self.element(session_id, parts[1])
             wanted = ' '.join(parts[2:])
             options = await select_element.query_selector_all('option')
             match = next((o for o in options if wanted == (o.text_all or '').strip() or wanted == (o.attrs or {}).get('value')), None)
@@ -273,7 +284,7 @@ class BrowserWorker:
             if not match:
                 raise ValueError(f'option not found: {wanted}')
             await match.select_option()
-            await self.page.sleep(2)
+            await page.sleep(2)
             return {'text': f'Selected "{(match.text_all or wanted).strip()}"', 'action': action}
 
         if action == 'press':
@@ -281,14 +292,14 @@ class BrowserWorker:
                 raise ValueError('usage: press <key>')
             key_map = {'enter': '\n', 'tab': '\t', 'space': ' ', 'backspace': '\b'}
             key = key_map.get(parts[1].lower(), parts[1])
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             focused = await page.select(':focus') or await page.select('body')
             await focused.send_keys(key)
             await page.sleep(1)
             return {'text': f'Pressed {parts[1]}', 'action': action}
 
         if action == 'scroll':
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             direction = parts[1].lower() if len(parts) > 1 else 'down'
             amount = int(parts[2]) if len(parts) > 2 else 600
             if direction == 'down':
@@ -305,14 +316,14 @@ class BrowserWorker:
         if action == 'get':
             if len(parts) < 2:
                 raise ValueError('usage: get text|url|title [@ref]')
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             kind = parts[1].lower()
             if kind == 'url':
                 text = page.url
             elif kind == 'title':
                 text = await page.evaluate('document.title')
             elif kind == 'text' and len(parts) > 2:
-                text = (await self.element(parts[2])).text_all or ''
+                text = (await self.element(session_id, parts[2])).text_all or ''
             elif kind == 'text':
                 text = await page.evaluate('document.body.innerText')
             else:
@@ -320,12 +331,12 @@ class BrowserWorker:
             return {'text': str(text).strip(), 'action': action}
 
         if action == 'wait':
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             target = parts[1] if len(parts) > 1 else '1000'
             if target.startswith('@'):
                 for _ in range(100):
                     try:
-                        await self.element(target)
+                        await self.element(session_id, target)
                         return {'text': f'Element {target} is available', 'action': action}
                     except ValueError:
                         await page.sleep(0.1)
@@ -334,17 +345,25 @@ class BrowserWorker:
             return {'text': f'Waited {target}ms', 'action': action}
 
         if action == 'screenshot':
-            page = await self.require_page()
+            page = await self.require_page(session_id)
             full_page = '--full' in parts[1:]
             output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
             output = output_dir / 'screenshot.png'
             await page.save_screenshot(output, format='png', full_page=full_page)
             return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
 
-        if action in {'close', 'shutdown'}:
+        if action == 'close':
+            page = self.pages.pop(session_id, None)
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            return {'text': 'Current Pi session tab closed', 'action': action}
+
+        if action == 'shutdown':
             await self.shutdown_browser()
-            text = 'Browser closed' if action == 'close' else 'Browser daemon shutting down'
-            return {'text': text, 'action': action}
+            return {'text': 'Browser daemon shutting down', 'action': action}
 
         raise ValueError(f'unsupported browser command: {action}')
 
@@ -353,9 +372,10 @@ class BrowserWorker:
 
 
 async def execute_request(worker, request):
+    session_id = str(request.get('sessionId') or 'default')
     try:
-        result = await worker.execute(request.get('command', ''))
-        return {'id': request.get('id'), 'ok': True, **result}
+        result = await worker.execute(request.get('command', ''), session_id=session_id)
+        return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **result}
     except Exception as error:
         return {'id': request.get('id'), 'ok': False, 'error': f'{type(error).__name__}: {error}'}
 

@@ -48,20 +48,60 @@ class DaemonIntegrationTests(unittest.TestCase):
         if self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGTERM)
             self.proc.wait(timeout=10)
+        for _ in range(20):
+            try:
+                os.killpg(self.proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.killpg(self.proc.pid, signal.SIGKILL)
         if self.proc.stderr:
             self.proc.stderr.close()
         self.temp_dir.cleanup()
 
-    def command(self, command, request_id=1):
+    def command(self, command, request_id=1, session_id='test-session'):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(self.socket_path))
-            client.sendall((json.dumps({'id': request_id, 'command': command}) + '\n').encode())
+            request = {'id': request_id, 'command': command, 'sessionId': session_id}
+            client.sendall((json.dumps(request) + '\n').encode())
             stream = client.makefile()
             line = stream.readline()
         self.assertTrue(line.startswith(MARKER), line)
         response = json.loads(line[len(MARKER):])
         self.assertTrue(response.get('ok'), response.get('error'))
         return response
+
+    def test_sessions_keep_independent_active_pages(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
+        self.command(f'open {fixture_url}', session_id='session-a')
+        self.command('snapshot -i', request_id=2, session_id='session-a')
+        self.command('click @e2', request_id=3, session_id='session-a')
+        self.command(f'open {overlay_url}', request_id=4, session_id='session-b')
+
+        session_a = self.command('get text', request_id=5, session_id='session-a')
+        session_b = self.command('get text', request_id=6, session_id='session-b')
+        screenshot = self.command('screenshot', request_id=7, session_id='session-a')
+
+        self.assertIn('clicked', session_a['text'])
+        self.assertNotIn('9 折優惠', session_a['text'])
+        self.assertIn('9 折優惠', session_b['text'])
+        screenshot_path = Path(screenshot['screenshotPath'])
+        self.assertTrue(screenshot_path.is_file())
+        self.assertGreater(screenshot_path.stat().st_size, 100)
+
+    def test_closing_one_session_keeps_other_session_page_alive(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
+        self.command(f'open {fixture_url}', session_id='session-a')
+        self.command(f'open {overlay_url}', request_id=2, session_id='session-b')
+
+        self.command('close', request_id=3, session_id='session-a')
+        session_b = self.command('get text', request_id=4, session_id='session-b')
+
+        self.assertIn('9 折優惠', session_b['text'])
+        self.assertIsNone(self.proc.poll())
 
     def test_shutdown_command_stops_daemon(self):
         response = self.command('shutdown')
