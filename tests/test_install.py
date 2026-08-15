@@ -26,10 +26,17 @@ class InstallerTests(unittest.TestCase):
 
             subprocess.run([str(ROOT / 'install.sh')], cwd=ROOT, env=env, check=True)
 
+            installer_source = (ROOT / 'install.sh').read_text()
+            self.assertIn('PI_NODRIVER_SOCKET', installer_source)
+            self.assertIn("'command': 'shutdown'", installer_source)
             extension = agent_dir / 'extensions/nodriver-browser'
             self.assertTrue((extension / 'index.ts').is_file())
             self.assertTrue((extension / 'worker.py').is_file())
             self.assertTrue((extension / 'browser_logic.py').is_file())
+            extension_source = (extension / 'index.ts').read_text()
+            self.assertIn('createConnection', extension_source)
+            self.assertIn('--server', extension_source)
+            self.assertIn('worker.disconnect()', extension_source)
             updated = json.loads(settings.read_text())
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())

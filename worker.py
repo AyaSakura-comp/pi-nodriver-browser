@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import asyncio
+import fcntl
 import json
 import logging
+import signal
 import sys
 import tempfile
 import urllib.request
@@ -339,9 +341,10 @@ class BrowserWorker:
             await page.save_screenshot(output, format='png', full_page=full_page)
             return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
 
-        if action == 'close':
+        if action in {'close', 'shutdown'}:
             await self.shutdown_browser()
-            return {'text': 'Browser closed', 'action': action}
+            text = 'Browser closed' if action == 'close' else 'Browser daemon shutting down'
+            return {'text': text, 'action': action}
 
         raise ValueError(f'unsupported browser command: {action}')
 
@@ -349,23 +352,78 @@ class BrowserWorker:
         await self.shutdown_browser()
 
 
-async def main():
+async def execute_request(worker, request):
+    try:
+        result = await worker.execute(request.get('command', ''))
+        return {'id': request.get('id'), 'ok': True, **result}
+    except Exception as error:
+        return {'id': request.get('id'), 'ok': False, 'error': f'{type(error).__name__}: {error}'}
+
+
+async def stdio_main():
     worker = BrowserWorker()
     try:
         while True:
             line = await asyncio.to_thread(sys.stdin.readline)
             if not line:
                 break
-            request = json.loads(line)
-            try:
-                result = await worker.execute(request.get('command', ''))
-                response = {'id': request.get('id'), 'ok': True, **result}
-            except Exception as error:
-                response = {'id': request.get('id'), 'ok': False, 'error': f'{type(error).__name__}: {error}'}
+            response = await execute_request(worker, json.loads(line))
             print(MARKER + json.dumps(response, ensure_ascii=False), flush=True)
     finally:
         await worker.close()
 
 
+async def server_main(socket_path):
+    worker = BrowserWorker()
+    command_lock = asyncio.Lock()
+    stop = asyncio.Event()
+    path = Path(socket_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = path.with_name(path.name + '.lock').open('a+')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return
+    path.unlink(missing_ok=True)
+
+    async def handle_client(reader, writer):
+        try:
+            while line := await reader.readline():
+                async with command_lock:
+                    response = await execute_request(worker, json.loads(line))
+                writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
+                await writer.drain()
+                if response.get('action') == 'shutdown':
+                    stop.set()
+                    break
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    loop = asyncio.get_running_loop()
+    for signal_value in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signal_value, stop.set)
+        except NotImplementedError:
+            pass
+
+    server = await asyncio.start_unix_server(handle_client, path=str(path))
+    path.chmod(0o600)
+    try:
+        async with server:
+            await stop.wait()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await worker.close()
+        path.unlink(missing_ok=True)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
 if __name__ == '__main__':
-    uc.loop().run_until_complete(main())
+    if len(sys.argv) == 3 and sys.argv[1] == '--server':
+        uc.loop().run_until_complete(server_main(sys.argv[2]))
+    else:
+        uc.loop().run_until_complete(stdio_main())

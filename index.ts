@@ -1,6 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { extname, join } from "node:path";
+import { createConnection, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -11,6 +13,7 @@ const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PYTHON = join(ROOT, ".venv", "bin", "python");
 const WORKER = join(ROOT, "worker.py");
 const MARKER = "__PI_NODRIVER__";
+const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
 const DESCRIPTION = `Browser automation through a persistent, headful Google Chrome controlled by Nodriver under Xvfb.
 Workflow: open URL → snapshot -i (get @refs like @e1) → interact → re-snapshot after page changes.
@@ -27,7 +30,8 @@ Commands:
   wait <@ref|ms> - Wait for an element or milliseconds
   dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
   screenshot [--full] - Capture screenshot and return it inline
-  close - Close Chrome
+  close - Close Chrome while leaving the daemon available
+  shutdown - Close Chrome and stop the persistent browser daemon
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes.`;
 
 type WorkerResponse = {
@@ -41,35 +45,39 @@ type WorkerResponse = {
 };
 
 class NodriverWorker {
-  private process?: ChildProcessWithoutNullStreams;
+  private socket?: Socket;
+  private connecting?: Promise<Socket>;
   private nextId = 1;
   private pending = new Map<number, { resolve: (value: WorkerResponse) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  private stderr = "";
 
-  private start() {
-    if (this.process && this.process.exitCode === null) return;
-    if (!existsSync(PYTHON)) {
-      throw new Error(`Nodriver browser environment is missing. Run: python3 -m venv ${join(ROOT, ".venv")} && ${PYTHON} -m pip install nodriver`);
-    }
-
-    this.stderr = "";
-    this.process = spawn("xvfb-run", ["-a", "-s", "-screen 0 1440x1000x24", PYTHON, WORKER], {
-      cwd: ROOT,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
+  private openSocket(): Promise<Socket> {
+    return new Promise((resolve, reject) => {
+      const socket = createConnection(SOCKET);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`Timed out connecting to browser daemon: ${SOCKET}`));
+      }, 500);
+      socket.once("connect", () => {
+        clearTimeout(timer);
+        resolve(socket);
+      });
+      socket.once("error", (error) => {
+        clearTimeout(timer);
+        socket.destroy();
+        reject(error);
+      });
     });
+  }
 
-    this.process.stderr.on("data", (chunk) => {
-      this.stderr = (this.stderr + chunk.toString()).slice(-12000);
-    });
-
-    const lines = createInterface({ input: this.process.stdout });
+  private attach(socket: Socket) {
+    this.socket = socket;
+    const lines = createInterface({ input: socket });
     lines.on("line", (line) => {
       if (!line.startsWith(MARKER)) return;
       let response: WorkerResponse;
       try {
         response = JSON.parse(line.slice(MARKER.length));
-      } catch (error) {
+      } catch {
         return;
       }
       const request = this.pending.get(response.id);
@@ -79,22 +87,62 @@ class NodriverWorker {
       if (response.ok) request.resolve(response);
       else request.reject(new Error(response.error || "Nodriver command failed"));
     });
-
-    this.process.on("exit", (code, signal) => {
-      const detail = this.stderr.trim();
-      const error = new Error(`Nodriver worker exited (${code ?? signal ?? "unknown"})${detail ? `: ${detail}` : ""}`);
+    socket.on("error", () => undefined);
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      const error = new Error("Browser daemon connection closed");
       for (const request of this.pending.values()) {
         clearTimeout(request.timer);
         request.reject(error);
       }
       this.pending.clear();
-      this.process = undefined;
     });
   }
 
-  request(command: string, signal?: AbortSignal): Promise<WorkerResponse> {
-    this.start();
-    const process = this.process!;
+  private async connectOrStart(): Promise<Socket> {
+    if (!existsSync(PYTHON)) {
+      throw new Error(`Nodriver browser environment is missing. Run: python3 -m venv ${join(ROOT, ".venv")} && ${PYTHON} -m pip install nodriver`);
+    }
+    try {
+      const socket = await this.openSocket();
+      this.attach(socket);
+      return socket;
+    } catch {
+      const daemon = spawn(
+        "xvfb-run",
+        ["-a", "-s", "-screen 0 1440x1000x24", PYTHON, WORKER, "--server", SOCKET],
+        { cwd: ROOT, stdio: "ignore", detached: true },
+      );
+      daemon.unref();
+    }
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try {
+        const socket = await this.openSocket();
+        this.attach(socket);
+        return socket;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("Browser daemon did not start");
+  }
+
+  private async connection(): Promise<Socket> {
+    if (this.socket && !this.socket.destroyed) return this.socket;
+    if (!this.connecting) {
+      this.connecting = this.connectOrStart().finally(() => {
+        this.connecting = undefined;
+      });
+    }
+    return this.connecting;
+  }
+
+  async request(command: string, signal?: AbortSignal): Promise<WorkerResponse> {
+    const socket = await this.connection();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -106,12 +154,11 @@ class NodriverWorker {
       const abort = () => {
         clearTimeout(timer);
         this.pending.delete(id);
-        this.stop();
         reject(new Error("Browser command cancelled"));
       };
       signal?.addEventListener("abort", abort, { once: true });
 
-      process.stdin.write(`${JSON.stringify({ id, command })}\n`, (error) => {
+      socket.write(`${JSON.stringify({ id, command })}\n`, (error) => {
         if (error) {
           clearTimeout(timer);
           this.pending.delete(id);
@@ -121,16 +168,10 @@ class NodriverWorker {
     });
   }
 
-  stop() {
-    const child = this.process;
-    this.process = undefined;
-    if (child && child.exitCode === null && child.pid) {
-      try {
-        process.kill(-child.pid, "SIGTERM");
-      } catch {
-        child.kill("SIGTERM");
-      }
-    }
+  disconnect() {
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.destroy();
   }
 }
 
@@ -184,6 +225,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    worker.stop();
+    worker.disconnect();
   });
 }

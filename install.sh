@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PI_AGENT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}"
 TARGET="$PI_AGENT_DIR/extensions/nodriver-browser"
 SETTINGS="$PI_AGENT_DIR/settings.json"
+PI_NODRIVER_SOCKET="${PI_NODRIVER_SOCKET:-$PI_AGENT_DIR/nodriver-browser.sock}"
 
 if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
   for command in python3 xvfb-run; do
@@ -21,6 +22,25 @@ if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
     echo "Chrome/Chromium was not found. Install it or set PI_NODRIVER_CHROME." >&2
     exit 1
   fi
+fi
+
+if [[ -S "$PI_NODRIVER_SOCKET" ]]; then
+  python3 - "$PI_NODRIVER_SOCKET" <<'PY' || true
+import json
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(3)
+client.connect(sys.argv[1])
+client.sendall((json.dumps({'id': 0, 'command': 'shutdown'}) + '\n').encode())
+client.recv(4096)
+client.close()
+PY
+  for _ in {1..30}; do
+    [[ ! -S "$PI_NODRIVER_SOCKET" ]] && break
+    sleep 0.1
+  done
 fi
 
 mkdir -p "$TARGET"
