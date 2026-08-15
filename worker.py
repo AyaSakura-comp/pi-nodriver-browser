@@ -51,7 +51,7 @@ class BrowserWorker:
                 browser_executable_path=resolve_browser_executable(),
                 user_data_dir=str(profile),
                 browser_args=['--window-size=1440,1000', '--no-first-run', '--no-default-browser-check'],
-                no_sandbox=should_disable_sandbox(),
+                sandbox=not should_disable_sandbox(),
                 lang='zh-TW',
             )
         return self.browser
