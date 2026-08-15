@@ -27,4 +27,5 @@ jobs:
         env:
           RUN_BROWSER_INTEGRATION: "1"
           NODRIVER_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          PI_NODRIVER_NO_SANDBOX: "1"
         run: python3 -m unittest discover -s tests -p 'test_worker_integration.py' -v

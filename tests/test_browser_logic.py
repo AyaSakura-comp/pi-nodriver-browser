@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import parse_command, format_snapshot, resolve_browser_executable
+from browser_logic import parse_command, format_snapshot, resolve_browser_executable, should_disable_sandbox
 
 
 class ParseCommandTests(unittest.TestCase):
@@ -22,6 +22,12 @@ class ParseCommandTests(unittest.TestCase):
 
 
 class BrowserExecutableTests(unittest.TestCase):
+    def test_no_sandbox_is_opt_in(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(should_disable_sandbox())
+        with patch.dict(os.environ, {'PI_NODRIVER_NO_SANDBOX': '1'}):
+            self.assertTrue(should_disable_sandbox())
+
     def test_prefers_explicit_browser_path(self):
         with patch.dict(os.environ, {'PI_NODRIVER_CHROME': '/custom/chrome'}):
             self.assertEqual(resolve_browser_executable(), '/custom/chrome')

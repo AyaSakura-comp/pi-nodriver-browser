@@ -52,6 +52,14 @@ Example custom browser path:
 export PI_NODRIVER_CHROME=/opt/google/chrome/google-chrome
 ```
 
+Some restricted containers cannot use Chrome's sandbox. Only in such an isolated environment, opt out explicitly:
+
+```bash
+export PI_NODRIVER_NO_SANDBOX=1
+```
+
+Do not disable the sandbox on a normal workstation or server.
+
 ## Architecture
 
 ```mermaid
@@ -222,6 +230,7 @@ The integration test opens a local HTML fixture, snapshots its controls, clicks 
 - `snapshot -i` references are page-state dependent; re-snapshot after navigation.
 - Only one command runs at a time within an extension instance.
 - The current implementation targets Linux/Xvfb. Native macOS and Windows display backends are not implemented.
+- `PI_NODRIVER_NO_SANDBOX=1` weakens Chrome process isolation and should only be used inside an already-isolated CI/container environment.
 
 ## License
 

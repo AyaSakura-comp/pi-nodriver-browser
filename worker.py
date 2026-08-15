@@ -8,7 +8,7 @@ from pathlib import Path
 
 import nodriver as uc
 
-from browser_logic import format_snapshot, parse_command, resolve_browser_executable
+from browser_logic import format_snapshot, parse_command, resolve_browser_executable, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 logging.basicConfig(level=logging.CRITICAL)
@@ -51,6 +51,7 @@ class BrowserWorker:
                 browser_executable_path=resolve_browser_executable(),
                 user_data_dir=str(profile),
                 browser_args=['--window-size=1440,1000', '--no-first-run', '--no-default-browser-check'],
+                no_sandbox=should_disable_sandbox(),
                 lang='zh-TW',
             )
         return self.browser
@@ -90,7 +91,9 @@ class BrowserWorker:
                 raise ValueError('usage: click <@ref>')
             element = await self.element(parts[1])
             before_tabs = len(self.browser.tabs)
+            await self.page.bring_to_front()
             await element.scroll_into_view()
+            await self.page.sleep(0.2)
             await element.mouse_click()
             await self.page.sleep(2)
             if len(self.browser.tabs) > before_tabs:

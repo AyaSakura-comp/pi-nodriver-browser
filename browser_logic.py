@@ -3,6 +3,10 @@ import shlex
 import shutil
 
 
+def should_disable_sandbox() -> bool:
+    return os.environ.get('PI_NODRIVER_NO_SANDBOX', '').lower() in {'1', 'true', 'yes'}
+
+
 def resolve_browser_executable() -> str:
     configured = os.environ.get('PI_NODRIVER_CHROME')
     if configured:
