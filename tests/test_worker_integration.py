@@ -65,6 +65,23 @@ class WorkerIntegrationTests(unittest.TestCase):
                     self.fail(response.get('error', 'worker command failed'))
                 return response
 
+    def test_dismisses_cookie_and_marketing_overlays_safely(self):
+        fixture_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+        result = self.command('dismiss overlays --cookies=accept')['text']
+        self.assertIn('cookie', result)
+        self.assertIn('同意', result)
+        self.assertIn('不用，謝謝', result)
+
+        page_text = self.command('get text')['text']
+        self.assertNotIn('網站使用了 Cookie', page_text)
+        self.assertNotIn('9 折優惠', page_text)
+        self.assertIn('Product survey', page_text)
+        self.assertIn('Next step', page_text)
+        self.assertNotIn('Next step', result)
+        self.assertIn('Buy product', page_text)
+
     def test_opens_snapshots_clicks_and_reads_page(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         self.command(f'open {fixture_url}')

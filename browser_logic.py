@@ -31,6 +31,20 @@ def resolve_browser_executable() -> str:
     raise RuntimeError('Chrome or Chromium was not found; set PI_NODRIVER_CHROME')
 
 
+def parse_dismiss_options(parts: list[str]) -> str:
+    if parts[:2] != ['dismiss', 'overlays']:
+        raise ValueError('usage: dismiss overlays [--cookies=accept|reject-optional|ignore]')
+    policy = 'reject-optional'
+    for option in parts[2:]:
+        if option.startswith('--cookies='):
+            policy = option.split('=', 1)[1]
+        else:
+            raise ValueError(f'unknown dismiss option: {option}')
+    if policy not in {'accept', 'reject-optional', 'ignore'}:
+        raise ValueError(f'unsupported cookie policy: {policy}')
+    return policy
+
+
 def parse_command(command: str) -> list[str]:
     parts = shlex.split(command)
     if not parts:

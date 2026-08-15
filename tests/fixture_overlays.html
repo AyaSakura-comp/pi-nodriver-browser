@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<body>
+  <main><button id="buy">Buy product</button></main>
+  <section class="marketing-modal" role="dialog" aria-modal="true">
+    <h2>不想錯過 9 折優惠嗎？</h2>
+    <button onclick="this.closest('section').remove()">是</button>
+    <button onclick="this.closest('section').remove()">不用，謝謝</button>
+  </section>
+  <section class="survey-modal" role="dialog" aria-modal="true">
+    <h2>Product survey</h2>
+    <button onclick="this.closest('section').remove()">Next step</button>
+  </section>
+  <aside class="cookie-banner" style="position:fixed;z-index:9999;bottom:0">
+    <p>為了提供更優質的購物體驗，我們網站使用了 Cookie。</p>
+    <button onclick="this.closest('aside').remove()">同意</button>
+  </aside>
+</body>
+</html>

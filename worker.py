@@ -9,10 +9,81 @@ from pathlib import Path
 
 import nodriver as uc
 
-from browser_logic import format_snapshot, parse_command, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import format_snapshot, parse_command, parse_devtools_active_port, parse_dismiss_options, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 logging.basicConfig(level=logging.CRITICAL)
+
+DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
+  document.querySelectorAll('[data-pi-dismiss-ref]').forEach(el => el.removeAttribute('data-pi-dismiss-ref'));
+
+  const visible = el => {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+  };
+  const normalize = value => (value || '').toLowerCase()
+    .replace(/[\\s,，.!！。:：;；_\\-]+/g, '');
+  const label = el => (el.innerText || el.textContent || el.value ||
+    el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+  const matches = (value, patterns) => {
+    const normalized = normalize(value);
+    return patterns.some(pattern => {
+      const expected = normalize(pattern);
+      const mayContain = expected.length >= 3 || /[^\\x00-\\x7f]/.test(expected);
+      return normalized === expected || (mayContain && normalized.includes(expected));
+    });
+  };
+  const controls = container => Array.from(container.querySelectorAll(
+    'button,a,input[type="button"],input[type="submit"],[role="button"],[aria-label],[class*="close" i]'
+  )).filter(visible);
+
+  const containers = Array.from(new Set(Array.from(document.querySelectorAll(
+    'dialog,[role="dialog"],[aria-modal="true"],[class*="modal" i],[id*="modal" i],' +
+    '[class*="popup" i],[id*="popup" i],[class*="overlay" i],[id*="overlay" i],' +
+    '[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]'
+  )).filter(visible)));
+
+  const cookieWords = ['cookie', 'cookies', '餅乾', 'クッキー', '쿠키'];
+  const cookieContainers = containers.filter(container => matches(container.innerText || container.textContent, cookieWords));
+  const otherContainers = containers.filter(container => !cookieContainers.includes(container));
+  const acceptCookie = ['同意', '接受全部', '全部接受', '我同意', 'acceptall', 'allowall', 'agree', 'gotit', 'ok'];
+  const rejectCookie = ['拒絕非必要', '僅必要', '只接受必要', '只允許必要', 'rejectall', 'declineall', 'necessaryonly', 'essentialonly'];
+  const declineMarketing = ['不用謝謝', '不用，謝謝', '不需要謝謝', '稍後', '暫時不要', 'nothanks', 'notnow', 'maybelater', 'skip'];
+  const closeWords = ['關閉', 'close', 'dismiss', '×', '✕', 'x'];
+
+  let candidate = null;
+  if (policy !== 'ignore') {
+    const cookiePatterns = policy === 'accept' ? acceptCookie : rejectCookie;
+    for (const container of cookieContainers) {
+      const element = controls(container).find(el => matches(label(el), cookiePatterns));
+      if (element) {
+        candidate = { element, kind: 'cookie', label: label(element) };
+        break;
+      }
+    }
+  }
+
+  if (!candidate) {
+    for (const container of otherContainers) {
+      const available = controls(container);
+      const element = available.find(el => matches(label(el), declineMarketing)) ||
+        available.find(el => matches(label(el), closeWords));
+      if (element) {
+        candidate = { element, kind: 'overlay', label: label(element) };
+        break;
+      }
+    }
+  }
+
+  if (!candidate) return { candidate: null, overlayCount: containers.length };
+  candidate.element.setAttribute('data-pi-dismiss-ref', 'active');
+  return {
+    candidate: { ref: 'active', kind: candidate.kind, label: candidate.label },
+    overlayCount: containers.length
+  };
+})(__PI_COOKIE_POLICY__))'''
 
 SNAPSHOT_JS = r'''JSON.stringify((() => {
   document.querySelectorAll('[data-pi-ref]').forEach(el => el.removeAttribute('data-pi-ref'));
@@ -130,6 +201,36 @@ class BrowserWorker:
             page = await self.require_page()
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             return {'text': format_snapshot(elements or []), 'action': action, 'count': len(elements or [])}
+
+        if action == 'dismiss':
+            policy = parse_dismiss_options(parts)
+            page = await self.require_page()
+            dismissed = []
+            remaining = 0
+            script = DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', json.dumps(policy))
+            for _ in range(8):
+                result = json.loads(await page.evaluate(script))
+                remaining = result.get('overlayCount', 0)
+                candidate = result.get('candidate')
+                if not candidate:
+                    break
+                element = await page.select('[data-pi-dismiss-ref="active"]')
+                if not element:
+                    break
+                await page.bring_to_front()
+                await element.scroll_into_view()
+                await page.sleep(0.2)
+                await element.mouse_click()
+                dismissed.append(candidate)
+                await page.sleep(0.8)
+            if dismissed:
+                summary = '; '.join(f"{item['kind']}: {item['label']}" for item in dismissed)
+                text = f'Dismissed {len(dismissed)} overlay control(s): {summary}'
+            else:
+                text = f'No matching overlay controls found (cookie policy: {policy})'
+            if remaining:
+                text += f'\nVisible overlay containers remaining: {remaining}'
+            return {'text': text, 'action': action, 'dismissed': dismissed, 'cookiePolicy': policy}
 
         if action == 'click':
             if len(parts) != 2:

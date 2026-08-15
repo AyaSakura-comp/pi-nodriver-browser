@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import parse_command, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -16,6 +16,18 @@ class DevToolsPortTests(unittest.TestCase):
     def test_rejects_invalid_active_port_file(self):
         with self.assertRaises(ValueError):
             parse_devtools_active_port('not-a-port\n')
+
+
+class DismissOptionsTests(unittest.TestCase):
+    def test_defaults_to_rejecting_optional_cookies(self):
+        self.assertEqual(parse_dismiss_options(['dismiss', 'overlays']), 'reject-optional')
+
+    def test_accepts_explicit_cookie_policy(self):
+        self.assertEqual(parse_dismiss_options(['dismiss', 'overlays', '--cookies=accept']), 'accept')
+
+    def test_rejects_unknown_cookie_policy(self):
+        with self.assertRaisesRegex(ValueError, 'cookie policy'):
+            parse_dismiss_options(['dismiss', 'overlays', '--cookies=surprise'])
 
 
 class ParseCommandTests(unittest.TestCase):

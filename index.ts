@@ -25,6 +25,7 @@ Commands:
   scroll <up|down|left|right> [px] - Scroll page
   get text|url|title [@ref] - Get information
   wait <@ref|ms> - Wait for an element or milliseconds
+  dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
   screenshot [--full] - Capture screenshot and return it inline
   close - Close Chrome
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes.`;
