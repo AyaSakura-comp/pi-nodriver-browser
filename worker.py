@@ -3,6 +3,7 @@ import asyncio
 import fcntl
 import json
 import logging
+import os
 import signal
 import sys
 import tempfile
@@ -349,7 +350,14 @@ class BrowserWorker:
             full_page = '--full' in parts[1:]
             output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
             output = output_dir / 'screenshot.png'
-            await page.save_screenshot(output, format='png', full_page=full_page)
+            screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+            try:
+                await asyncio.wait_for(
+                    page.save_screenshot(output, format='png', full_page=full_page),
+                    timeout=screenshot_timeout,
+                )
+            except TimeoutError as error:
+                raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
             return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
 
         if action == 'close':
@@ -373,11 +381,22 @@ class BrowserWorker:
 
 async def execute_request(worker, request):
     session_id = str(request.get('sessionId') or 'default')
+    command_timeout = float(os.environ.get('PI_NODRIVER_COMMAND_TIMEOUT', '75'))
     try:
-        result = await worker.execute(request.get('command', ''), session_id=session_id)
+        result = await asyncio.wait_for(
+            worker.execute(request.get('command', ''), session_id=session_id),
+            timeout=command_timeout,
+        )
         return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **result}
+    except TimeoutError:
+        return {
+            'id': request.get('id'),
+            'sessionId': session_id,
+            'ok': False,
+            'error': f'Browser command timed out after {command_timeout:g} seconds',
+        }
     except Exception as error:
-        return {'id': request.get('id'), 'ok': False, 'error': f'{type(error).__name__}: {error}'}
+        return {'id': request.get('id'), 'sessionId': session_id, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
 
 
 async def stdio_main():
@@ -395,7 +414,8 @@ async def stdio_main():
 
 async def server_main(socket_path):
     worker = BrowserWorker()
-    command_lock = asyncio.Lock()
+    session_locks = {}
+    browser_structure_lock = asyncio.Lock()
     stop = asyncio.Event()
     path = Path(socket_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,13 +430,31 @@ async def server_main(socket_path):
     async def handle_client(reader, writer):
         try:
             while line := await reader.readline():
-                async with command_lock:
-                    response = await execute_request(worker, json.loads(line))
+                request = json.loads(line)
+                session_id = str(request.get('sessionId') or 'default')
+                command = str(request.get('command') or '').strip()
+                action = command.split(maxsplit=1)[0].lower() if command else ''
+                session_lock = session_locks.setdefault(session_id, asyncio.Lock())
+
+                if action == 'shutdown':
+                    async with browser_structure_lock:
+                        response = await execute_request(worker, request)
+                else:
+                    async with session_lock:
+                        if action in {'open', 'click', 'close'}:
+                            async with browser_structure_lock:
+                                response = await execute_request(worker, request)
+                        else:
+                            response = await execute_request(worker, request)
                 writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
                 await writer.drain()
                 if response.get('action') == 'shutdown':
                     stop.set()
                     break
+        except Exception as error:
+            response = {'id': None, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
+            writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
+            await writer.drain()
         finally:
             writer.close()
             await writer.wait_closed()

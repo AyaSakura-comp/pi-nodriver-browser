@@ -4,6 +4,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         env = {
             **os.environ,
             'PI_NODRIVER_PROFILE': str(temp / 'profile'),
+            'PI_NODRIVER_COMMAND_TIMEOUT': '3' if self._testMethodName == 'test_command_timeout_releases_session' else '30',
         }
         self.proc = subprocess.Popen(
             [
@@ -60,7 +62,7 @@ class DaemonIntegrationTests(unittest.TestCase):
             self.proc.stderr.close()
         self.temp_dir.cleanup()
 
-    def command(self, command, request_id=1, session_id='test-session'):
+    def command_raw(self, command, request_id=1, session_id='test-session'):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(self.socket_path))
             request = {'id': request_id, 'command': command, 'sessionId': session_id}
@@ -68,9 +70,46 @@ class DaemonIntegrationTests(unittest.TestCase):
             stream = client.makefile()
             line = stream.readline()
         self.assertTrue(line.startswith(MARKER), line)
-        response = json.loads(line[len(MARKER):])
+        return json.loads(line[len(MARKER):])
+
+    def command(self, command, request_id=1, session_id='test-session'):
+        response = self.command_raw(command, request_id=request_id, session_id=session_id)
         self.assertTrue(response.get('ok'), response.get('error'))
         return response
+
+    def test_long_wait_in_one_session_does_not_block_another(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_url}', session_id='session-a')
+        self.command(f'open {fixture_url}', request_id=2, session_id='session-b')
+        started = threading.Event()
+
+        def wait_in_session_a():
+            started.set()
+            return self.command('wait 2500', request_id=3, session_id='session-a')
+
+        thread = threading.Thread(target=wait_in_session_a)
+        thread.start()
+        started.wait(timeout=1)
+        time.sleep(0.2)
+        before = time.monotonic()
+        response = self.command('get text', request_id=4, session_id='session-b')
+        elapsed = time.monotonic() - before
+        thread.join(timeout=5)
+
+        self.assertIn('Go now', response['text'])
+        self.assertLess(elapsed, 1.5)
+        self.assertFalse(thread.is_alive())
+
+    def test_command_timeout_releases_session(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_url}', session_id='session-a')
+
+        timed_out = self.command_raw('wait 5000', request_id=2, session_id='session-a')
+        recovered = self.command('get text', request_id=3, session_id='session-a')
+
+        self.assertFalse(timed_out['ok'])
+        self.assertIn('timed out', timed_out['error'])
+        self.assertIn('Go now', recovered['text'])
 
     def test_sessions_keep_independent_active_pages(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
