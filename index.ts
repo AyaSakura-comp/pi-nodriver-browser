@@ -20,7 +20,11 @@ Workflow: open URL → snapshot -i (get @refs like @e1) → interact → re-snap
 Commands:
   open <url> - Navigate to URL
   snapshot -i - List visible interactive elements with @refs
-  click <@ref> - Click element
+  click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
+  click <x> <y> - Click viewport coordinates (fallback for canvas, cross-origin iframes, and visual-only controls)
+  click-text <text> - Click the best visible element matching text or accessible label
+  click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
+  click-js <@ref> - Dispatch a deferred DOM click when a site's native mouse handler poisons CDP
   fill <@ref> <text> - Clear and type
   type <@ref> <text> - Type without clearing
   select <@ref> <value> - Select dropdown option
@@ -48,7 +52,12 @@ class NodriverWorker {
   private socket?: Socket;
   private connecting?: Promise<Socket>;
   private nextId = 1;
-  private pending = new Map<number, { resolve: (value: WorkerResponse) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private pending = new Map<number, {
+    resolve: (value: WorkerResponse) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+    removeAbortListener: () => void;
+  }>();
 
   private openSocket(): Promise<Socket> {
     return new Promise((resolve, reject) => {
@@ -83,6 +92,7 @@ class NodriverWorker {
       const request = this.pending.get(response.id);
       if (!request) return;
       clearTimeout(request.timer);
+      request.removeAbortListener();
       this.pending.delete(response.id);
       if (response.ok) request.resolve(response);
       else request.reject(new Error(response.error || "Nodriver command failed"));
@@ -94,6 +104,7 @@ class NodriverWorker {
       const error = new Error("Browser daemon connection closed");
       for (const request of this.pending.values()) {
         clearTimeout(request.timer);
+        request.removeAbortListener();
         request.reject(error);
       }
       this.pending.clear();
@@ -104,17 +115,18 @@ class NodriverWorker {
     if (!existsSync(PYTHON)) {
       throw new Error(`Nodriver browser environment is missing. Run: python3 -m venv ${join(ROOT, ".venv")} && ${PYTHON} -m pip install nodriver`);
     }
+    let child: ReturnType<typeof spawn> | undefined;
     try {
       const socket = await this.openSocket();
       this.attach(socket);
       return socket;
     } catch {
-      const daemon = spawn(
+      child = spawn(
         "xvfb-run",
-        ["-a", "-s", "-screen 0 1440x1000x24", PYTHON, WORKER, "--server", SOCKET],
+        ["-a", "-s", "-screen 0 1280x720x24", PYTHON, WORKER, "--server", SOCKET],
         { cwd: ROOT, stdio: "ignore", detached: true },
       );
-      daemon.unref();
+      child.unref();
     }
 
     let lastError: unknown;
@@ -126,6 +138,13 @@ class NodriverWorker {
         return socket;
       } catch (error) {
         lastError = error;
+      }
+    }
+    if (child?.pid) {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        // Process may already have exited while the final connection attempt ran.
       }
     }
     throw lastError instanceof Error ? lastError : new Error("Browser daemon did not start");
@@ -145,25 +164,35 @@ class NodriverWorker {
     const socket = await this.connection();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Browser command timed out: ${command}`));
-      }, 90_000);
-      this.pending.set(id, { resolve, reject, timer });
-
-      const abort = () => {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(new Error("Browser command cancelled"));
+      let settled = false;
+      const sendCancel = () => {
+        const cancelId = this.nextId++;
+        socket.write(`${JSON.stringify({ id: cancelId, cancelId: id, sessionId })}\n`);
       };
+      const finishWithError = (error: Error, cancel: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        this.pending.delete(id);
+        if (cancel) sendCancel();
+        reject(error);
+      };
+      const abort = () => finishWithError(new Error("Browser command cancelled"), true);
+      const timer = setTimeout(
+        () => finishWithError(new Error(`Browser command timed out: ${command}`), true),
+        90_000,
+      );
+      const removeAbortListener = () => signal?.removeEventListener("abort", abort);
+      this.pending.set(id, { resolve, reject, timer, removeAbortListener });
       signal?.addEventListener("abort", abort, { once: true });
 
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
       socket.write(`${JSON.stringify({ id, command, sessionId })}\n`, (error) => {
-        if (error) {
-          clearTimeout(timer);
-          this.pending.delete(id);
-          reject(error);
-        }
+        if (error) finishWithError(error, false);
       });
     });
   }

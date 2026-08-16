@@ -1,5 +1,19 @@
-<!doctype html><html><body>
+<!doctype html>
+<html>
+<body>
 <input id="query" placeholder="Search term">
 <button id="go" onclick="document.querySelector('#status').textContent='clicked'">Go now</button>
+<div id="custom" style="cursor:pointer" onclick="document.querySelector('#status').textContent='custom-clicked'"><span>Custom checkout</span></div>
+<div id="text-target" onclick="document.querySelector('#status').textContent='text-clicked'">加入購物車</div>
+<div id="coordinate-target" style="position:absolute;left:300px;top:300px;width:120px;height:60px;background:red" onclick="document.querySelector('#status').textContent='coordinate-clicked'">Canvas-like target</div>
+<div id="shadow-host"></div>
 <div id="status">idle</div>
-</body></html>
+<script>
+  const root = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+  root.innerHTML = `<div id="shadow-action" style="cursor:pointer">Shadow action</div>`;
+  root.querySelector('#shadow-action').onclick = () => {
+    document.querySelector('#status').textContent = 'shadow-clicked';
+  };
+</script>
+</body>
+</html>

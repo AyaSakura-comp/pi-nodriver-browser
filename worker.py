@@ -89,13 +89,45 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
 })(__PI_COOKIE_POLICY__))'''
 
 SNAPSHOT_JS = r'''JSON.stringify((() => {
-  document.querySelectorAll('[data-pi-ref]').forEach(el => el.removeAttribute('data-pi-ref'));
-  const selector = 'a,button,input,textarea,select,summary,[role="button"],[role="link"],[contenteditable="true"]';
-  const elements = Array.from(document.querySelectorAll(selector)).filter(el => {
+  const seen = new Set();
+  const elements = [];
+  const semanticSelector = 'a,button,input,textarea,select,summary,details,label,' +
+    '[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],' +
+    '[role="checkbox"],[role="radio"],[role="switch"],[contenteditable="true"]';
+
+  const visible = el => {
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-  });
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+  };
+  const interactive = el => {
+    if (el.matches(semanticSelector)) return true;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+    const style = getComputedStyle(el);
+    const pointerCursor = ['pointer', 'grab', 'zoom-in'].includes(style.cursor) &&
+      (!el.parentElement || getComputedStyle(el.parentElement).cursor !== style.cursor);
+    return typeof el.onclick === 'function' || el.hasAttribute('onclick') ||
+      el.tabIndex >= 0 || pointerCursor || el.hasAttribute('data-action') ||
+      el.hasAttribute('data-testid') && /button|link|submit|cart|checkout|action/i.test(el.getAttribute('data-testid'));
+  };
+  const visit = root => {
+    try {
+      root.querySelectorAll('[data-pi-ref]').forEach(el => el.removeAttribute('data-pi-ref'));
+      root.querySelectorAll('*').forEach(el => {
+        if (!seen.has(el) && visible(el) && interactive(el)) {
+          seen.add(el);
+          elements.push(el);
+        }
+        if (el.shadowRoot) visit(el.shadowRoot);
+        if (el.tagName === 'IFRAME') {
+          try { if (el.contentDocument) visit(el.contentDocument); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  };
+  visit(document);
+
   return elements.map((el, index) => {
     const ref = `e${index + 1}`;
     el.setAttribute('data-pi-ref', ref);
@@ -110,6 +142,79 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
     };
   });
 })())'''
+
+CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
+  const visible = el => {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+  };
+  const semanticSelector = 'a,button,input,textarea,select,summary,details,label,' +
+    '[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],' +
+    '[role="checkbox"],[role="radio"],[role="switch"],[contenteditable="true"]';
+  const interactive = el => el.matches(semanticSelector) || typeof el.onclick === 'function' ||
+    el.hasAttribute('onclick') || el.tabIndex >= 0 || ['pointer', 'grab', 'zoom-in'].includes(getComputedStyle(el).cursor);
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const entries = [];
+
+  const visit = (root, offsetX = 0, offsetY = 0, frames = []) => {
+    let all = [];
+    try { all = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
+    for (const el of all) {
+      if (visible(el)) entries.push({ el, offsetX, offsetY, frames });
+      if (el.shadowRoot) visit(el.shadowRoot, offsetX, offsetY, frames);
+      if (el.tagName === 'IFRAME') {
+        try {
+          const rect = el.getBoundingClientRect();
+          if (el.contentDocument) visit(el.contentDocument, offsetX + rect.left, offsetY + rect.top, [...frames, el]);
+        } catch (_) {}
+      }
+    }
+  };
+  visit(document);
+
+  let match = null;
+  if (request.kind === 'ref') {
+    match = entries.find(item => item.el.getAttribute('data-pi-ref') === request.value) || null;
+  } else if (request.kind === 'css') {
+    match = entries.find(item => {
+      try { return item.el.matches(request.value); } catch (_) { return false; }
+    }) || null;
+  } else if (request.kind === 'text') {
+    const wanted = normalize(request.value);
+    const candidates = entries.filter(item => {
+      const el = item.el;
+      const label = normalize(el.innerText || el.textContent || el.value ||
+        el.getAttribute('aria-label') || el.getAttribute('title'));
+      return label === wanted || label.includes(wanted);
+    });
+    candidates.sort((a, b) => {
+      const aText = normalize(a.el.innerText || a.el.textContent || a.el.value || a.el.getAttribute('aria-label'));
+      const bText = normalize(b.el.innerText || b.el.textContent || b.el.value || b.el.getAttribute('aria-label'));
+      const aScore = (aText === wanted ? 0 : 1000) + (interactive(a.el) ? 0 : 100) + aText.length;
+      const bScore = (bText === wanted ? 0 : 1000) + (interactive(b.el) ? 0 : 100) + bText.length;
+      return aScore - bScore;
+    });
+    match = candidates[0] || null;
+  }
+  if (!match) return { found: false };
+
+  for (const frame of match.frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
+  match.el.scrollIntoView({ block: 'center', inline: 'center' });
+  const rect = match.el.getBoundingClientRect();
+  const currentOffset = match.frames.reduce((offset, frame) => {
+    const frameRect = frame.getBoundingClientRect();
+    return { x: offset.x + frameRect.left, y: offset.y + frameRect.top };
+  }, { x: 0, y: 0 });
+  return {
+    found: true,
+    x: currentOffset.x + rect.left + rect.width / 2,
+    y: currentOffset.y + rect.top + rect.height / 2,
+    tag: match.el.tagName.toLowerCase(),
+    text: (match.el.innerText || match.el.textContent || match.el.value || '').trim()
+  };
+})(__PI_CLICK_REQUEST__))'''
 
 
 class BrowserWorker:
@@ -127,7 +232,7 @@ class BrowserWorker:
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
                     user_data_dir=str(profile),
-                    browser_args=['--window-size=1440,1000', '--no-first-run', '--no-default-browser-check'],
+                    browser_args=['--window-size=1280,720', '--no-first-run', '--no-default-browser-check'],
                     sandbox=not should_disable_sandbox(),
                     lang='zh-TW',
                 )
@@ -189,6 +294,27 @@ class BrowserWorker:
             raise ValueError(f'element {ref} not found; run snapshot -i again')
         return element
 
+    async def resolve_click_target(self, page, kind, value):
+        request = json.dumps({'kind': kind, 'value': value}, ensure_ascii=False)
+        script = CLICK_TARGET_JS.replace('__PI_CLICK_REQUEST__', request)
+        result = json.loads(await page.evaluate(script))
+        if not result.get('found'):
+            if kind == 'ref':
+                raise ValueError(f'element @{value} not found; run snapshot -i again')
+            raise ValueError(f'click target not found by {kind}: {value}')
+        return result
+
+    async def native_click(self, page, x, y):
+        before_tabs = len(self.browser.tabs)
+        await page.bring_to_front()
+        await page.mouse_click(float(x), float(y))
+        await page.sleep(2)
+        if len(self.browser.tabs) > before_tabs:
+            page = self.browser.tabs[-1]
+            await page.bring_to_front()
+            await page.sleep(2)
+        return page
+
     async def execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
@@ -244,22 +370,53 @@ class BrowserWorker:
             return {'text': text, 'action': action, 'dismissed': dismissed, 'cookiePolicy': policy}
 
         if action == 'click':
-            if len(parts) != 2:
-                raise ValueError('usage: click <@ref>')
             page = await self.require_page(session_id)
-            element = await self.element(session_id, parts[1])
-            before_tabs = len(self.browser.tabs)
-            await page.bring_to_front()
-            await element.scroll_into_view()
-            await page.sleep(0.2)
-            await element.mouse_click()
-            await page.sleep(2)
-            if len(self.browser.tabs) > before_tabs:
-                page = self.browser.tabs[-1]
+            if len(parts) == 3:
+                try:
+                    x, y = float(parts[1]), float(parts[2])
+                except ValueError as error:
+                    raise ValueError('usage: click <@ref> or click <x> <y>') from error
+                page = await self.native_click(page, x, y)
                 self.pages[session_id] = page
-                await page.bring_to_front()
-                await page.sleep(2)
-            return {'text': f'Clicked {parts[1]}\nURL: {page.url}', 'action': action, 'url': page.url}
+                return {'text': f'Clicked viewport coordinates ({x:g}, {y:g})\nURL: {page.url}', 'action': action, 'url': page.url}
+            if len(parts) != 2 or not parts[1].startswith('@'):
+                raise ValueError('usage: click <@ref> or click <x> <y>')
+            normalized = parts[1].removeprefix('@')
+            target = await self.resolve_click_target(page, 'ref', normalized)
+            page = await self.native_click(page, target['x'], target['y'])
+            self.pages[session_id] = page
+            return {'text': f'Clicked {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
+
+        if action in ('click-text', 'click-css'):
+            if len(parts) < 2:
+                raise ValueError(f'usage: {action} <text-or-selector>')
+            page = await self.require_page(session_id)
+            value = ' '.join(parts[1:])
+            kind = 'text' if action == 'click-text' else 'css'
+            target = await self.resolve_click_target(page, kind, value)
+            page = await self.native_click(page, target['x'], target['y'])
+            self.pages[session_id] = page
+            return {'text': f'Clicked by {kind} "{value}" ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
+
+        if action == 'click-js':
+            if len(parts) != 2 or not parts[1].startswith('@'):
+                raise ValueError('usage: click-js <@ref>')
+            page = await self.require_page(session_id)
+            normalized = parts[1].removeprefix('@')
+            target = await self.resolve_click_target(page, 'ref', normalized)
+            script = f'''(() => {{
+                const element = document.elementFromPoint({float(target['x'])}, {float(target['y'])});
+                if (!element) return false;
+                setTimeout(() => element.click(), 0);
+                return true;
+            }})()'''
+            if not await page.evaluate(script):
+                raise ValueError(f'element {parts[1]} is not clickable at its current coordinates')
+            return {
+                'text': f'Deferred DOM click dispatched for {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})',
+                'action': action,
+                'url': page.url,
+            }
 
         if action in ('fill', 'type'):
             if len(parts) < 3:
@@ -408,6 +565,8 @@ async def stdio_main():
                 break
             response = await execute_request(worker, json.loads(line))
             print(MARKER + json.dumps(response, ensure_ascii=False), flush=True)
+            if response.get('action') == 'shutdown':
+                break
     finally:
         await worker.close()
 
@@ -428,34 +587,69 @@ async def server_main(socket_path):
     path.unlink(missing_ok=True)
 
     async def handle_client(reader, writer):
-        try:
-            while line := await reader.readline():
-                request = json.loads(line)
-                session_id = str(request.get('sessionId') or 'default')
-                command = str(request.get('command') or '').strip()
-                action = command.split(maxsplit=1)[0].lower() if command else ''
-                session_lock = session_locks.setdefault(session_id, asyncio.Lock())
+        active_tasks = {}
+        write_lock = asyncio.Lock()
 
+        async def send_response(response):
+            async with write_lock:
+                writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
+                await writer.drain()
+
+        async def process_request(request):
+            request_id = request.get('id')
+            session_id = str(request.get('sessionId') or 'default')
+            command = str(request.get('command') or '').strip()
+            action = command.split(maxsplit=1)[0].lower() if command else ''
+            session_lock = session_locks.setdefault(session_id, asyncio.Lock())
+            try:
                 if action == 'shutdown':
                     async with browser_structure_lock:
                         response = await execute_request(worker, request)
                 else:
                     async with session_lock:
-                        if action in {'open', 'click', 'close'}:
+                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'close'}:
                             async with browser_structure_lock:
                                 response = await execute_request(worker, request)
                         else:
                             response = await execute_request(worker, request)
-                writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
-                await writer.drain()
-                if response.get('action') == 'shutdown':
-                    stop.set()
-                    break
+            except asyncio.CancelledError:
+                response = {
+                    'id': request_id,
+                    'sessionId': session_id,
+                    'ok': False,
+                    'error': 'Browser command cancelled',
+                }
+            finally:
+                active_tasks.pop(request_id, None)
+            await send_response(response)
+            if response.get('action') == 'shutdown':
+                stop.set()
+                writer.close()
+
+        try:
+            while line := await reader.readline():
+                request = json.loads(line)
+                request_id = request.get('id')
+                cancel_id = request.get('cancelId')
+                if cancel_id is not None:
+                    task = active_tasks.get(cancel_id)
+                    if task is not None:
+                        task.cancel()
+                    await send_response({
+                        'id': request_id,
+                        'sessionId': str(request.get('sessionId') or 'default'),
+                        'ok': True,
+                        'action': 'cancel',
+                        'text': f'Cancellation requested for browser command {cancel_id}',
+                    })
+                    continue
+                task = asyncio.create_task(process_request(request))
+                active_tasks[request_id] = task
         except Exception as error:
-            response = {'id': None, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
-            writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
-            await writer.drain()
+            await send_response({'id': None, 'ok': False, 'error': f'{type(error).__name__}: {error}'})
         finally:
+            if active_tasks:
+                await asyncio.gather(*tuple(active_tasks.values()), return_exceptions=True)
             writer.close()
             await writer.wait_closed()
 

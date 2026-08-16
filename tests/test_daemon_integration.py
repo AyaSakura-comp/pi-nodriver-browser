@@ -111,6 +111,36 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.assertIn('timed out', timed_out['error'])
         self.assertIn('Go now', recovered['text'])
 
+    def test_cancel_interrupts_running_command_and_releases_session(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_url}', session_id='session-a')
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(str(self.socket_path))
+            stream = client.makefile()
+            wait_request = {'id': 2, 'command': 'wait 5000', 'sessionId': 'session-a'}
+            cancel_request = {'id': 3, 'cancelId': 2, 'sessionId': 'session-a'}
+            client.sendall((json.dumps(wait_request) + '\n').encode())
+            time.sleep(0.2)
+            started = time.monotonic()
+            client.sendall((json.dumps(cancel_request) + '\n').encode())
+            responses = {}
+            while len(responses) < 2:
+                line = stream.readline()
+                self.assertTrue(line.startswith(MARKER), line)
+                response = json.loads(line[len(MARKER):])
+                responses[response['id']] = response
+
+        recovered = self.command('get text', request_id=4, session_id='session-a')
+
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertFalse(responses[2]['ok'])
+        self.assertIn('cancelled', responses[2]['error'].lower())
+        self.assertTrue(responses[3]['ok'])
+        self.assertEqual(responses[3]['action'], 'cancel')
+        self.assertIn('Go now', recovered['text'])
+
     def test_sessions_keep_independent_active_pages(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
@@ -142,11 +172,19 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.assertIn('9 折優惠', session_b['text'])
         self.assertIsNone(self.proc.poll())
 
-    def test_shutdown_command_stops_daemon(self):
-        response = self.command('shutdown')
-        self.assertEqual(response['action'], 'shutdown')
-        self.proc.wait(timeout=10)
-        self.assertFalse(self.socket_path.exists())
+    def test_shutdown_command_stops_daemon_with_persistent_client_connected(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(self.socket_path))
+            request = {'id': 1, 'command': 'shutdown', 'sessionId': 'test-session'}
+            client.sendall((json.dumps(request) + '\n').encode())
+            stream = client.makefile()
+            line = stream.readline()
+            self.assertTrue(line.startswith(MARKER), line)
+            response = json.loads(line[len(MARKER):])
+            self.assertEqual(response['action'], 'shutdown')
+
+            self.proc.wait(timeout=10)
+            self.assertFalse(self.socket_path.exists())
 
     def test_browser_survives_client_disconnect(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()

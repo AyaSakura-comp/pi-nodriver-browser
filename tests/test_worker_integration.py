@@ -82,6 +82,13 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertNotIn('Next step', result)
         self.assertIn('Buy product', page_text)
 
+    def open_fixture(self):
+        fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+    def status(self):
+        return self.command('get text')['text']
+
     def test_opens_snapshots_clicks_and_reads_page(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         self.command(f'open {fixture_url}')
@@ -95,6 +102,44 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command(f'click {button_ref}')
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
+
+        self.command(f'open {fixture_url}')
+        snapshot = self.command('snapshot -i')['text']
+        button_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
+        self.command(f'click-js {button_ref}')
+        time.sleep(0.2)
+        page_text = self.command('get text')['text']
+        self.assertIn('clicked', page_text)
+
+    def test_snapshot_and_ref_click_support_custom_div_controls(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        custom_lines = [line for line in snapshot.splitlines() if 'Custom checkout' in line]
+        self.assertEqual(len(custom_lines), 1)
+        self.command(f'click {custom_lines[0].split()[0]}')
+        self.assertIn('custom-clicked', self.status())
+
+    def test_snapshot_and_ref_click_support_open_shadow_dom(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        shadow_line = next(line for line in snapshot.splitlines() if 'Shadow action' in line)
+        self.command(f'click {shadow_line.split()[0]}')
+        self.assertIn('shadow-clicked', self.status())
+
+    def test_click_text_finds_non_semantic_control(self):
+        self.open_fixture()
+        self.command('click-text "加入購物車"')
+        self.assertIn('text-clicked', self.status())
+
+    def test_click_css_finds_non_semantic_control(self):
+        self.open_fixture()
+        self.command('click-css "#custom"')
+        self.assertIn('custom-clicked', self.status())
+
+    def test_click_coordinates_uses_viewport_coordinates(self):
+        self.open_fixture()
+        self.command('click 360 330')
+        self.assertIn('coordinate-clicked', self.status())
 
 
 if __name__ == '__main__':
