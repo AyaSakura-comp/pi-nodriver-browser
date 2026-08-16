@@ -71,6 +71,7 @@ def format_snapshot(elements: list[dict]) -> str:
             ('ariaLabel', 'aria-label'),
             ('placeholder', 'placeholder'),
             ('href', 'href'),
+            ('download', 'download'),
         ):
             value = (item.get(key) or '').strip()
             if value:

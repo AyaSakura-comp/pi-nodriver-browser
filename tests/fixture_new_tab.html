@@ -1,2 +1,7 @@
 <!doctype html>
-<html><body><main>New tab report ready</main></body></html>
+<html><body>
+<main>New tab report ready</main>
+<button id="complete-login" onclick="window.opener.postMessage('oauth-complete', '*'); window.close()">Complete login</button>
+<button id="complete-login-delayed" onclick="window.opener.postMessage('oauth-complete', '*'); setTimeout(() => window.close(), 800)">Complete delayed login</button>
+<button id="nested-oauth" onclick="setTimeout(() => window.open('fixture_new_tab.html?nested=1', 'nested-oauth'), 800)">Open nested OAuth</button>
+</body></html>

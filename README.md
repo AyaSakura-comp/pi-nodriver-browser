@@ -130,9 +130,10 @@ screenshot --full
 5. The daemon routes the command to that session's active tab; `open` creates/replaces only that session's tab.
 6. `snapshot -i` marks visible interactive DOM nodes with `data-pi-ref` attributes and returns model-friendly references.
 7. Commands such as `click @e2` resolve those references in that session's live DOM.
-8. A navigation or major DOM change invalidates old references; the model should run `snapshot -i` again.
-9. Pi task/session shutdown closes only its socket connection. The daemon, Xvfb, Chrome, session tabs, and in-memory page map remain alive.
-10. `close` closes only the caller's tab. `shutdown`, installer upgrade, uninstall, process termination, or machine restart closes the shared daemon and Chrome.
+8. OAuth/login popups opened by a click become the session's active page. When a popup closes, the next command automatically returns to its opener.
+9. A navigation or major DOM change invalidates old references. After a missing/stale-ref error, a per-session guard blocks further ref-based commands until an explicit `snapshot -i` succeeds; text, CSS, coordinate, and overlay-dismiss fallbacks remain available.
+10. Pi task/session shutdown closes only its socket connection. The daemon, Xvfb, Chrome, session tabs, and in-memory page map remain alive.
+11. `close` closes only the caller's tab. `shutdown`, installer upgrade, uninstall, process termination, or machine restart closes the shared daemon and Chrome.
 
 ## Browser command reference
 
@@ -145,6 +146,11 @@ screenshot --full
 | `click-text <text>` | Click the best visible element matching text or its accessible label |
 | `click-css <selector>` | Click the first visible element matching a CSS selector, including open Shadow DOM |
 | `click-js <@ref>` | Dispatch a deferred DOM click when a native mouse handler disrupts CDP |
+| `download-info <@ref>` | Inspect the URL, filename, inferred MIME type, and cross-origin status without clicking |
+| `download <@ref> [ms]` | Click and wait for a verified completed download; default 30 seconds |
+| `wait-download [ms]` | Wait for the active or most recent download; default 30 seconds |
+| `downloads [limit]` | List completed files and in-progress percentages; default 10 |
+| `download-latest` | Return metadata and the absolute path of the newest completed file |
 | `fill <@ref> <text>` | Clear an input and type text |
 | `type <@ref> <text>` | Type without clearing |
 | `select <@ref> <value>` | Select a dropdown option by value or visible text |
@@ -153,12 +159,19 @@ screenshot --full
 | `get text [@ref]` | Get page or element text |
 | `get url` / `get title` | Get current page metadata |
 | `wait <@ref>` / `wait <ms>` | Wait for an element or duration |
+| `wait-popup [ms]` | Wait for an OAuth/login popup and switch to it; default 30 seconds |
+| `wait-popup-close [ms]` | Wait for the active popup to close, then return to its opener; default 30 seconds |
+| `switch opener` | Return to the popup opener without closing the popup |
 | `dismiss overlays [--cookies=…]` | Dismiss cookie banners and modal overlays safely |
 | `screenshot [--full]` | Return a PNG screenshot inline |
 | `close` | Close only the current Pi session's active tab |
 | `shutdown` | Close Chrome and stop the persistent browser daemon |
 
 Send exactly one command per tool call. Shell chaining such as `wait 2000 && screenshot` is rejected; call `wait 2000` and `screenshot` separately.
+
+For OAuth flows such as LINE Login, click the login control normally, then interact with the popup using `snapshot -i`. Immediate popups are selected automatically; `wait-popup 30000` also catches delayed script-opened windows. After QR, 2FA, or consent completes, `wait-popup-close 30000` waits for the popup to close and restores the original site. If it closes between commands, restoration happens automatically. Use `switch opener` to return early without closing it.
+
+Download links are marked with `download="…"` in snapshots. Use `download-info @e5` to inspect one without triggering it, or `download @e5 30000` to click and wait for completion. Chrome download lifecycle events are combined with `.crdownload`-aware filesystem verification; completed results include an absolute `downloadPath` suitable for attaching to the final response. Files are restricted to `PI_NODRIVER_DOWNLOAD_DIR`, defaulting to `~/.pi/agent/nodriver-downloads`, separated into hashed per-session directories, and never executed automatically. CDP frame attribution prevents one Pi session from listing or waiting on another session's downloads.
 
 Use quotes around arguments containing spaces:
 
@@ -277,7 +290,7 @@ The integration tests open local HTML fixtures, exercise clicks and overlay dism
 - The browser accepts arbitrary URLs requested by the model. Apply normal SSRF and network-access precautions in sensitive environments.
 - The persistent profile may contain authenticated cookies. Protect `~/.pi/agent/nodriver-profile/` and never commit it.
 - Screenshots and page text can contain private information and are returned to the active model session.
-- `snapshot -i` references are page-state dependent; re-snapshot after navigation.
+- `snapshot -i` references are page-state dependent; re-snapshot after navigation. Never retry a missing/stale ref: the extension requires a successful fresh snapshot before accepting another ref-based command in that session.
 - The daemon serializes commands per Pi session ID. A slow screenshot or wait in one session does not block unrelated sessions.
 - Every command has a daemon-side timeout, so an abandoned client request cannot retain its session lock forever.
 - Each Pi session has an independent active tab, but all tabs share the same Chrome profile, cookies, login state, browser process, and network identity.

@@ -25,6 +25,11 @@ Commands:
   click-text <text> - Click the best visible element matching text or accessible label
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js <@ref> - Dispatch a deferred DOM click when a site's native mouse handler poisons CDP
+  download-info <@ref> - Inspect a download target without clicking it
+  download <@ref> [ms] - Click and wait for a verified completed download
+  wait-download [ms] - Wait for the active or most recent download
+  downloads [limit] - List recent files and in-progress download percentages
+  download-latest - Return metadata and the absolute path of the newest completed file
   fill <@ref> <text> - Clear and type
   type <@ref> <text> - Type without clearing
   select <@ref> <value> - Select dropdown option
@@ -32,11 +37,14 @@ Commands:
   scroll <up|down|left|right> [px] - Scroll page
   get text|url|title [@ref] - Get information
   wait <@ref|ms> - Wait for an element or milliseconds
+  wait-popup [ms] - Wait for an OAuth/login popup and switch to it
+  wait-popup-close [ms] - Wait for the active popup to close and return to its opener
+  switch opener - Return to the popup's opener without closing the popup
   dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
   screenshot [--full] - Capture screenshot and return it inline
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
-Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes.`;
+Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. After any missing/stale ref error, the extension blocks further ref-based commands until you run snapshot -i; never retry the old ref.`;
 
 type WorkerResponse = {
   id: number;
@@ -216,7 +224,9 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes.",
+      "After a missing or stale @ref error, run snapshot -i as the very next browser command; the extension blocks ref-based commands until then, so never retry the old ref.",
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
+      "For downloads, inspect with download-info and prefer download <@ref> over clicking and guessing; use downloads to check progress.",
       "Browser close affects only the current Pi session tab; browser shutdown stops the shared daemon for every session.",
     ],
     parameters: Type.Object({

@@ -69,6 +69,17 @@ class BrowserExecutableTests(unittest.TestCase):
 
 
 class SnapshotFormattingTests(unittest.TestCase):
+    def test_marks_download_targets_with_the_suggested_filename(self):
+        output = format_snapshot([{
+            'ref': 'e2',
+            'tag': 'a',
+            'text': 'Export report',
+            'href': 'https://example.test/report',
+            'download': 'quarterly.pdf',
+        }])
+
+        self.assertIn('download="quarterly.pdf"', output)
+
     def test_formats_interactive_element_for_agent(self):
         output = format_snapshot([
             {

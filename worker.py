@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import signal
 import sys
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -137,6 +141,7 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
       text: (el.innerText || el.textContent || '').trim(),
       value: el.value || '',
       href: el.href || '',
+      download: el.getAttribute('download') || '',
       placeholder: el.getAttribute('placeholder') || '',
       ariaLabel: el.getAttribute('aria-label') || ''
     };
@@ -212,7 +217,9 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
     x: currentOffset.x + rect.left + rect.width / 2,
     y: currentOffset.y + rect.top + rect.height / 2,
     tag: match.el.tagName.toLowerCase(),
-    text: (match.el.innerText || match.el.textContent || match.el.value || '').trim()
+    text: (match.el.innerText || match.el.textContent || match.el.value || '').trim(),
+    href: match.el.href || match.el.closest?.('a')?.href || '',
+    download: match.el.getAttribute?.('download') || match.el.closest?.('a')?.getAttribute?.('download') || ''
   };
 })(__PI_CLICK_REQUEST__))'''
 
@@ -222,6 +229,19 @@ class BrowserWorker:
         self.browser = None
         self.launched_browser = None
         self.pages = {}
+        self.popup_openers = {}
+        self.popup_just_switched = set()
+        self.popup_just_closed = set()
+        self.snapshot_required_sessions = set()
+        configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
+        self.download_dir = (
+            Path(configured_download_dir).expanduser()
+            if configured_download_dir else Path.home() / '.pi' / 'agent' / 'nodriver-downloads'
+        )
+        self.downloads = {}
+        self.download_frame_sessions = {}
+        self.download_target_sessions = {}
+        self.download_route_session = 'default'
 
     async def ensure_browser(self):
         if self.browser is None:
@@ -265,7 +285,256 @@ class BrowserWorker:
                         continue
                 if self.browser is None:
                     raise startup_error
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            self.browser.add_handler(uc.cdp.target.TargetCreated, self.on_target_created)
+            self.browser.add_handler(uc.cdp.browser.DownloadWillBegin, self.on_download_will_begin)
+            self.browser.add_handler(uc.cdp.browser.DownloadProgress, self.on_download_progress)
+            await self.browser.send(uc.cdp.browser.set_download_behavior(
+                'allow', download_path=str(self.download_dir), events_enabled=True
+            ))
         return self.browser
+
+    @staticmethod
+    def path_has_symlink_component(path):
+        path = Path(path).expanduser().absolute()
+        return any(
+            component.exists() and component.is_symlink()
+            for component in (path, *path.parents)
+        )
+
+    def session_download_dir(self, session_id='default'):
+        root = self.download_dir.expanduser().absolute()
+        if self.path_has_symlink_component(root):
+            raise ValueError('configured download directory cannot contain a symlink')
+        root.mkdir(parents=True, exist_ok=True)
+        if session_id is None:
+            path = root / '.quarantine'
+        elif session_id == 'default':
+            path = root
+        else:
+            digest = hashlib.sha256(session_id.encode()).hexdigest()[:24]
+            path = root / digest
+        if path.is_symlink():
+            raise ValueError('session download directory cannot be a symlink')
+        path.mkdir(parents=True, exist_ok=True)
+        if path != root and path.resolve().parent != root.resolve():
+            raise ValueError('session download directory escaped the configured root')
+        return path
+
+    async def configure_download_session(self, session_id, page=None):
+        download_dir = self.session_download_dir(session_id)
+        self.download_route_session = session_id
+        await self.browser.send(uc.cdp.browser.set_download_behavior(
+            'allow', download_path=str(download_dir), events_enabled=True
+        ))
+        if page is None:
+            return
+        self.download_target_sessions[str(page.target.target_id)] = session_id
+        page.add_handler(uc.cdp.page.FrameAttached, self.on_frame_attached)
+        try:
+            frame_tree = await page.send(uc.cdp.page.get_frame_tree())
+        except Exception:
+            return
+
+        def register(tree):
+            self.download_frame_sessions[str(tree.frame.id_)] = session_id
+            for child in tree.child_frames or []:
+                register(child)
+
+        register(frame_tree)
+
+    def on_frame_attached(self, event):
+        session_id = self.download_frame_sessions.get(str(event.parent_frame_id))
+        if session_id is not None:
+            self.download_frame_sessions[str(event.frame_id)] = session_id
+
+    def on_target_created(self, event):
+        target = event.target_info
+        session_id = self.download_target_sessions.get(str(target.opener_id))
+        if session_id is not None:
+            self.download_target_sessions[str(target.target_id)] = session_id
+            self.download_frame_sessions[str(target.target_id)] = session_id
+
+    def on_download_will_begin(self, event):
+        frame_id = str(event.frame_id)
+        session_id = self.download_frame_sessions.get(
+            frame_id,
+            self.download_target_sessions.get(frame_id),
+        )
+        self.downloads[event.guid] = {
+            'guid': event.guid,
+            'sessionId': session_id,
+            'url': event.url,
+            'filename': Path(event.suggested_filename).name,
+            'state': 'inProgress',
+            'receivedBytes': 0,
+            'totalBytes': 0,
+            'startedAt': time.time(),
+            'path': None,
+        }
+
+    def place_completed_download(self, record, value):
+        source = Path(value).expanduser().absolute()
+        root = self.download_dir.resolve()
+        resolved_parent = source.parent.resolve()
+        if source.parent.is_symlink() or resolved_parent != source.parent.absolute():
+            raise ValueError('completed download parent cannot be a symlink')
+        if resolved_parent != root and root not in resolved_parent.parents:
+            raise ValueError('completed download escaped the configured download directory')
+        if source.is_symlink():
+            raise ValueError('completed download cannot be a symlink')
+        if not source.is_file():
+            return str(source)
+        destination_dir = self.session_download_dir(record['sessionId']).resolve()
+        if source.parent == destination_dir:
+            return str(source)
+        requested = Path(record.get('filename') or source.name)
+        destination = destination_dir / requested.name
+        counter = 1
+        while destination.exists():
+            destination = destination_dir / f'{requested.stem} ({counter}){requested.suffix}'
+            counter += 1
+        source.replace(destination)
+        return str(destination)
+
+    def on_download_progress(self, event):
+        record = self.downloads.setdefault(event.guid, {
+            'guid': event.guid,
+            'sessionId': None,
+            'url': '',
+            'filename': event.guid,
+            'startedAt': time.time(),
+            'path': None,
+        })
+        record.update({
+            'state': event.state,
+            'receivedBytes': int(event.received_bytes),
+            'totalBytes': int(event.total_bytes),
+        })
+        if event.file_path:
+            record['path'] = event.file_path
+        if event.state == 'completed':
+            if record.get('path'):
+                record['path'] = self.place_completed_download(record, record['path'])
+            else:
+                record['path'] = str(
+                    self.session_download_dir(record['sessionId']) / record['filename']
+                )
+
+    def download_file_snapshot(self, session_id='default'):
+        download_dir = self.session_download_dir(session_id)
+        files = {}
+        for path in download_dir.iterdir():
+            try:
+                if not path.is_file() or path.is_symlink() or path.name.endswith('.crdownload'):
+                    continue
+                resolved = self.safe_download_path(path, session_id)
+                stat = resolved.stat()
+                files[resolved] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+        return files
+
+    def list_downloads(self, limit=10, session_id='default'):
+        download_dir = self.session_download_dir(session_id)
+        items = []
+        for path in download_dir.iterdir():
+            try:
+                if not path.is_file() or path.is_symlink() or path.name.endswith('.crdownload'):
+                    continue
+                resolved = self.safe_download_path(path, session_id)
+                stat = resolved.stat()
+            except OSError:
+                continue
+            items.append({
+                'name': resolved.name,
+                'path': str(resolved),
+                'size': stat.st_size,
+                'mimeType': mimetypes.guess_type(resolved.name)[0] or 'application/octet-stream',
+                'state': 'completed',
+                'modifiedAt': stat.st_mtime,
+            })
+        for record in self.downloads.values():
+            if record.get('sessionId', 'default') != session_id or record.get('state') == 'completed':
+                continue
+            total = record.get('totalBytes', 0)
+            received = record.get('receivedBytes', 0)
+            progress = int(received * 100 / total) if total else None
+            items.append({
+                'name': record.get('filename') or record['guid'],
+                'path': None,
+                'url': record.get('url') or '',
+                'size': received,
+                'mimeType': mimetypes.guess_type(record.get('filename', ''))[0] or 'application/octet-stream',
+                'state': 'downloading' if record.get('state') == 'inProgress' else record.get('state', 'unknown'),
+                'progress': progress,
+                'modifiedAt': record.get('startedAt', 0),
+            })
+        items.sort(key=lambda item: item['modifiedAt'], reverse=True)
+        return items[:limit]
+
+    def safe_download_path(self, value, session_id='default'):
+        path = Path(value).expanduser().resolve()
+        root = self.session_download_dir(session_id).resolve()
+        if path != root and root not in path.parents:
+            raise ValueError('download path escaped this session download directory')
+        return path
+
+    async def wait_for_download(self, baseline_guids, before_files, timeout_ms, session_id='default'):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_ms / 1000
+        while loop.time() < deadline:
+            new_records = [
+                record for guid, record in self.downloads.items()
+                if guid not in baseline_guids and record.get('sessionId', 'default') == session_id
+            ]
+            new_records.sort(key=lambda record: record.get('startedAt', 0), reverse=True)
+            for record in new_records:
+                if record.get('state') == 'canceled':
+                    raise RuntimeError(f'download canceled: {record.get("filename", record["guid"])}')
+                if record.get('state') == 'completed' and record.get('path'):
+                    path = self.safe_download_path(record['path'], session_id)
+                    if path.is_file() and not path.name.endswith('.crdownload'):
+                        record['path'] = str(path)
+                        return record
+
+            current_files = self.download_file_snapshot(session_id)
+            changed_files = [
+                path for path, signature in current_files.items()
+                if before_files.get(path) != signature
+            ]
+            if changed_files:
+                path = max(changed_files, key=lambda item: item.stat().st_mtime_ns)
+                return {
+                    'guid': '',
+                    'sessionId': session_id,
+                    'url': '',
+                    'filename': path.name,
+                    'state': 'completed',
+                    'receivedBytes': path.stat().st_size,
+                    'totalBytes': path.stat().st_size,
+                    'startedAt': time.time(),
+                    'path': str(path),
+                }
+            await asyncio.sleep(0.05)
+        raise TimeoutError(f'timed out waiting {timeout_ms}ms for a download to complete')
+
+    def download_response(self, record, action, session_id='default'):
+        path = self.safe_download_path(record['path'], session_id)
+        size = path.stat().st_size
+        mime_type = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+        return {
+            'text': (
+                f'Download completed\nName: {path.name}\nSize: {size} bytes\n'
+                f'Type: {mime_type}\nPath: {path}'
+            ),
+            'action': action,
+            'downloadPath': str(path),
+            'filename': path.name,
+            'size': size,
+            'mimeType': mime_type,
+            'url': record.get('url') or '',
+        }
 
     async def shutdown_browser(self):
         if self.browser is not None:
@@ -279,30 +548,71 @@ class BrowserWorker:
             self.browser = None
             self.launched_browser = None
             self.pages.clear()
+            self.popup_openers.clear()
+            self.popup_just_switched.clear()
+            self.popup_just_closed.clear()
+            self.download_frame_sessions.clear()
+            self.download_target_sessions.clear()
 
     async def require_page(self, session_id):
         page = self.pages.get(session_id)
         if page is None:
             raise ValueError('this Pi session has no open page; run open <url> first')
+        openers = self.popup_openers.get(session_id, [])
+        if openers:
+            await self.browser.update_targets()
+            if page not in self.browser.tabs:
+                while openers:
+                    opener = openers.pop()
+                    if opener in self.browser.tabs:
+                        await opener.bring_to_front()
+                        self.pages[session_id] = opener
+                        self.popup_just_switched.discard(session_id)
+                        self.popup_just_closed.add(session_id)
+                        return opener
+                raise ValueError('popup and its opener are no longer available')
         return page
+
+    def stale_ref_error(self, session_id, ref):
+        self.snapshot_required_sessions.add(session_id)
+        return ValueError(f'element {ref} not found; run snapshot -i again')
 
     async def element(self, session_id, ref):
         page = await self.require_page(session_id)
         normalized = ref.removeprefix('@')
         element = await page.select(f'[data-pi-ref="{normalized}"]')
         if not element:
-            raise ValueError(f'element {ref} not found; run snapshot -i again')
+            raise self.stale_ref_error(session_id, ref)
         return element
 
-    async def resolve_click_target(self, page, kind, value):
+    async def resolve_click_target(self, page, kind, value, session_id=None):
         request = json.dumps({'kind': kind, 'value': value}, ensure_ascii=False)
         script = CLICK_TARGET_JS.replace('__PI_CLICK_REQUEST__', request)
         result = json.loads(await page.evaluate(script))
         if not result.get('found'):
             if kind == 'ref':
+                if session_id is not None:
+                    raise self.stale_ref_error(session_id, f'@{value}')
                 raise ValueError(f'element @{value} not found; run snapshot -i again')
             raise ValueError(f'click target not found by {kind}: {value}')
         return result
+
+    @staticmethod
+    def is_owned_popup(opener, popup):
+        return popup.target.opener_id == opener.target.target_id
+
+    async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
+        try:
+            await asyncio.wait_for(
+                page.mouse_click(float(x), float(y)),
+                timeout=timeout_seconds,
+            )
+            return True
+        except TimeoutError:
+            await self.browser.update_targets()
+            if page not in self.browser.tabs:
+                return False
+            raise TimeoutError('native mouse click did not complete')
 
     async def native_click(self, page, x, y):
         minimum_settle_seconds = 0.1
@@ -310,6 +620,8 @@ class BrowserWorker:
         new_tab_timeout_seconds = 2.0
         poll_seconds = 0.05
         before_tabs = len(self.browser.tabs)
+        before_target_ids = {tab.target.target_id for tab in self.browser.tabs}
+        clicking_page = page
         before_url = page.url
         await page.bring_to_front()
         try:
@@ -337,7 +649,9 @@ class BrowserWorker:
         except Exception:
             expect_new_tab = False
 
-        await page.mouse_click(float(x), float(y))
+        click_completed = await self.mouse_click_allowing_target_close(page, x, y)
+        if not click_completed:
+            return page
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + (new_tab_timeout_seconds if expect_new_tab else maximum_settle_seconds)
@@ -347,13 +661,21 @@ class BrowserWorker:
             await page.sleep(poll_seconds)
             now = loop.time()
             if len(self.browser.tabs) > before_tabs:
-                page = self.browser.tabs[-1]
-                await page.bring_to_front()
-                before_tabs = len(self.browser.tabs)
-                before_url = page.url
-                expect_new_tab = False
-                deadline = min(deadline, now + maximum_settle_seconds)
-                last_change = now
+                await self.browser.update_targets()
+                owned_popups = [
+                    tab for tab in self.browser.tabs
+                    if tab.target.target_id not in before_target_ids
+                    and self.is_owned_popup(clicking_page, tab)
+                ]
+                if owned_popups:
+                    page = owned_popups[-1]
+                    await page.bring_to_front()
+                    before_tabs = len(self.browser.tabs)
+                    before_target_ids = {tab.target.target_id for tab in self.browser.tabs}
+                    before_url = page.url
+                    expect_new_tab = False
+                    deadline = min(deadline, now + maximum_settle_seconds)
+                    last_change = now
             try:
                 state = json.loads(await page.evaluate('''JSON.stringify({
                   ready: document.readyState,
@@ -383,28 +705,125 @@ class BrowserWorker:
             pass
         return page
 
+    async def track_clicked_page(self, session_id, previous, page):
+        if page != previous:
+            if not self.is_owned_popup(previous, page):
+                page = previous
+            else:
+                self.popup_openers.setdefault(session_id, []).append(previous)
+                self.popup_just_switched.add(session_id)
+                await self.configure_download_session(session_id, page)
+        if self.popup_openers.get(session_id):
+            await asyncio.sleep(0.1)
+        await self.browser.update_targets()
+        if page not in self.browser.tabs:
+            openers = self.popup_openers.get(session_id, [])
+            while openers:
+                opener = openers.pop()
+                if opener in self.browser.tabs:
+                    await opener.bring_to_front()
+                    self.popup_just_closed.add(session_id)
+                    return opener
+        return page
+
     async def execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
+        uses_ref = (
+            (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
+            or (action in {'fill', 'type', 'select'} and len(parts) > 1)
+            or (action == 'get' and len(parts) > 2 and parts[2].startswith('@'))
+            or (action == 'wait' and len(parts) > 1 and parts[1].startswith('@'))
+        )
+        if uses_ref and session_id in self.snapshot_required_sessions:
+            raise ValueError(
+                'STALE_REF_GUARD: ref-based commands are blocked after a stale ref; '
+                'do not retry the old ref; run exactly: snapshot -i'
+            )
+        if action != 'wait-popup':
+            self.popup_just_switched.discard(session_id)
+        if action != 'wait-popup-close':
+            self.popup_just_closed.discard(session_id)
+
+        if action == 'wait-download':
+            if len(parts) > 2:
+                raise ValueError('usage: wait-download [ms]')
+            timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
+            session_records = {
+                guid: record for guid, record in self.downloads.items()
+                if record.get('sessionId', 'default') == session_id
+            }
+            if session_records:
+                latest_guid = max(
+                    session_records,
+                    key=lambda guid: session_records[guid].get('startedAt', 0),
+                )
+                baseline_guids = set(self.downloads) - {latest_guid}
+                record = await self.wait_for_download(
+                    baseline_guids, self.download_file_snapshot(session_id), timeout_ms, session_id
+                )
+                return self.download_response(record, action, session_id)
+            existing = self.list_downloads(1, session_id)
+            if existing:
+                return self.download_response({'path': existing[0]['path'], 'url': ''}, action, session_id)
+            record = await self.wait_for_download(
+                set(self.downloads), self.download_file_snapshot(session_id), timeout_ms, session_id
+            )
+            return self.download_response(record, action, session_id)
+
+        if action == 'download-latest':
+            if len(parts) != 1:
+                raise ValueError('usage: download-latest')
+            items = self.list_downloads(1, session_id)
+            if not items:
+                raise ValueError(f'no completed downloads for this session')
+            return self.download_response({'path': items[0]['path'], 'url': ''}, action, session_id)
+
+        if action == 'downloads':
+            if len(parts) > 2:
+                raise ValueError('usage: downloads [limit]')
+            limit = int(parts[1]) if len(parts) == 2 else 10
+            if not 1 <= limit <= 100:
+                raise ValueError('download list limit must be between 1 and 100')
+            items = self.list_downloads(limit, session_id)
+            if items:
+                lines = []
+                for index, item in enumerate(items, 1):
+                    state = item['state']
+                    if item.get('progress') is not None:
+                        state += f' {item["progress"]}%'
+                    location = item.get('path') or item.get('url') or '(pending path)'
+                    lines.append(
+                        f'{index}. {item["name"]} — {state} — {item["size"]} bytes — {item["mimeType"]}\n   {location}'
+                    )
+                text = '\n'.join(lines)
+            else:
+                text = 'No downloads for this session'
+            return {'text': text, 'action': action, 'downloads': items}
 
         if action == 'open':
             if len(parts) != 2:
                 raise ValueError('usage: open <url>')
             browser = await self.ensure_browser()
             previous = self.pages.get(session_id)
+            previous_openers = self.popup_openers.pop(session_id, [])
+            await self.configure_download_session(session_id)
             page = await browser.get(parts[1], new_tab=True)
             self.pages[session_id] = page
-            if previous is not None:
-                try:
-                    await previous.close()
-                except Exception:
-                    pass
+            await self.configure_download_session(session_id, page)
+            for old_page in [previous, *previous_openers]:
+                if old_page is not None:
+                    try:
+                        await old_page.close()
+                    except Exception:
+                        pass
             await page.sleep(2)
             return {'text': f'Opened {page.url or parts[1]}', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
             page = await self.require_page(session_id)
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            self.snapshot_required_sessions.discard(session_id)
             return {'text': format_snapshot(elements or []), 'action': action, 'count': len(elements or [])}
 
         if action == 'dismiss':
@@ -437,6 +856,51 @@ class BrowserWorker:
                 text += f'\nVisible overlay containers remaining: {remaining}'
             return {'text': text, 'action': action, 'dismissed': dismissed, 'cookiePolicy': policy}
 
+        if action == 'download-info':
+            if len(parts) != 2 or not parts[1].startswith('@'):
+                raise ValueError('usage: download-info <@ref>')
+            page = await self.require_page(session_id)
+            target = await self.resolve_click_target(page, 'ref', parts[1].removeprefix('@'), session_id)
+            url = target.get('href') or ''
+            if not url:
+                raise ValueError(f'{parts[1]} does not expose a download URL')
+            parsed = urllib.parse.urlparse(url)
+            filename = target.get('download') or Path(urllib.parse.unquote(parsed.path)).name or 'download'
+            mime_type = mimetypes.guess_type(filename)[0] or mimetypes.guess_type(parsed.path)[0] or 'application/octet-stream'
+            page_origin = urllib.parse.urlparse(page.url)
+            cross_origin = (parsed.scheme, parsed.netloc) != (page_origin.scheme, page_origin.netloc)
+            text = (
+                f'Download target: {target.get("text") or filename}\n'
+                f'Name: {filename}\nType: {mime_type}\n'
+                f'Cross-origin: {str(cross_origin).lower()}\nURL: {url}'
+            )
+            return {
+                'text': text,
+                'action': action,
+                'url': url,
+                'filename': filename,
+                'mimeType': mime_type,
+                'crossOrigin': cross_origin,
+            }
+
+        if action == 'download':
+            if len(parts) not in (2, 3) or not parts[1].startswith('@'):
+                raise ValueError('usage: download <@ref> [ms]')
+            timeout_ms = int(parts[2]) if len(parts) == 3 else 30000
+            page = await self.require_page(session_id)
+            target = await self.resolve_click_target(page, 'ref', parts[1].removeprefix('@'), session_id)
+            await self.configure_download_session(session_id, page)
+            baseline_guids = set(self.downloads)
+            before_files = self.download_file_snapshot(session_id)
+            previous = page
+            page = await self.native_click(page, target['x'], target['y'])
+            page = await self.track_clicked_page(session_id, previous, page)
+            self.pages[session_id] = page
+            record = await self.wait_for_download(
+                baseline_guids, before_files, timeout_ms, session_id
+            )
+            return self.download_response(record, action, session_id)
+
         if action == 'click':
             page = await self.require_page(session_id)
             if len(parts) == 3:
@@ -444,14 +908,20 @@ class BrowserWorker:
                     x, y = float(parts[1]), float(parts[2])
                 except ValueError as error:
                     raise ValueError('usage: click <@ref> or click <x> <y>') from error
+                previous = page
+                await self.configure_download_session(session_id, page)
                 page = await self.native_click(page, x, y)
+                page = await self.track_clicked_page(session_id, previous, page)
                 self.pages[session_id] = page
                 return {'text': f'Clicked viewport coordinates ({x:g}, {y:g})\nURL: {page.url}', 'action': action, 'url': page.url}
             if len(parts) != 2 or not parts[1].startswith('@'):
                 raise ValueError('usage: click <@ref> or click <x> <y>')
             normalized = parts[1].removeprefix('@')
-            target = await self.resolve_click_target(page, 'ref', normalized)
+            target = await self.resolve_click_target(page, 'ref', normalized, session_id)
+            previous = page
+            await self.configure_download_session(session_id, page)
             page = await self.native_click(page, target['x'], target['y'])
+            page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             return {'text': f'Clicked {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
 
@@ -462,7 +932,10 @@ class BrowserWorker:
             value = ' '.join(parts[1:])
             kind = 'text' if action == 'click-text' else 'css'
             target = await self.resolve_click_target(page, kind, value)
+            previous = page
+            await self.configure_download_session(session_id, page)
             page = await self.native_click(page, target['x'], target['y'])
+            page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             return {'text': f'Clicked by {kind} "{value}" ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
 
@@ -471,7 +944,8 @@ class BrowserWorker:
                 raise ValueError('usage: click-js <@ref>')
             page = await self.require_page(session_id)
             normalized = parts[1].removeprefix('@')
-            target = await self.resolve_click_target(page, 'ref', normalized)
+            target = await self.resolve_click_target(page, 'ref', normalized, session_id)
+            await self.configure_download_session(session_id, page)
             script = f'''(() => {{
                 const element = document.elementFromPoint({float(target['x'])}, {float(target['y'])});
                 if (!element) return false;
@@ -519,6 +993,7 @@ class BrowserWorker:
             key_map = {'enter': '\n', 'tab': '\t', 'space': ' ', 'backspace': '\b'}
             key = key_map.get(parts[1].lower(), parts[1])
             page = await self.require_page(session_id)
+            await self.configure_download_session(session_id, page)
             focused = await page.select(':focus') or await page.select('body')
             await focused.send_keys(key)
             await page.sleep(1)
@@ -556,6 +1031,97 @@ class BrowserWorker:
                 raise ValueError('usage: get text|url|title [@ref]')
             return {'text': str(text).strip(), 'action': action}
 
+        if action == 'wait-popup':
+            if len(parts) > 2:
+                raise ValueError('usage: wait-popup [ms]')
+            timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
+            page = await self.require_page(session_id)
+            if session_id in self.popup_just_switched:
+                self.popup_just_switched.discard(session_id)
+                return {
+                    'text': f'Popup is already active\nURL: {page.url}',
+                    'action': action,
+                    'url': page.url,
+                }
+            opener_id = page.target.target_id
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_ms / 1000
+            while loop.time() < deadline:
+                await self.browser.update_targets()
+                popup = next((
+                    tab for tab in reversed(self.browser.tabs)
+                    if tab != page and tab.target.opener_id == opener_id
+                ), None)
+                if popup is not None:
+                    self.popup_openers.setdefault(session_id, []).append(page)
+                    self.pages[session_id] = popup
+                    self.popup_just_switched.add(session_id)
+                    await self.configure_download_session(session_id, popup)
+                    await popup.bring_to_front()
+                    while popup.url in ('', 'about:blank') and loop.time() < deadline:
+                        await asyncio.sleep(0.05)
+                        await self.browser.update_targets()
+                    return {
+                        'text': f'Popup opened\nURL: {popup.url}',
+                        'action': action,
+                        'url': popup.url,
+                    }
+                await asyncio.sleep(0.05)
+            raise TimeoutError(f'timed out waiting {timeout_ms}ms for popup to open')
+
+        if action == 'switch':
+            if len(parts) != 2 or parts[1].lower() != 'opener':
+                raise ValueError('usage: switch opener')
+            openers = self.popup_openers.get(session_id, [])
+            await self.browser.update_targets()
+            while openers:
+                opener = openers.pop()
+                if opener in self.browser.tabs:
+                    await opener.bring_to_front()
+                    self.pages[session_id] = opener
+                    self.popup_just_switched.discard(session_id)
+                    return {
+                        'text': f'Switched to popup opener\nURL: {opener.url}',
+                        'action': action,
+                        'url': opener.url,
+                    }
+            raise ValueError('the current page has no available popup opener')
+
+        if action == 'wait-popup-close':
+            if len(parts) > 2:
+                raise ValueError('usage: wait-popup-close [ms]')
+            timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
+            page = await self.require_page(session_id)
+            openers = self.popup_openers.get(session_id, [])
+            if not openers:
+                if session_id in self.popup_just_closed:
+                    self.popup_just_closed.discard(session_id)
+                    return {
+                        'text': f'Popup is already closed; opener is active\nURL: {page.url}',
+                        'action': action,
+                        'url': page.url,
+                    }
+                raise ValueError('the current page has no tracked popup opener')
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_ms / 1000
+            while loop.time() < deadline:
+                await self.browser.update_targets()
+                if page not in self.browser.tabs:
+                    while openers:
+                        opener = openers.pop()
+                        if opener in self.browser.tabs:
+                            await opener.bring_to_front()
+                            self.pages[session_id] = opener
+                            self.popup_just_switched.discard(session_id)
+                            return {
+                                'text': f'Popup closed; returned to opener\nURL: {opener.url}',
+                                'action': action,
+                                'url': opener.url,
+                            }
+                    raise ValueError('popup closed, but its opener is no longer available')
+                await asyncio.sleep(0.05)
+            raise TimeoutError(f'timed out waiting {timeout_ms}ms for popup to close')
+
         if action == 'wait':
             page = await self.require_page(session_id)
             target = parts[1] if len(parts) > 1 else '1000'
@@ -587,6 +1153,9 @@ class BrowserWorker:
 
         if action == 'close':
             page = self.pages.pop(session_id, None)
+            self.popup_openers.pop(session_id, None)
+            self.popup_just_switched.discard(session_id)
+            self.popup_just_closed.discard(session_id)
             if page is not None:
                 try:
                     await page.close()
@@ -643,6 +1212,7 @@ async def server_main(socket_path):
     worker = BrowserWorker()
     session_locks = {}
     browser_structure_lock = asyncio.Lock()
+    client_writers = set()
     stop = asyncio.Event()
     path = Path(socket_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -655,6 +1225,7 @@ async def server_main(socket_path):
     path.unlink(missing_ok=True)
 
     async def handle_client(reader, writer):
+        client_writers.add(writer)
         active_tasks = {}
         write_lock = asyncio.Lock()
 
@@ -675,7 +1246,7 @@ async def server_main(socket_path):
                         response = await execute_request(worker, request)
                 else:
                     async with session_lock:
-                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'close'}:
+                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'download', 'press', 'close'}:
                             async with browser_structure_lock:
                                 response = await execute_request(worker, request)
                         else:
@@ -692,7 +1263,8 @@ async def server_main(socket_path):
             await send_response(response)
             if response.get('action') == 'shutdown':
                 stop.set()
-                writer.close()
+                for client_writer in tuple(client_writers):
+                    client_writer.close()
 
         try:
             while line := await reader.readline():
@@ -718,6 +1290,7 @@ async def server_main(socket_path):
         finally:
             if active_tasks:
                 await asyncio.gather(*tuple(active_tasks.values()), return_exceptions=True)
+            client_writers.discard(writer)
             writer.close()
             await writer.wait_closed()
 

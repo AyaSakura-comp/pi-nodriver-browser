@@ -1,9 +1,12 @@
 <!doctype html>
 <html>
 <body>
+<script>window.addEventListener('message', event => { if (event.data === 'oauth-complete') document.querySelector('#status').textContent = event.data; });</script>
 <input id="query" placeholder="Search term">
 <button id="go" onclick="document.querySelector('#status').textContent='clicked'">Go now</button>
 <a id="new-tab" href="fixture_new_tab.html" target="_blank">Open report</a>
+<a id="oauth-popup" href="fixture_new_tab.html" target="oauth-login">Open OAuth login</a>
+<a id="download-sample" href="download_sample.txt" download="sample-report.txt">Download sample report</a>
 <a id="seed-named-tab" href="fixture_new_tab.html" target="report-window">Seed named report</a>
 <button id="delayed-new-tab" onclick="setTimeout(() => window.open('fixture_new_tab.html', '_blank'), 800)">Open delayed report</button>
 <div id="nested-delayed-new-tab" style="cursor:pointer" onclick="setTimeout(() => window.open('fixture_new_tab.html', '_blank'), 800)"><span>Open nested delayed report</span></div>

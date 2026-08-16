@@ -1,8 +1,11 @@
+import functools
+import http.server
 import json
 import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -11,12 +14,22 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = '__PI_NODRIVER__'
 
 
+class QuietSimpleHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+
 @unittest.skipUnless(os.environ.get('RUN_BROWSER_INTEGRATION') == '1', 'browser integration test')
 class WorkerIntegrationTests(unittest.TestCase):
     def setUp(self):
         python = os.environ.get('NODRIVER_PYTHON', str(ROOT / '.venv/bin/python'))
         self.temp_dir = tempfile.TemporaryDirectory()
-        env = {**os.environ, 'PI_NODRIVER_PROFILE': str(Path(self.temp_dir.name) / 'profile')}
+        self.download_dir = Path(self.temp_dir.name) / 'downloads'
+        env = {
+            **os.environ,
+            'PI_NODRIVER_PROFILE': str(Path(self.temp_dir.name) / 'profile'),
+            'PI_NODRIVER_DOWNLOAD_DIR': str(self.download_dir),
+        }
         self.proc = subprocess.Popen(
             ['xvfb-run', '-a', '-s', '-screen 0 1280x900x24', python, str(ROOT / 'worker.py')],
             stdin=subprocess.PIPE,
@@ -111,6 +124,90 @@ class WorkerIntegrationTests(unittest.TestCase):
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
+    def test_download_info_describes_a_snapshot_target_without_clicking(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        download_ref = next(line for line in snapshot.splitlines() if 'Download sample report' in line).split()[0]
+
+        result = self.command(f'download-info {download_ref}')
+
+        self.assertIn('sample-report.txt', result['text'])
+        self.assertIn('text/plain', result['text'])
+        self.assertIn('download_sample.txt', result['url'])
+
+    def test_downloads_lists_recent_files_without_opening_a_page(self):
+        self.download_dir.mkdir(parents=True)
+        (self.download_dir / 'older.csv').write_text('old')
+        time.sleep(0.01)
+        (self.download_dir / 'latest.pdf').write_bytes(b'%PDF-fixture')
+
+        result = self.command('downloads 5')
+
+        self.assertIn('latest.pdf', result['text'])
+        self.assertIn('older.csv', result['text'])
+        self.assertLess(result['text'].index('latest.pdf'), result['text'].index('older.csv'))
+
+    def test_download_latest_returns_the_newest_completed_file(self):
+        self.download_dir.mkdir(parents=True)
+        (self.download_dir / 'older.csv').write_text('old')
+        time.sleep(0.01)
+        expected = self.download_dir / 'latest.pdf'
+        expected.write_bytes(b'%PDF-fixture')
+
+        result = self.command('download-latest')
+
+        self.assertEqual(Path(result['downloadPath']), expected)
+        self.assertIn('latest.pdf', result['text'])
+        self.assertEqual(result['mimeType'], 'application/pdf')
+
+    def test_wait_download_reports_a_file_started_by_a_normal_click(self):
+        handler = functools.partial(
+            QuietSimpleHTTPRequestHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(f'open http://127.0.0.1:{server.server_port}/fixture.html')
+            snapshot = self.command('snapshot -i')['text']
+            download_ref = next(line for line in snapshot.splitlines() if 'Download sample report' in line).split()[0]
+            self.command(f'click {download_ref}')
+
+            result = self.command('wait-download 5000')
+
+            self.assertEqual(Path(result['downloadPath']).name, 'sample-report.txt')
+            self.assertIn('completed', result['text'].lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_download_click_waits_for_a_completed_file(self):
+        handler = functools.partial(
+            QuietSimpleHTTPRequestHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(f'open http://127.0.0.1:{server.server_port}/fixture.html')
+            snapshot = self.command('snapshot -i')['text']
+            download_ref = next(line for line in snapshot.splitlines() if 'Download sample report' in line).split()[0]
+
+            result = self.command(f'download {download_ref} 5000')
+
+            output = Path(result['downloadPath'])
+            self.assertEqual(output.parent, self.download_dir)
+            self.assertEqual(output.name, 'sample-report.txt')
+            self.assertEqual(output.read_text(), 'Pi Nodriver download fixture\n')
+            self.assertIn('completed', result['text'].lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
     def test_click_returns_quickly_after_synchronous_update(self):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
@@ -143,6 +240,106 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.25)
         self.assertIn('fixture_new_tab.html', result['url'])
         self.assertIn('New tab report ready', self.status())
+
+    def test_popup_close_automatically_returns_to_its_opener(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+        popup_snapshot = self.command('snapshot -i')['text']
+        complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete login' in line).split()[0]
+
+        result = self.command(f'click {complete_ref}')
+
+        self.assertIn('fixture.html', result['url'])
+        self.assertIn('oauth-complete', self.status())
+
+    def test_wait_popup_is_idempotent_after_click_already_switched(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+
+        result = self.command('wait-popup 100')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+
+    def test_wait_popup_detects_a_delayed_child_of_an_active_popup(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+        popup_snapshot = self.command('snapshot -i')['text']
+        nested_ref = next(line for line in popup_snapshot.splitlines() if 'Open nested OAuth' in line).split()[0]
+        self.command(f'click-js {nested_ref}')
+
+        result = self.command('wait-popup 2000')
+
+        self.assertIn('nested=1', result['url'])
+
+    def test_wait_popup_switches_to_a_delayed_oauth_window(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open delayed report' in line).split()[0]
+        self.command(f'click-js {popup_ref}')
+
+        result = self.command('wait-popup 2000')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
+    def test_switch_opener_returns_to_source_without_closing_popup(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+
+        result = self.command('switch opener')
+
+        self.assertIn('fixture.html', result['url'])
+        self.assertIn('Go now', self.status())
+
+    def test_next_command_recovers_after_popup_closes_between_commands(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+        popup_snapshot = self.command('snapshot -i')['text']
+        complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
+        self.command(f'click {complete_ref}')
+        time.sleep(1)
+
+        page_text = self.status()
+
+        self.assertIn('oauth-complete', page_text)
+
+    def test_wait_popup_close_is_idempotent_after_automatic_recovery(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+        popup_snapshot = self.command('snapshot -i')['text']
+        complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
+        self.command(f'click {complete_ref}')
+        time.sleep(1)
+
+        result = self.command('wait-popup-close 100')
+
+        self.assertIn('fixture.html', result['url'])
+
+    def test_wait_popup_close_returns_to_opener_after_oauth_finishes(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
+        self.command(f'click {popup_ref}')
+        popup_snapshot = self.command('snapshot -i')['text']
+        complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
+        self.command(f'click {complete_ref}')
+
+        result = self.command('wait-popup-close 2000')
+
+        self.assertIn('fixture.html', result['url'])
+        self.assertIn('oauth-complete', self.status())
 
     def test_click_waits_for_a_scripted_delayed_new_tab(self):
         self.open_fixture()
