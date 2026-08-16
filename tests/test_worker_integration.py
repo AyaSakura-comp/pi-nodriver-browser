@@ -111,6 +111,80 @@ class WorkerIntegrationTests(unittest.TestCase):
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
+    def test_click_returns_quickly_after_synchronous_update(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        button_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
+
+        started = time.monotonic()
+        self.command(f'click {button_ref}')
+
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertIn('clicked', self.status())
+
+    def test_click_caps_wait_for_continuously_mutating_pages(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        button_ref = next(line for line in snapshot.splitlines() if 'Start noisy updates' in line).split()[0]
+
+        started = time.monotonic()
+        self.command(f'click {button_ref}')
+
+        self.assertLess(time.monotonic() - started, 0.9)
+
+    def test_click_switches_to_a_new_tab_without_fixed_two_second_wait(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        link_ref = next(line for line in snapshot.splitlines() if 'Open report' in line).split()[0]
+
+        started = time.monotonic()
+        result = self.command(f'click {link_ref}')
+
+        self.assertLess(time.monotonic() - started, 1.25)
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
+    def test_click_waits_for_a_scripted_delayed_new_tab(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        button_ref = next(line for line in snapshot.splitlines() if 'Open delayed report' in line).split()[0]
+
+        result = self.command(f'click {button_ref}')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
+    def test_click_detects_a_delayed_new_tab_handler_on_an_ancestor(self):
+        self.open_fixture()
+        result = self.command('click-css "#nested-delayed-new-tab span"')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
+    def test_click_waits_for_a_delayed_named_form_target(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        button_ref = next(line for line in snapshot.splitlines() if 'Open named report' in line).split()[0]
+
+        result = self.command(f'click {button_ref}')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
+    def test_click_switches_to_an_existing_named_form_target(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        seed_ref = next(line for line in snapshot.splitlines() if 'Seed named report' in line).split()[0]
+        self.command(f'click-js {seed_ref}')
+        time.sleep(0.3)
+        snapshot = self.command('snapshot -i')['text']
+        form_ref = next(line for line in snapshot.splitlines() if 'Open named report' in line).split()[0]
+
+        result = self.command(f'click {form_ref}')
+
+        self.assertIn('fixture_new_tab.html', result['url'])
+        self.assertIn('New tab report ready', self.status())
+
     def test_snapshot_and_ref_click_support_custom_div_controls(self):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']

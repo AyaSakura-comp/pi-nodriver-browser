@@ -3,6 +3,13 @@
 <body>
 <input id="query" placeholder="Search term">
 <button id="go" onclick="document.querySelector('#status').textContent='clicked'">Go now</button>
+<a id="new-tab" href="fixture_new_tab.html" target="_blank">Open report</a>
+<a id="seed-named-tab" href="fixture_new_tab.html" target="report-window">Seed named report</a>
+<button id="delayed-new-tab" onclick="setTimeout(() => window.open('fixture_new_tab.html', '_blank'), 800)">Open delayed report</button>
+<div id="nested-delayed-new-tab" style="cursor:pointer" onclick="setTimeout(() => window.open('fixture_new_tab.html', '_blank'), 800)"><span>Open nested delayed report</span></div>
+<form action="fixture_new_tab.html" target="report-window"><button onclick="event.preventDefault(); setTimeout(() => this.form.submit(), 800)"><span>Open named report</span></button></form>
+<button id="noisy" onclick="window.noisyTimer=setInterval(() => document.querySelector('#noise').textContent=Date.now(), 20)">Start noisy updates</button>
+<span id="noise"></span>
 <div id="custom" style="cursor:pointer" onclick="document.querySelector('#status').textContent='custom-clicked'"><span>Custom checkout</span></div>
 <div id="text-target" onclick="document.querySelector('#status').textContent='text-clicked'">加入購物車</div>
 <div id="coordinate-target" style="position:absolute;left:300px;top:300px;width:120px;height:60px;background:red" onclick="document.querySelector('#status').textContent='coordinate-clicked'">Canvas-like target</div>

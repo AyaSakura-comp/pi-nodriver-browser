@@ -305,14 +305,82 @@ class BrowserWorker:
         return result
 
     async def native_click(self, page, x, y):
+        minimum_settle_seconds = 0.1
+        maximum_settle_seconds = 0.5
+        new_tab_timeout_seconds = 2.0
+        poll_seconds = 0.05
         before_tabs = len(self.browser.tabs)
+        before_url = page.url
         await page.bring_to_front()
+        try:
+            expect_new_tab = bool(await page.evaluate(f'''(() => {{
+              window.__piClickSettle?.observer?.disconnect();
+              const hit = document.elementFromPoint({float(x)}, {float(y)});
+              const anchor = hit?.closest?.('a');
+              const control = hit?.closest?.('button,input');
+              const form = control?.form || hit?.closest?.('form');
+              const target = anchor?.target || control?.formTarget || form?.target || '';
+              const opensBrowsingContext = target && !['_self', '_parent', '_top']
+                .includes(target.toLowerCase());
+              let clickHandler = '';
+              for (let element = hit; element; element = element.parentElement) {{
+                clickHandler += ` ${{element.getAttribute?.('onclick') || ''}} ${{element.onclick || ''}}`;
+              }}
+              const state = {{ mutations: 0, observer: null }};
+              state.observer = new MutationObserver(() => state.mutations++);
+              state.observer.observe(document.documentElement, {{
+                subtree: true, childList: true, characterData: true
+              }});
+              window.__piClickSettle = state;
+              return opensBrowsingContext || /(?:window\\.)?open\\s*\\(/.test(clickHandler);
+            }})()'''))
+        except Exception:
+            expect_new_tab = False
+
         await page.mouse_click(float(x), float(y))
-        await page.sleep(2)
-        if len(self.browser.tabs) > before_tabs:
-            page = self.browser.tabs[-1]
-            await page.bring_to_front()
-            await page.sleep(2)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + (new_tab_timeout_seconds if expect_new_tab else maximum_settle_seconds)
+        last_change = started
+        last_mutations = 0
+        while loop.time() < deadline:
+            await page.sleep(poll_seconds)
+            now = loop.time()
+            if len(self.browser.tabs) > before_tabs:
+                page = self.browser.tabs[-1]
+                await page.bring_to_front()
+                before_tabs = len(self.browser.tabs)
+                before_url = page.url
+                expect_new_tab = False
+                deadline = min(deadline, now + maximum_settle_seconds)
+                last_change = now
+            try:
+                state = json.loads(await page.evaluate('''JSON.stringify({
+                  ready: document.readyState,
+                  mutations: window.__piClickSettle?.mutations || 0,
+                  url: location.href
+                })'''))
+                if state['url'] != before_url:
+                    before_url = state['url']
+                    last_change = now
+                if state['mutations'] != last_mutations:
+                    last_mutations = state['mutations']
+                    last_change = now
+            except Exception:
+                last_change = now
+
+            elapsed = now - started
+            quiet = now - last_change
+            if not expect_new_tab and (
+                (elapsed >= minimum_settle_seconds and quiet >= minimum_settle_seconds)
+                or elapsed >= maximum_settle_seconds
+            ):
+                break
+
+        try:
+            await page.evaluate('window.__piClickSettle?.observer?.disconnect()')
+        except Exception:
+            pass
         return page
 
     async def execute(self, command, session_id='default'):

@@ -43,6 +43,11 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('-screen 0 1280x720x24', extension_source)
             worker_source = (extension / 'worker.py').read_text()
             self.assertIn('--window-size=1280,720', worker_source)
+            native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
+            self.assertIn('minimum_settle_seconds = 0.1', native_click)
+            self.assertIn('maximum_settle_seconds = 0.5', native_click)
+            self.assertIn('new_tab_timeout_seconds = 2.0', native_click)
+            self.assertNotIn('page.sleep(1)', native_click)
             updated = json.loads(settings.read_text())
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
