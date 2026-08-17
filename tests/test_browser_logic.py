@@ -80,6 +80,18 @@ class SnapshotFormattingTests(unittest.TestCase):
 
         self.assertIn('download="quarterly.pdf"', output)
 
+    def test_compacts_long_text_and_urls_to_bound_snapshot_tokens(self):
+        output = format_snapshot([{
+            'ref': 'e9',
+            'tag': 'a',
+            'text': 'T' * 400,
+            'href': 'https://example.test/' + 'p' * 400,
+        }])
+
+        self.assertIn('"' + 'T' * 160 + '…"', output)
+        self.assertIn('href="https://example.test/' + 'p' * 139 + '…"', output)
+        self.assertLessEqual(len(output), 340)
+
     def test_formats_interactive_element_for_agent(self):
         output = format_snapshot([
             {

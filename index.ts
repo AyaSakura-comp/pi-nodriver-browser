@@ -16,10 +16,11 @@ const MARKER = "__PI_NODRIVER__";
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
 const DESCRIPTION = `Browser automation through a persistent, headful Google Chrome controlled by Nodriver under Xvfb.
-Workflow: open URL → snapshot -i (get @refs like @e1) → interact → re-snapshot after page changes.
+Workflow: open URL → snapshot -i (get current-viewport @refs like @e1) → interact → re-snapshot after page changes.
 Commands:
   open <url> - Navigate to URL
-  snapshot -i - List visible interactive elements with @refs
+  snapshot -i - List interactive elements in the current viewport with compact @refs
+  snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
   click <x> <y> - Click viewport coordinates (fallback for canvas, cross-origin iframes, and visual-only controls)
   click-text <text> - Click the best visible element matching text or accessible label
@@ -44,7 +45,7 @@ Commands:
   screenshot [--full] - Capture screenshot and return it inline
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
-Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. After any missing/stale ref error, the extension blocks further ref-based commands until you run snapshot -i; never retry the old ref.`;
+Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; ref-based commands remain blocked until you run snapshot -i, so never retry the old ref.`;
 
 type WorkerResponse = {
   id: number;
@@ -131,7 +132,7 @@ class NodriverWorker {
     } catch {
       child = spawn(
         "xvfb-run",
-        ["-a", "-s", "-screen 0 1280x720x24", PYTHON, WORKER, "--server", SOCKET],
+        ["-a", "-s", "-screen 0 960x720x24", PYTHON, WORKER, "--server", SOCKET],
         { cwd: ROOT, stdio: "ignore", detached: true },
       );
       child.unref();
@@ -223,8 +224,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Interact with web pages using a persistent Nodriver-controlled Chrome browser",
     promptGuidelines: [
       "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots.",
-      "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes.",
-      "After a missing or stale @ref error, run snapshot -i as the very next browser command; the extension blocks ref-based commands until then, so never retry the old ref.",
+      "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
+      "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",
+      "A missing or stale @ref does not perform the action and automatically returns both a fresh DOM snapshot and viewport image for joint inspection; run snapshot -i next to unlock ref-based commands, and never retry the old ref.",
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
       "For downloads, inspect with download-info and prefer download <@ref> over clicking and guessing; use downloads to check progress.",
       "Browser close affects only the current Pi session tab; browser shutdown stops the shared daemon for every session.",
@@ -241,7 +243,7 @@ export default function (pi: ExtensionAPI) {
       const response = await responsePromise;
       const text = response.text || "(no output)";
 
-      if (response.action === "screenshot" && response.screenshotPath) {
+      if (response.screenshotPath) {
         const image = readFileSync(response.screenshotPath);
         const extension = extname(response.screenshotPath).toLowerCase();
         const mimeType = extension === ".jpg" || extension === ".jpeg" ? "image/jpeg" : "image/png";

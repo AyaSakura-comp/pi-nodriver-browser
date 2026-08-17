@@ -58,23 +58,28 @@ def _quoted(value: str) -> str:
     return value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
 
 
+def _compact(value: str, limit: int) -> str:
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit] + '…'
+
+
 def format_snapshot(elements: list[dict]) -> str:
     lines: list[str] = []
     for item in elements:
         ref = item.get('ref', '')
         tag = item.get('tag', 'element')
-        text = (item.get('text') or item.get('value') or '').strip()
+        text = _compact(item.get('text') or item.get('value') or '', 160)
         line = f'@{ref} <{tag}>'
         if text:
-            line += f' "{_quoted(text[:300])}"'
+            line += f' "{_quoted(text)}"'
         for key, label in (
             ('ariaLabel', 'aria-label'),
             ('placeholder', 'placeholder'),
             ('href', 'href'),
             ('download', 'download'),
         ):
-            value = (item.get(key) or '').strip()
+            value = _compact(item.get(key) or '', 160)
             if value:
-                line += f' {label}="{_quoted(value[:500])}"'
+                line += f' {label}="{_quoted(value)}"'
         lines.append(line)
     return '\n'.join(lines) if lines else '(no interactive elements)'

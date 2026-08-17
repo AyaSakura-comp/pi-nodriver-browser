@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { margin: 0; }
+    section { height: 650px; padding: 20px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <output id="status" style="position:fixed;right:10px;top:10px">idle</output>
+  <section><button id="top-action" onclick="document.getElementById('status').textContent='top-clicked'">Top viewport action</button></section>
+  <section><button id="middle-action" onclick="document.getElementById('status').textContent='middle-clicked'">Middle viewport action</button></section>
+  <section><button id="bottom-action" onclick="document.getElementById('status').textContent='bottom-clicked'">Bottom viewport action</button></section>
+</body>
+</html>

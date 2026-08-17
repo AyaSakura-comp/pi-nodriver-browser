@@ -124,6 +124,41 @@ class WorkerIntegrationTests(unittest.TestCase):
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
+    def test_snapshot_lists_only_interactive_objects_in_the_current_viewport(self):
+        fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+        top_snapshot = self.command('snapshot -i')['text']
+        self.assertIn('Top viewport action', top_snapshot)
+        self.assertNotIn('Middle viewport action', top_snapshot)
+        self.assertNotIn('Bottom viewport action', top_snapshot)
+        top_ref = next(line for line in top_snapshot.splitlines() if 'Top viewport action' in line).split()[0]
+        self.command(f'click {top_ref}')
+        self.assertIn('top-clicked', self.command('get text')['text'])
+
+        self.command('scroll down 650')
+        middle_snapshot = self.command('snapshot -i')['text']
+        self.assertNotIn('Top viewport action', middle_snapshot)
+        self.assertNotIn('Middle viewport action', middle_snapshot)
+        self.assertIn('Bottom viewport action', middle_snapshot)
+        bottom_ref = next(line for line in middle_snapshot.splitlines() if 'Bottom viewport action' in line).split()[0]
+        self.command(f'click {bottom_ref}')
+        self.assertIn('bottom-clicked', self.command('get text')['text'])
+
+    def test_full_snapshot_is_visual_only_and_prompts_scroll_exploration(self):
+        fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+        result = self.command('snapshot -i --full')
+
+        self.assertEqual(result['action'], 'snapshot-full-vision')
+        self.assertEqual(result['count'], 0)
+        self.assertNotIn('@e', result['text'])
+        self.assertIn('Visual overview only', result['text'])
+        self.assertIn('scroll down', result['text'])
+        self.assertTrue(Path(result['screenshotPath']).is_file())
+        self.assertGreater(Path(result['screenshotPath']).stat().st_size, 0)
+
     def test_download_info_describes_a_snapshot_target_without_clicking(self):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']

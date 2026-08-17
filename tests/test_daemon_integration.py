@@ -305,11 +305,15 @@ class DaemonIntegrationTests(unittest.TestCase):
         stale_ref = next(line for line in old_snapshot.splitlines() if 'Go now' in line).split()[0]
         self.command(f'open {overlay_url}', request_id=3)
 
-        first_failure = self.command_raw(f'click {stale_ref}', request_id=4)
+        recovery = self.command_raw(f'click {stale_ref}', request_id=4)
         guarded_failure = self.command_raw(f'click {stale_ref}', request_id=5)
 
-        self.assertFalse(first_failure['ok'])
-        self.assertIn('run snapshot -i again', first_failure['error'])
+        self.assertTrue(recovery['ok'])
+        self.assertEqual(recovery['action'], 'stale-ref-recovery')
+        self.assertIn(f'CLICK NOT PERFORMED: {stale_ref}', recovery['text'])
+        self.assertIn('Fresh DOM snapshot:', recovery['text'])
+        self.assertTrue(Path(recovery['screenshotPath']).is_file())
+        self.assertEqual(Path(recovery['screenshotPath']).suffix, '.jpg')
         self.assertFalse(guarded_failure['ok'])
         self.assertIn('STALE_REF_GUARD', guarded_failure['error'])
         self.assertIn('run exactly: snapshot -i', guarded_failure['error'])

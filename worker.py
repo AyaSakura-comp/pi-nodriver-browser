@@ -21,6 +21,13 @@ from browser_logic import format_snapshot, parse_command, parse_devtools_active_
 MARKER = '__PI_NODRIVER__'
 logging.basicConfig(level=logging.CRITICAL)
 
+
+class StaleRefError(ValueError):
+    def __init__(self, ref):
+        self.ref = ref
+        super().__init__(f'element {ref} not found; run snapshot -i again')
+
+
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   document.querySelectorAll('[data-pi-dismiss-ref]').forEach(el => el.removeAttribute('data-pi-dismiss-ref'));
 
@@ -103,7 +110,8 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' &&
-      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
+      rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
   };
   const interactive = el => {
     if (el.matches(semanticSelector)) return true;
@@ -252,7 +260,7 @@ class BrowserWorker:
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
                     user_data_dir=str(profile),
-                    browser_args=['--window-size=1280,720', '--no-first-run', '--no-default-browser-check'],
+                    browser_args=['--window-size=960,720', '--no-first-run', '--no-default-browser-check'],
                     sandbox=not should_disable_sandbox(),
                     lang='zh-TW',
                 )
@@ -575,7 +583,30 @@ class BrowserWorker:
 
     def stale_ref_error(self, session_id, ref):
         self.snapshot_required_sessions.add(session_id)
-        return ValueError(f'element {ref} not found; run snapshot -i again')
+        return StaleRefError(ref)
+
+    async def stale_ref_recovery(self, session_id, ref):
+        page = await self.require_page(session_id)
+        elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+        output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-stale-'))
+        output = output_dir / 'snapshot.jpg'
+        screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+        await asyncio.wait_for(
+            page.save_screenshot(output, format='jpeg', full_page=False),
+            timeout=screenshot_timeout,
+        )
+        snapshot = format_snapshot(elements or [])
+        return {
+            'text': (
+                f'CLICK NOT PERFORMED: {ref} is stale.\n'
+                'STALE_REF_GUARD remains active; use the image and fresh DOM snapshot together to reassess the page. '
+                'Run exactly: snapshot -i before issuing another ref-based command.\n\n'
+                f'Fresh DOM snapshot:\n{snapshot}'
+            ),
+            'action': 'stale-ref-recovery',
+            'count': len(elements or []),
+            'screenshotPath': str(output),
+        }
 
     async def element(self, session_id, ref):
         page = await self.require_page(session_id)
@@ -821,7 +852,28 @@ class BrowserWorker:
             return {'text': f'Opened {page.url or parts[1]}', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
+            if parts not in (['snapshot', '-i'], ['snapshot', '-i', '--full']):
+                raise ValueError('usage: snapshot -i [--full]')
             page = await self.require_page(session_id)
+            if '--full' in parts:
+                output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-full-'))
+                output = output_dir / 'overview.jpg'
+                screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+                await asyncio.wait_for(
+                    page.save_screenshot(output, format='jpeg', full_page=True),
+                    timeout=screenshot_timeout,
+                )
+                return {
+                    'text': (
+                        'Visual overview only; no DOM refs were generated. Inspect the image first. '
+                        'Then use scroll down or scroll up and run snapshot -i to inspect and interact with '
+                        'objects in each current viewport. Do not report an object as missing until you have '
+                        'checked the likely page sections and reached the relevant page boundary.'
+                    ),
+                    'action': 'snapshot-full-vision',
+                    'count': 0,
+                    'screenshotPath': str(output),
+                }
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             self.snapshot_required_sessions.discard(session_id)
             return {'text': format_snapshot(elements or []), 'action': action, 'count': len(elements or [])}
@@ -1182,6 +1234,20 @@ async def execute_request(worker, request):
             timeout=command_timeout,
         )
         return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **result}
+    except StaleRefError as error:
+        try:
+            recovery = await asyncio.wait_for(
+                worker.stale_ref_recovery(session_id, error.ref),
+                timeout=command_timeout,
+            )
+            return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **recovery}
+        except Exception as recovery_error:
+            return {
+                'id': request.get('id'),
+                'sessionId': session_id,
+                'ok': False,
+                'error': f'{type(error).__name__}: {error}; visual recovery failed: {recovery_error}',
+            }
     except TimeoutError:
         return {
             'id': request.get('id'),
