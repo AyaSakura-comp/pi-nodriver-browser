@@ -134,8 +134,9 @@ screenshot --full
 8. OAuth/login popups opened by a click become the session's active page. When a popup closes, the next command automatically returns to its opener.
 9. Normal snapshots include only elements intersecting the current viewport and compact long text/URLs to control token use. `snapshot -i --full` returns only a full-page visual overview; the model must inspect it, scroll to likely sections, and run normal snapshots there before concluding an object is missing.
 10. A navigation or major DOM change invalidates old references. A missing/stale ref never performs the requested action; it atomically captures a fresh current-viewport DOM snapshot and viewport JPG so the model can compare structure with vision. A per-session guard then blocks further ref-based commands until an explicit `snapshot -i` succeeds; text, CSS, coordinate, and overlay-dismiss fallbacks remain available.
-11. Pi task/session shutdown closes only its socket connection. The daemon, Xvfb, Chrome, session tabs, and in-memory page map remain alive.
-12. `close` closes only the caller's tab. `shutdown`, installer upgrade, uninstall, process termination, or machine restart closes the shared daemon and Chrome.
+11. A per-session loop guard tracks consecutive identical commands. Observing commands (`wait`, `snapshot`, `screenshot`, `get`, `downloads`, `download-info`) cannot return new information when repeated verbatim, so the third identical repeat in a row is rejected with a `LOOP_GUARD` error that tells the model to abandon the browser and answer via web search or its own knowledge. Any different command resets the counter, and state-changing commands such as `scroll down` or `press` may repeat freely. The tool description and prompt guidelines also scope the browser to tasks that genuinely require driving a live page, so general research never enters the browser in the first place.
+12. Pi task/session shutdown closes only its socket connection. The daemon, Xvfb, Chrome, session tabs, and in-memory page map remain alive.
+13. `close` closes only the caller's tab. `shutdown`, installer upgrade, uninstall, process termination, or machine restart closes the shared daemon and Chrome.
 
 ## Browser command reference
 

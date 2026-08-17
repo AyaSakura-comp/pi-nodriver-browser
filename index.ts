@@ -16,6 +16,7 @@ const MARKER = "__PI_NODRIVER__";
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
 const DESCRIPTION = `Browser automation through a persistent, headful Google Chrome controlled by Nodriver under Xvfb.
+Use this only when the answer requires driving a live page: logging in, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
 Workflow: open URL → snapshot -i (get current-viewport @refs like @e1) → interact → re-snapshot after page changes.
 Commands:
   open <url> - Navigate to URL
@@ -45,7 +46,8 @@ Commands:
   screenshot [--full] - Capture screenshot and return it inline
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
-Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; ref-based commands remain blocked until you run snapshot -i, so never retry the old ref.`;
+Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; ref-based commands remain blocked until you run snapshot -i, so never retry the old ref.
+Never send the same observing command (wait, snapshot, screenshot, get, downloads, download-info) twice in a row: it cannot return anything new, and a third identical repeat is rejected with LOOP_GUARD. On LOOP_GUARD, leave the browser and answer with web search or your own knowledge rather than retrying.`;
 
 type WorkerResponse = {
   id: number;
@@ -223,7 +225,10 @@ export default function (pi: ExtensionAPI) {
     description: DESCRIPTION,
     promptSnippet: "Interact with web pages using a persistent Nodriver-controlled Chrome browser",
     promptGuidelines: [
-      "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots.",
+      "Use browser only for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots on a live page.",
+      "Do not open browser for general research, factual look-ups, policy or product questions, or anything a search result or your own knowledge already answers; prefer web search or firecrawl there, and answer directly when neither is needed.",
+      "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
+      "A LOOP_GUARD error means the same observing command was repeated and the browser is not making progress: stop using browser for this question and answer with web search or your own knowledge.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
       "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",
       "A missing or stale @ref does not perform the action and automatically returns both a fresh DOM snapshot and viewport image for joint inspection; run snapshot -i next to unlock ref-based commands, and never retry the old ref.",

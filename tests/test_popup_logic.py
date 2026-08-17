@@ -191,3 +191,42 @@ class PopupOwnershipTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LoopGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = BrowserWorker()
+
+    def repeat(self, command, times):
+        for _ in range(times):
+            parts = command.split()
+            self.worker.track_repeat('s1', parts[0], parts)
+
+    def test_third_identical_observing_command_is_rejected(self):
+        self.repeat('wait 3000', 2)
+        with self.assertRaises(ValueError) as caught:
+            self.repeat('wait 3000', 1)
+        self.assertIn('LOOP_GUARD', str(caught.exception))
+
+    def test_two_identical_observing_commands_are_allowed(self):
+        self.repeat('snapshot -i', 2)
+
+    def test_different_command_resets_the_counter(self):
+        self.repeat('wait 3000', 2)
+        self.repeat('scroll down', 1)
+        self.repeat('wait 3000', 2)
+
+    def test_state_changing_commands_may_repeat_freely(self):
+        self.repeat('scroll down', 10)
+        self.repeat('press Enter', 10)
+
+    def test_guard_is_per_session(self):
+        for _ in range(2):
+            self.worker.track_repeat('a', 'wait', ['wait', '3000'])
+            self.worker.track_repeat('b', 'wait', ['wait', '3000'])
+
+    def test_counter_resets_after_firing(self):
+        self.repeat('wait 3000', 2)
+        with self.assertRaises(ValueError):
+            self.repeat('wait 3000', 1)
+        self.repeat('wait 3000', 2)

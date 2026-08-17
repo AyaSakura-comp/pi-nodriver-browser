@@ -28,6 +28,12 @@ class StaleRefError(ValueError):
         super().__init__(f'element {ref} not found; run snapshot -i again')
 
 
+# Commands that observe the page without changing it. Repeating one of these
+# verbatim cannot produce new information, so an identical repeat is a loop.
+NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'get', 'downloads', 'download-info'}
+REPEAT_LIMIT = 3
+
+
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   document.querySelectorAll('[data-pi-dismiss-ref]').forEach(el => el.removeAttribute('data-pi-dismiss-ref'));
 
@@ -241,6 +247,7 @@ class BrowserWorker:
         self.popup_just_switched = set()
         self.popup_just_closed = set()
         self.snapshot_required_sessions = set()
+        self.repeated_commands = {}
         configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
         self.download_dir = (
             Path(configured_download_dir).expanduser()
@@ -757,9 +764,31 @@ class BrowserWorker:
                     return opener
         return page
 
+    def track_repeat(self, session_id, action, parts):
+        signature = ' '.join(parts)
+        previous, count = self.repeated_commands.get(session_id, (None, 0))
+        if signature != previous:
+            self.repeated_commands[session_id] = (signature, 1)
+            return
+        count += 1
+        self.repeated_commands[session_id] = (signature, count)
+        if action not in NON_PROGRESSING_ACTIONS or count < REPEAT_LIMIT:
+            return
+        self.repeated_commands.pop(session_id, None)
+        raise ValueError(
+            f'LOOP_GUARD: "{signature}" ran {count} times in a row and cannot return anything new. '
+            'Stop repeating it. The browser is only worth using when the answer requires driving a '
+            'live page (logging in, clicking through a flow, reading something behind interaction). '
+            'If the question is general research or the page is not cooperating, abandon the browser '
+            'now and answer using web search, firecrawl, or your own knowledge instead. '
+            'If you do stay in the browser, the next command must be a different one that changes '
+            'state or target: open <url>, scroll, click, or close.'
+        )
+
     async def execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
+        self.track_repeat(session_id, action, parts)
         uses_ref = (
             (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action in {'fill', 'type', 'select'} and len(parts) > 1)
@@ -1208,6 +1237,7 @@ class BrowserWorker:
             self.popup_openers.pop(session_id, None)
             self.popup_just_switched.discard(session_id)
             self.popup_just_closed.discard(session_id)
+            self.repeated_commands.pop(session_id, None)
             if page is not None:
                 try:
                     await page.close()
