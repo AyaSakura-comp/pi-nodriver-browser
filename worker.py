@@ -807,6 +807,46 @@ class BrowserWorker:
             'state or target: open <url>, scroll, click, or close.'
         )
 
+    def apply_guidance_hooks(self, session_id, action, result, page):
+        try:
+            hints = []
+            url = getattr(page, 'url', '') or result.get('url', '')
+            url_lower = (url or '').lower()
+            text = result.get('text', '')
+
+            # Hook 1: Anti-Scroll Loop & Long Page Hook
+            if action == 'scroll':
+                direction = result.get('action_args', ['down'])[0] if isinstance(result.get('action_args'), list) else 'scroll'
+                self.scroll_history.setdefault(session_id, []).append(direction)
+                if len(self.scroll_history.get(session_id, [])) >= 2:
+                    hints.append("💡 [Guidance: Multiple scrolls detected. If exploring page structure, use 'snapshot -i --full' or 'screenshot --full' to view the entire layout in 1 step, or proceed to answer.]")
+            elif action in ('click', 'fill', 'open', 'type', 'select', 'press'):
+                self.scroll_history[session_id] = []
+
+            # Hook 2: Search Result Reached Hook
+            if any(k in url_lower for k in ['/search', 'searchkeyword', 'search.momo', 'pchome.com.tw/search', 'amazon.com/s', 'google.com/search']):
+                if action in ('open', 'click', 'press', 'snapshot', 'screenshot'):
+                    hints.append("💡 [Guidance: Search results visible. If required info (price, stock, specs) is present, stop browsing and answer the user directly.]")
+
+            # Hook 3: Product Detail Page Hook
+            if any(k in url_lower for k in ['goodsdetail', '/dp/', '/item/', '/product/', 'productid']):
+                if action in ('open', 'click'):
+                    hints.append("💡 [Guidance: Product detail page loaded. Use 'snapshot -i' to locate purchase/spec elements (@ref). Avoid exploring unrelated tabs.]")
+
+            # Hook 4: Secondary Tab / Review Trap Hook
+            if any(k in url_lower for k in ['#reviews', 'tab=review', 'tab=explore', '#explore', 'customerreviews']):
+                hints.append("💡 [Guidance: Currently in secondary tab (Reviews/Explore). Use 'scroll up' or click main tab to return to product overview.]")
+
+            # Hook 5: Overlay / App Banner Hint
+            if action == 'snapshot' and any(k in text for k in ['立即體驗', '下載App', '下載 24h', 'Close overlay', 'aria-label="關閉"']):
+                hints.append("💡 [Guidance: App promo overlay detected in DOM. Use 'click @ref' (or 'dismiss overlays') to close it.]")
+
+            if hints and isinstance(result.get('text'), str):
+                result['text'] = result['text'].rstrip() + "\n\n" + "\n".join(hints)
+        except Exception:
+            pass
+        return result
+
     async def execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
