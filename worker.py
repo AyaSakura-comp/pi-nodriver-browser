@@ -890,7 +890,19 @@ class BrowserWorker:
             previous = self.pages.get(session_id)
             previous_openers = self.popup_openers.pop(session_id, [])
             await self.configure_download_session(session_id)
-            page = await browser.get(parts[1], new_tab=True)
+            page = await browser.get('about:blank', new_tab=True)
+
+            # Enforce iPhone Mobile Mode (Portrait 390x844 with Touch Emulation)
+            ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+            w, h = 390, 844
+            await page.send(uc.cdp.network.set_user_agent_override(user_agent=ua))
+            await page.send(uc.cdp.emulation.set_device_metrics_override(
+                width=w, height=h, device_scale_factor=3.0, mobile=True
+            ))
+            await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
+            page._is_mobile_mode = True
+
+            await page.get(parts[1])
             self.pages[session_id] = page
             await self.configure_download_session(session_id, page)
             for old_page in [previous, *previous_openers]:
@@ -900,7 +912,7 @@ class BrowserWorker:
                     except Exception:
                         pass
             await self.wait_for_page_ready(page)
-            return {'text': f'Opened {page.url or parts[1]}', 'action': action, 'url': page.url or parts[1]}
+            return {'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
             if parts not in (['snapshot', '-i'], ['snapshot', '-i', '--full']):
