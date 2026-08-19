@@ -1257,8 +1257,7 @@ class BrowserWorker:
             raise TimeoutError(f'timed out waiting {timeout_ms}ms for popup to close')
 
         if action == 'wait':
-            # Instantaneous no-op; all actions are already self-settled
-            return {'text': 'Page and DOM state are already fully settled; proceed directly', 'action': action}
+            raise ValueError("Command 'wait' does not exist and is unnecessary. All browser actions (open, click, scroll) automatically settle DOM and network. Proceed DIRECTLY to snapshot -i or screenshot.")
 
 
         if action == 'mobile':
