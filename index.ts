@@ -20,7 +20,6 @@ Use this only when the answer requires driving a live page: logging in (當需�
 Workflow: open URL → snapshot -i or screenshot → click/interact → snapshot/screenshot. (All commands like open, click, scroll automatically wait for DOM/UI settling; NEVER send standalone 'wait <ms>' like wait 500 or wait 1000).
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
-  mobile [on|off|iphone|android] - Toggle mobile emulation mode (390x844 viewport & touch events)
   open <url> - Navigate to URL
   snapshot -i - List interactive elements in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
