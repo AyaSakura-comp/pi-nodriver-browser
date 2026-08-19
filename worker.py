@@ -1111,7 +1111,26 @@ class BrowserWorker:
             await self.configure_download_session(session_id, page)
             focused = await page.select(':focus') or await page.select('body')
             await focused.send_keys(key)
-            await page.sleep(1)
+            if parts[1].lower() == 'enter':
+                submit_script = '''(() => {
+                    const el = document.activeElement;
+                    if (!el) return false;
+                    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+                    el.dispatchEvent(new KeyboardEvent('keydown', opts));
+                    el.dispatchEvent(new KeyboardEvent('keypress', opts));
+                    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+                    const form = el.closest ? el.closest('form') : (el.form || null);
+                    if (form && typeof form.requestSubmit === 'function') {
+                        try { form.requestSubmit(); return true; } catch (e) {}
+                    }
+                    const searchBtn = el.parentElement ? el.parentElement.querySelector('button, [class*="search"], [type="submit"]') : null;
+                    if (searchBtn) {
+                        try { searchBtn.click(); return true; } catch (e) {}
+                    }
+                    return false;
+                })()'''
+                await page.evaluate(submit_script)
+            await page.sleep(0.3)
             return {'text': f'Pressed {parts[1]}', 'action': action}
 
         if action == 'scroll':
