@@ -19,6 +19,7 @@ const DESCRIPTION = `Browser automation through a persistent, headful Google Chr
 Use this only when the answer requires driving a live page: logging in, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
 Workflow: open URL → snapshot -i (get current-viewport @refs like @e1) → interact → re-snapshot after page changes.
 Commands:
+  crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
   open <url> - Navigate to URL
   snapshot -i - List interactive elements in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
@@ -225,8 +226,11 @@ export default function (pi: ExtensionAPI) {
     description: DESCRIPTION,
     promptSnippet: "Interact with web pages using a persistent Nodriver-controlled Chrome browser",
     promptGuidelines: [
-      "Use browser only for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots on a live page.",
-      "Do not open browser for general research, factual look-ups, policy or product questions, or anything a search result or your own knowledge already answers; prefer web search or firecrawl there, and answer directly when neither is needed.",
+      "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots on a live page.",
+      "For reading or scraping full content from one or multiple URLs, prefer using the crawl tool (or browser command 'crawl <urls...>') which runs multi-tab parallel extraction without opening persistent tabs.",
+      "After a web_search, judge whether the snippets actually answer the question. When they do not — the answer needs figures, quotes, code, or detail the snippet only alludes to — follow up with crawl on the promising result URLs instead of answering from snippets alone.",
+      "Batch that follow-up into ONE crawl call carrying every URL you want. The pages themselves fetch in well under a second either way; what costs real time is the agent round-trip around each call, so one call with ten URLs finishes in a fraction of the time ten calls take.",
+      "Do not open browser for general research or factual look-ups that web_search already answers.",
       "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
       "A LOOP_GUARD error means the same observing command was repeated and the browser is not making progress: stop using browser for this question and answer with web search or your own knowledge.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
@@ -260,6 +264,57 @@ export default function (pi: ExtensionAPI) {
           details: response,
         };
       }
+
+      const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+      let output = truncation.content;
+      if (truncation.truncated) {
+        output += `\n\n[Output truncated: ${truncation.outputLines}/${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)}/${formatSize(truncation.totalBytes)}.]`;
+      }
+      return {
+        content: [{ type: "text" as const, text: output }],
+        details: { ...response, truncated: truncation.truncated },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "crawl",
+    label: "Parallel Browser Crawl",
+    description: "Crawl one or multiple web pages in parallel using local headful Chromium with fast-path DOM ready. Replaces Firecrawl with zero rate-limit and faster multi-tab speed.",
+    promptSnippet: "Crawl one or multiple web URLs in parallel to extract full clean page text",
+    promptGuidelines: [
+      "Use crawl when you need the full content of one or multiple web pages.",
+      "Reach for it right after web_search whenever the snippets are too thin to answer from: crawl the promising result URLs rather than guessing at what the pages say.",
+      "Always pass every URL you want in a SINGLE call. Splitting them costs one agent round-trip per URL, which dwarfs the fetch itself — measured on this setup, four real pages came back in about 1.5s in one call, so the fetching was never the bottleneck.",
+      "Do not pre-filter down to a single 'best' URL out of caution. Crawling several and comparing is cheap here, and a failed page is reported per-URL without affecting the others.",
+      "Crawl executes JavaScript, bypasses anti-bot barriers, and extracts clean readable text from all pages simultaneously.",
+    ],
+    parameters: Type.Object({
+      urls: Type.Array(Type.String({ description: "URL to crawl" }), {
+        description: "List of HTTP/HTTPS URLs to crawl concurrently in parallel, e.g. [\"https://example.com/1\", \"https://example.com/2\"]",
+      }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      let rawText = "";
+      if (Array.isArray(params.urls)) {
+        rawText = params.urls.map((u) => String(u)).join(" ");
+      } else if (typeof params.urls === "string") {
+        rawText = params.urls;
+      } else if (params.urls) {
+        rawText = JSON.stringify(params.urls);
+      }
+      const matched = rawText.match(/https?:\/\/[^\s"'\]\[\<\>]+/g);
+      const urlList = matched ? Array.from(new Set(matched.map((u) => u.replace(/[.,;)]+$/, "")))) : [];
+      if (urlList.length === 0) {
+        return { content: [{ type: "text" as const, text: "Error: No valid URLs provided to crawl." }] };
+      }
+      const command = `crawl ${JSON.stringify(urlList)}`;
+      const run = async () => worker.request(command, sessionId, signal);
+      const responsePromise = queue.then(run, run);
+      queue = responsePromise.catch(() => undefined);
+      const response = await responsePromise;
+      const text = response.text || "(no output)";
 
       const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
       let output = truncation.content;

@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -569,6 +570,27 @@ class BrowserWorker:
             self.download_frame_sessions.clear()
             self.download_target_sessions.clear()
 
+    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.08):
+        """
+        Adaptive fast-path DOM ready detector.
+        Returns as soon as document.readyState is interactive/complete and body has content,
+        polling every 80ms up to timeout_sec (default 2.0s).
+        """
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                state = await page.evaluate("document.readyState")
+                if state in ("interactive", "complete"):
+                    has_content = await page.evaluate(
+                        "Boolean(document.body && (document.body.innerText.length > 0 || document.body.children.length > 0))"
+                    )
+                    if has_content:
+                        await asyncio.sleep(0.05)
+                        return
+                await asyncio.sleep(poll_interval)
+        except Exception:
+            await page.sleep(0.3)
+
     async def require_page(self, session_id):
         page = self.pages.get(session_id)
         if page is None:
@@ -877,7 +899,7 @@ class BrowserWorker:
                         await old_page.close()
                     except Exception:
                         pass
-            await page.sleep(2)
+            await self.wait_for_page_ready(page)
             return {'text': f'Opened {page.url or parts[1]}', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
@@ -1231,6 +1253,89 @@ class BrowserWorker:
             except TimeoutError as error:
                 raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
             return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
+
+        if action == 'crawl':
+            remainder = command[len('crawl'):].strip()
+            # Robust URL extraction: supports JSON arrays, space/newline separated, or quoted URLs
+            extracted = re.findall(r'https?://[^\s"\'\]\[\<\>]+', remainder)
+            # Clean trailing punctuation that might come from sentence end
+            urls = []
+            for u in extracted:
+                u_clean = u.rstrip('.,;)')
+                if u_clean and u_clean not in urls:
+                    urls.append(u_clean)
+
+            if not urls:
+                raise ValueError('usage: crawl <url1> [url2] [url3] ...')
+
+            await self.ensure_browser()
+
+            async def crawl_single(target_url, idx):
+                tab = None
+                t0 = asyncio.get_running_loop().time()
+                try:
+                    tab = await self.browser.get("about:blank", new_tab=True)
+                    await tab.get(target_url)
+                    await self.wait_for_page_ready(tab, timeout_sec=4.0)
+                    title = await tab.evaluate("document.title") or "No Title"
+                    text = await tab.evaluate("document.body.innerText") or ""
+                    clean_text = str(text).strip()
+                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+                    return {
+                        "index": idx + 1,
+                        "url": target_url,
+                        "title": str(title).strip(),
+                        "text": clean_text,
+                        "ok": bool(clean_text),
+                        "chars": len(clean_text),
+                        "elapsed": elapsed
+                    }
+                except Exception as err:
+                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+                    return {
+                        "index": idx + 1,
+                        "url": target_url,
+                        "title": "Error",
+                        "text": "",
+                        "ok": False,
+                        "error": str(err),
+                        "chars": 0,
+                        "elapsed": elapsed
+                    }
+                finally:
+                    if tab is not None:
+                        try:
+                            await tab.close()
+                        except Exception:
+                            pass
+
+            results = await asyncio.gather(*(crawl_single(url, i) for i, url in enumerate(urls)))
+            successful = [r for r in results if r["ok"]]
+            total_chars = sum(r["chars"] for r in results)
+
+            output_parts = [
+                f"Parallel Crawl Completed: {len(successful)}/{len(urls)} pages successfully captured ({total_chars:,} total characters)."
+            ]
+            for r in results:
+                if r["ok"]:
+                    output_parts.append(
+                        f"### [{r['index']}] [{r['title']}]({r['url']})\n"
+                        f"*Status: OK | Length: {r['chars']:,} chars | Time: {r['elapsed']}s*\n\n"
+                        f"{r['text']}\n"
+                    )
+                else:
+                    output_parts.append(
+                        f"### [{r['index']}] [Failed] {r['url']}\n"
+                        f"*Status: FAILED | Error: {r.get('error', 'No text extracted')}*\n"
+                    )
+
+            return {
+                "text": "\n---\n".join(output_parts),
+                "action": "crawl",
+                "results": results,
+                "successCount": len(successful),
+                "totalCount": len(urls)
+            }
 
         if action == 'close':
             page = self.pages.pop(session_id, None)
