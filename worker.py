@@ -807,21 +807,30 @@ class BrowserWorker:
             'state or target: open <url>, scroll, click, or close.'
         )
 
-    def apply_guidance_hooks(self, session_id, action, result, page):
+    def apply_guidance_hooks(self, session_id, action, result, page, parts=None):
         try:
             hints = []
             url = getattr(page, 'url', '') or result.get('url', '')
             url_lower = (url or '').lower()
             text = result.get('text', '')
 
-            # Hook 1: Anti-Scroll Loop & Long Page Hook
+            # Track rolling action history
+            history = self.scroll_history.setdefault(session_id, [])
             if action == 'scroll':
-                direction = result.get('action_args', ['down'])[0] if isinstance(result.get('action_args'), list) else 'scroll'
-                self.scroll_history.setdefault(session_id, []).append(direction)
-                if len(self.scroll_history.get(session_id, [])) >= 2:
-                    hints.append("💡 [Guidance: Multiple scrolls detected. If exploring page structure, use 'snapshot -i --full' or 'screenshot --full' to view the entire layout in 1 step, or proceed to answer.]")
-            elif action in ('click', 'fill', 'open', 'type', 'select', 'press'):
+                direction = parts[1].lower() if parts and len(parts) > 1 else 'down'
+                history.append(f'scroll-{direction}')
+            elif action == 'screenshot':
+                history.append('screenshot')
+            elif action in ('click', 'click-text', 'click-css', 'fill', 'open', 'type', 'select', 'press'):
                 self.scroll_history[session_id] = []
+                history = []
+
+            # Hook 1: Anti-Scroll Loop & Ping-Pong Circuit Breaker
+            scroll_count = sum(1 for a in history if a.startswith('scroll-'))
+            has_ping_pong = ('scroll-down' in history and 'scroll-up' in history)
+            
+            if scroll_count >= 2 or has_ping_pong:
+                hints.append("⚠️ [CIRCUIT BREAKER: Back-and-forth scrolling detected. DO NOT scroll again. Use 'screenshot --full' to view the whole page at once, or stop and answer the user immediately with what you already have.]")
 
             # Hook 2: Search Result Reached Hook
             if any(k in url_lower for k in ['/search', 'searchkeyword', 'search.momo', 'pchome.com.tw/search', 'amazon.com/s', 'google.com/search']):
@@ -1175,6 +1184,11 @@ class BrowserWorker:
 
         if action == 'scroll':
             page = await self.require_page(session_id)
+            history = self.scroll_history.get(session_id, [])
+            scroll_count = sum(1 for a in history if a.startswith('scroll-'))
+            if scroll_count >= 3:
+                raise ValueError("SCROLL_LOOP_GUARD: You have scrolled 3 times consecutively without clicking or interacting. Stop scrolling back and forth. Use 'screenshot --full' or 'snapshot -i --full' to view the complete page in one step, or answer the user with the information already retrieved.")
+
             direction = parts[1].lower() if len(parts) > 1 else 'down'
             amount = int(parts[2]) if len(parts) > 2 else 600
             if direction == 'down':
