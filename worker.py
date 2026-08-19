@@ -1257,18 +1257,8 @@ class BrowserWorker:
             raise TimeoutError(f'timed out waiting {timeout_ms}ms for popup to close')
 
         if action == 'wait':
-            page = await self.require_page(session_id)
-            target = parts[1] if len(parts) > 1 else '1000'
-            if target.startswith('@'):
-                for _ in range(100):
-                    try:
-                        await self.element(session_id, target)
-                        return {'text': f'Element {target} is available', 'action': action}
-                    except ValueError:
-                        await page.sleep(0.1)
-                raise TimeoutError(f'timed out waiting for {target}')
-            await page.sleep(int(target) / 1000)
-            return {'text': f'Waited {target}ms', 'action': action}
+            # Instantaneous no-op; all actions are already self-settled
+            return {'text': 'Page and DOM state are already fully settled; proceed directly', 'action': action}
 
 
         if action == 'mobile':

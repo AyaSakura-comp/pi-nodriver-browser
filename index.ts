@@ -40,7 +40,6 @@ Commands:
   press <key> - Press Enter, Tab, Space, Backspace, or text
   scroll <up|down|left|right> [px] - Scroll page
   get text|url|title [@ref] - Get information
-  wait <@ref> - Wait for an element (do NOT use wait <ms>; open/click/scroll already auto-wait for settling)
   wait-popup [ms] - Wait for an OAuth/login popup and switch to it
   wait-popup-close [ms] - Wait for the active popup to close and return to its opener
   switch opener - Return to the popup's opener without closing the popup
@@ -49,7 +48,7 @@ Commands:
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; ref-based commands remain blocked until you run snapshot -i, so never retry the old ref.
-Never send the same observing command (wait, snapshot, screenshot, get, downloads, download-info) twice in a row: it cannot return anything new, and a third identical repeat is rejected with LOOP_GUARD. On LOOP_GUARD, leave the browser and answer with web search or your own knowledge rather than retrying.`;
+Never send the same observing command (snapshot, screenshot, get, downloads, download-info) twice in a row: it cannot return anything new, and a third identical repeat is rejected with LOOP_GUARD. On LOOP_GUARD, leave the browser and answer with web search or your own knowledge rather than retrying.`;
 
 type WorkerResponse = {
   id: number;
