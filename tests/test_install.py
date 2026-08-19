@@ -40,10 +40,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('ctx.sessionManager.getSessionId()', extension_source)
             self.assertIn('sessionId', extension_source)
             self.assertIn('cancelId', extension_source)
-            self.assertIn('-screen 0 960x720x24', extension_source)
+            self.assertIn('-screen 0 1600x1000x24', extension_source)
             self.assertIn('if (response.screenshotPath)', extension_source)
             worker_source = (extension / 'worker.py').read_text()
-            self.assertIn('--window-size=960,720', worker_source)
+            self.assertIn('--window-size=1600,1000', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
             self.assertIn('minimum_settle_seconds = 0.1', native_click)
             self.assertIn('maximum_settle_seconds = 0.5', native_click)

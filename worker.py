@@ -268,7 +268,7 @@ class BrowserWorker:
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
                     user_data_dir=str(profile),
-                    browser_args=['--window-size=960,720', '--no-first-run', '--no-default-browser-check'],
+                    browser_args=['--window-size=1600,1000', '--no-first-run', '--no-default-browser-check'],
                     sandbox=not should_disable_sandbox(),
                     lang='zh-TW',
                 )

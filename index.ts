@@ -136,7 +136,7 @@ class NodriverWorker {
     } catch {
       child = spawn(
         "xvfb-run",
-        ["-a", "-s", "-screen 0 960x720x24", PYTHON, WORKER, "--server", SOCKET],
+        ["-a", "-s", "-screen 0 1600x1000x24", PYTHON, WORKER, "--server", SOCKET],
         { cwd: ROOT, stdio: "ignore", detached: true },
       );
       child.unref();
