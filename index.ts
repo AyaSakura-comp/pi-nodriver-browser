@@ -17,7 +17,7 @@ const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent",
 
 const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (automatically handles Xvfb and Chrome in the background - do NOT use bash to check $DISPLAY, Xvfb, or browser processes).
 Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
-Workflow: open URL → snapshot -i (get current-viewport @refs like @e1) → interact → re-snapshot after page changes.
+Workflow: open URL → snapshot -i or screenshot (open automatically waits for DOM ready; do NOT add unnecessary 'wait' after 'open') → interact.
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
   mobile [on|off|iphone|android] - Toggle mobile emulation mode (390x844 viewport & touch events)
