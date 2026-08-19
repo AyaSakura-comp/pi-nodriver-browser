@@ -1239,6 +1239,38 @@ class BrowserWorker:
             await page.sleep(int(target) / 1000)
             return {'text': f'Waited {target}ms', 'action': action}
 
+
+        if action == 'mobile':
+            page = await self.require_page(session_id)
+            target = parts[1].lower() if len(parts) > 1 else 'on'
+            if target in ('off', 'disable', 'false', 'desktop'):
+                await page.send(uc.cdp.network.set_user_agent_override(user_agent=''))
+                await page.send(uc.cdp.emulation.clear_device_metrics_override())
+                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=False))
+                page._is_mobile_mode = False
+                return {'text': 'Mobile emulation disabled; restored desktop viewport', 'action': action}
+            else:
+                ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+                if target in ('android', 'pixel'):
+                    ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                
+                w, h = 390, 844
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    w, h = int(parts[1]), int(parts[2])
+                elif len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
+                    w, h = int(parts[2]), int(parts[3])
+
+                await page.send(uc.cdp.network.set_user_agent_override(user_agent=ua))
+                await page.send(uc.cdp.emulation.set_device_metrics_override(
+                    width=w,
+                    height=h,
+                    device_scale_factor=3.0,
+                    mobile=True
+                ))
+                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
+                page._is_mobile_mode = True
+                return {'text': f'Mobile emulation enabled ({w}x{h} viewport, touch enabled)', 'action': action, 'viewport': [w, h]}
+
         if action == 'screenshot':
             page = await self.require_page(session_id)
             full_page = '--full' in parts[1:]
