@@ -964,10 +964,11 @@ class BrowserWorker:
             return {'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)', 'action': action, 'url': page.url or parts[1]}
 
         if action == 'snapshot':
-            if parts not in (['snapshot', '-i'], ['snapshot', '-i', '--full']):
-                raise ValueError('usage: snapshot -i [--full]')
             page = await self.require_page(session_id)
-            if '--full' in parts:
+            args_str = ' '.join(parts[1:]).lower()
+            is_full = '--full' in args_str or '-full' in args_str
+
+            if is_full:
                 output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-full-'))
                 output = output_dir / 'overview.jpg'
                 screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -1319,7 +1320,8 @@ class BrowserWorker:
 
         if action == 'screenshot':
             page = await self.require_page(session_id)
-            full_page = '--full' in parts[1:]
+            args_str = ' '.join(parts[1:]).lower()
+            full_page = '--full' in args_str or '-full' in args_str or '-i' in args_str and ('full' in args_str)
             output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
             output = output_dir / 'screenshot.png'
             screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
