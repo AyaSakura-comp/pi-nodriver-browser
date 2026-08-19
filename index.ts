@@ -15,9 +15,13 @@ const WORKER = join(ROOT, "worker.py");
 const MARKER = "__PI_NODRIVER__";
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
-const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (automatically handles Xvfb and Chrome in the background - do NOT use bash to check $DISPLAY, Xvfb, or browser processes).
-Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
-Workflow: open URL → snapshot -i or screenshot → click/interact → snapshot/screenshot. (All commands like open, click, scroll automatically wait for DOM/UI settling; NEVER send standalone 'wait <ms>' like wait 500 or wait 1000).
+const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (permanently fixed in iPhone Mobile Mode 390x844).
+Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction.
+Guidelines:
+- Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
+- One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops.
+- No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
+Workflow: open URL → snapshot -i or screenshot → click/interact → snapshot/screenshot.
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
   open <url> - Navigate to URL
