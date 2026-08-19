@@ -1275,6 +1275,16 @@ class BrowserWorker:
                 t0 = asyncio.get_running_loop().time()
                 try:
                     tab = await self.browser.get("about:blank", new_tab=True)
+                    # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
+                    try:
+                        await tab.send(uc.cdp.emulation.set_device_metrics_override(
+                            width=1920,
+                            height=1080,
+                            device_scale_factor=1.0,
+                            mobile=False
+                        ))
+                    except Exception:
+                        pass
                     await tab.get(target_url)
                     await self.wait_for_page_ready(tab, timeout_sec=4.0)
                     title = await tab.evaluate("document.title") or "No Title"
