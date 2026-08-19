@@ -17,7 +17,7 @@ const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent",
 
 const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (automatically handles Xvfb and Chrome in the background - do NOT use bash to check $DISPLAY, Xvfb, or browser processes).
 Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
-Workflow: open URL → snapshot -i or screenshot (open automatically waits for DOM ready; do NOT add unnecessary 'wait' after 'open') → interact.
+Workflow: open URL → snapshot -i or screenshot → click/interact → snapshot/screenshot. (All commands like open, click, scroll automatically wait for DOM/UI settling; NEVER send standalone 'wait <ms>' like wait 500 or wait 1000).
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
   mobile [on|off|iphone|android] - Toggle mobile emulation mode (390x844 viewport & touch events)
@@ -40,7 +40,7 @@ Commands:
   press <key> - Press Enter, Tab, Space, Backspace, or text
   scroll <up|down|left|right> [px] - Scroll page
   get text|url|title [@ref] - Get information
-  wait <@ref|ms> - Wait for an element or milliseconds
+  wait <@ref> - Wait for an element (do NOT use wait <ms>; open/click/scroll already auto-wait for settling)
   wait-popup [ms] - Wait for an OAuth/login popup and switch to it
   wait-popup-close [ms] - Wait for the active popup to close and return to its opener
   switch opener - Return to the popup's opener without closing the popup
