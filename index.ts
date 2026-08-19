@@ -16,7 +16,7 @@ const MARKER = "__PI_NODRIVER__";
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
 const DESCRIPTION = `Browser automation through a persistent, headful Google Chrome controlled by Nodriver under Xvfb.
-Use this only when the answer requires driving a live page: logging in, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
+Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction. For general research, look-ups, and questions that a search result or your own knowledge can answer, do not open the browser at all.
 Workflow: open URL → snapshot -i (get current-viewport @refs like @e1) → interact → re-snapshot after page changes.
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
