@@ -1400,30 +1400,74 @@ class BrowserWorker:
                 tab = None
                 t0 = asyncio.get_running_loop().time()
                 try:
-                    tab = await self.browser.get("about:blank", new_tab=True)
-                    # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
-                    try:
-                        await tab.send(uc.cdp.emulation.set_device_metrics_override(
-                            width=1920,
-                            height=1080,
-                            device_scale_factor=1.0,
-                            mobile=False
-                        ))
-                    except Exception:
-                        pass
-                    await tab.get(target_url)
-                    await self.wait_for_page_ready(tab, timeout_sec=4.0)
-                    title = await tab.evaluate("document.title") or "No Title"
-                    text = await tab.evaluate("document.body.innerText") or ""
-                    clean_text = str(text).strip()
+                    async def fetch_tab():
+                        nonlocal tab
+                        tab = await self.browser.get("about:blank", new_tab=True)
+                        # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
+                        try:
+                            await tab.send(uc.cdp.emulation.set_device_metrics_override(
+                                width=1920,
+                                height=1080,
+                                device_scale_factor=1.0,
+                                mobile=False
+                            ))
+                        except Exception:
+                            pass
+                        await tab.get(target_url)
+                        await self.wait_for_page_ready(tab, timeout_sec=2.5)
+                        title = await tab.evaluate("document.title") or "No Title"
+                        text = await tab.evaluate("document.body.innerText") or ""
+                        return str(title).strip(), str(text).strip()
+
+                    # 3.0s Hard Circuit Breaker per tab
+                    title, clean_text = await asyncio.wait_for(fetch_tab(), timeout=3.0)
+                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+
+                    # Detect Anti-Bot / Cloudflare Challenge Validation
+                    lower_title = title.lower()
+                    lower_text = clean_text.lower()
+                    is_challenge = (
+                        "challenge validation" in lower_title
+                        or "just a moment..." in lower_title
+                        or "cloudflare" in lower_title
+                        or "attention required" in lower_title
+                        or "verify you are human" in lower_text
+                        or "enable javascript and cookies to continue" in lower_text
+                    )
+
+                    if is_challenge:
+                        return {
+                            "index": idx + 1,
+                            "url": target_url,
+                            "title": title,
+                            "text": "",
+                            "ok": False,
+                            "error": "Anti-Bot / Cloudflare Challenge Validation detected (Access Blocked by WAF)",
+                            "chars": 0,
+                            "elapsed": elapsed
+                        }
+
+                    is_ok = bool(clean_text and len(clean_text) > 20)
+                    return {
+                        "index": idx + 1,
+                        "url": target_url,
+                        "title": title,
+                        "text": clean_text,
+                        "ok": is_ok,
+                        "error": None if is_ok else "No readable text content extracted",
+                        "chars": len(clean_text),
+                        "elapsed": elapsed
+                    }
+                except asyncio.TimeoutError:
                     elapsed = round(asyncio.get_running_loop().time() - t0, 2)
                     return {
                         "index": idx + 1,
                         "url": target_url,
-                        "title": str(title).strip(),
-                        "text": clean_text,
-                        "ok": bool(clean_text),
-                        "chars": len(clean_text),
+                        "title": "Timeout",
+                        "text": "",
+                        "ok": False,
+                        "error": f"3.0s Circuit Breaker Tripped (Page took >{elapsed}s to load or settle)",
+                        "chars": 0,
                         "elapsed": elapsed
                     }
                 except Exception as err:
@@ -1447,11 +1491,19 @@ class BrowserWorker:
 
             results = await asyncio.gather(*(crawl_single(url, i) for i, url in enumerate(urls)))
             successful = [r for r in results if r["ok"]]
+            failed = [r for r in results if not r["ok"]]
             total_chars = sum(r["chars"] for r in results)
 
-            output_parts = [
-                f"Parallel Crawl Completed: {len(successful)}/{len(urls)} pages successfully captured ({total_chars:,} total characters)."
-            ]
+            if not successful:
+                output_parts = [
+                    f"⚠️ CRAWL FAILED: 0/{len(urls)} pages successfully captured. All requested URLs either timed out (3.0s Circuit Breaker) or were blocked by WAF/anti-bot protection.\n"
+                    f"💡 ACTION FOR AGENT: Do NOT retry these same URLs. Immediately fallback to an alternative domain (e.g., Google Finance / Yahoo) or search directly with specific queries."
+                ]
+            else:
+                output_parts = [
+                    f"Parallel Crawl Completed: {len(successful)}/{len(urls)} pages successfully captured ({total_chars:,} total characters)."
+                ]
+
             for r in results:
                 if r["ok"]:
                     output_parts.append(
@@ -1461,8 +1513,8 @@ class BrowserWorker:
                     )
                 else:
                     output_parts.append(
-                        f"### [{r['index']}] [Failed] {r['url']}\n"
-                        f"*Status: FAILED | Error: {r.get('error', 'No text extracted')}*\n"
+                        f"### [{r['index']}] [FAILED] {r['url']}\n"
+                        f"*Status: FAILED | Reason: {r.get('error', 'Unknown failure')} | Time: {r['elapsed']}s*\n"
                     )
 
             return {
@@ -1470,6 +1522,7 @@ class BrowserWorker:
                 "action": "crawl",
                 "results": results,
                 "successCount": len(successful),
+                "failedCount": len(failed),
                 "totalCount": len(urls)
             }
 
