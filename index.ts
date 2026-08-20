@@ -15,8 +15,10 @@ const WORKER = join(ROOT, "worker.py");
 const MARKER = "__PI_NODRIVER__";
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
-const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (permanently fixed in iPhone Mobile Mode 390x844).
-Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction.
+const DESCRIPTION = `Autonomous live browser automation (permanently fixed in iPhone Mobile Mode 390x844).
+ROUTING GUIDELINES:
+- WHEN TO USE BROWSER: Automatically invoke this tool when the user request requires live web data, real-time e-commerce pricing/promotions (MOMO, PChome, Amazon, Shopee), current stock availability, real-time exchange rates/schedules, dynamic web portals, interactive form submissions, UI flows, or login/OAuth authentication. No explicit user command like "use browser" is needed.
+- WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.
 Guidelines:
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use 'fill-submit <@ref> <text>' to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
