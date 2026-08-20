@@ -961,7 +961,15 @@ class BrowserWorker:
                     except Exception:
                         pass
             await self.wait_for_page_ready(page)
-            return {'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)', 'action': action, 'url': page.url or parts[1]}
+            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            self.snapshot_required_sessions.discard(session_id)
+            snapshot_text = format_snapshot(elements or [])
+            return {
+                'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)\n\nInteractive elements on page:\n{snapshot_text}',
+                'action': action,
+                'url': page.url or parts[1],
+                'count': len(elements or [])
+            }
 
         if action == 'snapshot':
             page = await self.require_page(session_id)
@@ -1123,6 +1131,44 @@ class BrowserWorker:
                 'text': f'Deferred DOM click dispatched for {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})',
                 'action': action,
                 'url': page.url,
+            }
+
+        if action in ('fill-submit', 'fill_submit'):
+            if len(parts) < 3:
+                raise ValueError(f'usage: {action} <@ref> <text>')
+            page = await self.require_page(session_id)
+            element = await self.element(session_id, parts[1])
+            text = ' '.join(parts[2:])
+            await element.focus()
+            await element.clear_input()
+            await element.send_keys(text)
+            submit_script = '''(() => {
+                const el = document.activeElement;
+                if (!el) return false;
+                const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+                el.dispatchEvent(new KeyboardEvent('keydown', opts));
+                el.dispatchEvent(new KeyboardEvent('keypress', opts));
+                el.dispatchEvent(new KeyboardEvent('keyup', opts));
+                const form = el.closest ? el.closest('form') : (el.form || null);
+                if (form && typeof form.requestSubmit === 'function') {
+                    try { form.requestSubmit(); return true; } catch (e) {}
+                }
+                const searchBtn = el.parentElement ? el.parentElement.querySelector('button, [class*="search"], [type="submit"], input[type="submit"]') : null;
+                if (searchBtn) {
+                    try { searchBtn.click(); return true; } catch (e) {}
+                }
+                return false;
+            })()'''
+            await page.evaluate(submit_script)
+            await self.wait_for_page_ready(page)
+            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            self.snapshot_required_sessions.discard(session_id)
+            snapshot_text = format_snapshot(elements or [])
+            return {
+                'text': f'Filled and submitted {parts[1]} with "{text}"\nURL: {page.url}\n\nResults / Updated Page Elements:\n{snapshot_text}',
+                'action': action,
+                'url': page.url,
+                'count': len(elements or [])
             }
 
         if action in ('fill', 'type'):

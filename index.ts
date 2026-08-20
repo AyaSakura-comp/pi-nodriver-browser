@@ -18,13 +18,15 @@ const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent",
 const DESCRIPTION = `Browser automation powered by a persistent, self-managing nodriver-browser daemon (permanently fixed in iPhone Mobile Mode 390x844).
 Use this only when the answer requires driving a live page: logging in (當需要 login 的時候使用 browser), OAuth authentication, clicking through a flow, filling a form, or reading content that appears only after interaction.
 Guidelines:
+- Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use 'fill-submit <@ref> <text>' to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
 - One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
-Workflow: open URL → snapshot -i or screenshot → click/interact → snapshot/screenshot.
+Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto-returns results DOM) → report answer.
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
-  open <url> - Navigate to URL
+  open <url> - Navigate to URL (automatically returns interactive elements snapshot with @refs)
+  fill-submit <@ref> <text> - Clear, type, and submit form / press Enter in 1 atomic step (returns updated results snapshot)
   snapshot -i - List interactive elements in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
