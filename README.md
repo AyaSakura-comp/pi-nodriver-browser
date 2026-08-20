@@ -1,175 +1,184 @@
 # Pi Nodriver Browser
 
-A global [Pi coding agent](https://github.com/badlogic/pi-mono) extension that registers a persistent `browser` tool backed by **Nodriver**, a real headful **Chrome/Chromium** instance, and **Xvfb**.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
+[![Nodriver: 0.50.3](https://img.shields.io/badge/Nodriver-0.50.3-orange.svg)](https://github.com/ultrafunkamsterdam/nodriver)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux%20%2F%20Xvfb-lightgrey.svg)]()
 
-This project is intended for Linux Pi installations that need interactive browser automation—opening pages, inspecting interactive elements, clicking, typing, selecting options, scrolling, and returning screenshots to the model—without using Chrome's headless mode.
+A high-performance, persistent browser automation and parallel web crawling extension for the [Pi coding agent](https://github.com/badlogic/pi-mono), powered by **Nodriver**, headful **Chrome/Chromium**, **Xvfb**, and an integrated **Stealth & Anti-Bot Bypass Subsystem**.
 
-> The extension reduces obvious headless-browser fingerprints, but it does **not** guarantee bypassing CAPTCHA, bot detection, authentication, or a site's terms of service.
+Designed specifically for autonomous agent pair-programming, dynamic SPA interaction, real-time e-commerce comparison, and high-throughput research scraping on local hardware (optimized for AMD APUs & ROCm local inference).
 
 ---
 
-## 🎯 Architectural Overview & Dual-Mode System Design
+## 🏛️ System & Software Architecture (SW Architecture)
 
-`pi-nodriver-browser` implements a decoupled **Dual-Mode System Architecture** that separates **Interactive Browser Driving** from **High-Throughput Parallel Scraping (`crawl`)**.
+`pi-nodriver-browser` employs a decoupled **Client-Daemon Multi-Session Architecture** that isolates the lightweight TypeScript agent harness from the heavyweight Python/Chromium execution engine.
 
 ```mermaid
-flowchart TD
-    subgraph Pi Agent Context
-        U[User Request / Goal] --> LLM[Local Qwen 3.6 35B / Flagship LLM]
-        LLM -->|Tool Call| EXT[index.ts Extension Client]
+flowchart TB
+    subgraph ClientLayer["1. Pi Agent Client Layer (TypeScript)"]
+        UI["User Prompt / Goal"] --> AGENT["Pi Agent (Qwen 3.6 35B / LLM)"]
+        AGENT --> ROUTER["Context-Aware Intent Router"]
+        ROUTER -->|"Live Web / E-Commerce"| EXT["index.ts Extension Client"]
+        ROUTER -->|"Static Theory / Code"| DIRECT["Direct LLM Generation (0s Overhead)"]
+        EXT --> IPC_CLIENT["Socket Client & Session Queue"]
     end
 
-    subgraph Daemon & IPC Layer
-        EXT -->|Unix Socket IPC| SOCK[~/.pi/agent/nodriver-browser.sock]
-        SOCK --> WORKER[worker.py Persistent Daemon]
-        WORKER --> SESSIONS[Session ID & Active Tab Manager]
+    subgraph IPCLayer["2. IPC & Process Boundary"]
+        IPC_CLIENT <==>|"Unix Domain Socket (~/.pi/agent/nodriver-browser.sock)\nJSON Protocol with Streaming Markers"| DAEMON["worker.py Persistent Daemon"]
     end
 
-    subgraph Dual-Mode Execution Engine
-        SESSIONS -->|Interactive Command| INTERACTIVE[Interactive Mode: 1600x1000 Viewport]
-        SESSIONS -->|Crawl Array Command| CRAWL[Parallel Crawl Mode: 1920x1080 CDP Viewport]
-
-        INTERACTIVE -->|Click, Type, Snapshot| TAB_MAIN[Session Main Tab]
-        CRAWL -->|asyncio.gather| TABS_PARALLEL[Background Parallel Tabs 1..N]
-
-        TABS_PARALLEL -->|Fast-Path DOM Polling| DOM_READY[Adaptive 80ms Fast-Path DOM Ready]
-        DOM_READY -->|innerText Extraction| TEXT_RES[Structured Markdown Multi-Page Result]
-        TABS_PARALLEL -->|Auto Close| DISPOSE[Tab Disposed & Memory Freed]
+    subgraph DaemonLayer["3. Python Daemon Core (worker.py)"]
+        DAEMON --> SESSIONS["Session & Tab Manager\n(Strict Per-Session Isolation)"]
+        DAEMON --> GUARD["Per-Session Loop Guard\n(3-Repeat Deadlock Protection)"]
+        DAEMON --> BREAKER["3.0s Per-Tab Circuit Breaker\n& Anti-Bot WAF Detection"]
+        DAEMON --> ENGINE["Dual-Mode Execution Engine"]
     end
 
-    subgraph Chrome & Display Layer
-        TAB_MAIN --> CHROME[Headful Chrome / Chromium]
-        TABS_PARALLEL --> CHROME
-        CHROME --> XVFB[Xvfb Virtual X11 Display]
-        CHROME <--> PROFILE[(~/.pi/agent/nodriver-profile)]
+    subgraph StealthLayer["4. Stealth & Anti-Bot Subsystem"]
+        ENGINE --> STEALTH_EXT["stealth-extension (Chrome Manifest V3)"]
+        STEALTH_EXT --> S_STEALTH["stealth.js\n- WebGL NVIDIA RTX 4070 Spoof\n- navigator.webdriver Removal\n- window.chrome Runtime Mock\n- Plugins & Permissions Injections"]
+        STEALTH_EXT --> S_SOLVER["turnstile_solver.js\n- Shadow DOM Inspection\n- Cloudflare Turnstile Auto-Click\n- Human-like Bezier Pointer Events"]
+    end
+
+    subgraph BrowserLayer["5. Chromium & Display Subsystem"]
+        ENGINE -->|"Interactive Mode (iPhone / 1600x1000)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
+        TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
+        TABS_POOL --> CHROME
+        CHROME <--> XVFB["Xvfb Virtual X11 Display (:99)"]
+        CHROME <--> PROFILE["Persistent Profile (~/.pi/agent/nodriver-profile)"]
+    end
 ```
 
+### Key Architectural Subsystems:
+
+#### 1. Client-Daemon IPC & Session Isolation
+* **Zero-Spawning Overhead**: A single persistent Python daemon (`worker.py`) runs in the background. Pi commands connect via Unix Domain Socket (`nodriver-browser.sock`), avoiding the 2–3s cold-start penalty of launching Chrome on every turn.
+* **Per-Session Tab Routing**: Each Pi conversation maintains its own isolated `session_id` mapping. Session tabs, active viewports, and downloads operate independently without cross-session interference.
+* **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
+
+#### 2. Stealth & Anti-Bot Subsystem (`stealth-extension`)
+Integrated directly into Chrome via `--load-extension`, eliminating headless bot markers and automating challenge bypasses:
+* **`stealth.js`**:
+  * **WebGL Hardware Spoofing**: Overrides WebGL `UNMASKED_VENDOR_WEBGL` and `UNMASKED_RENDERER_WEBGL` from software/Mesa drivers to `Google Inc. (NVIDIA)` / `NVIDIA GeForce RTX 4070 Direct3D11`.
+  * **Bot Flag Erasure**: Completely removes `navigator.webdriver` and normalizes `navigator.plugins`, `navigator.languages` (`zh-TW`, `en-US`), and `Notification.permission`.
+  * **Runtime Consistency**: Injects authentic `window.chrome.runtime`, `window.chrome.csi`, and `window.chrome.loadTimes` structures.
+* **`turnstile_solver.js`**:
+  * **Shadow DOM Scanner**: Automatically traverses closed/open Shadow DOMs and iframe hierarchies to detect Cloudflare Turnstile, hCaptcha, and challenge checkboxes.
+  * **Synthetic Human Pointer Dispatch**: Emulates natural `mousemove` → `mousedown` → `mouseup` → `click` sequences with randomized coordinate jitter.
+
+#### 3. 3.0s Circuit Breaker & Diagnostic Feedback
+* **Hard 3.0s Per-Tab Timeout**: Individual background tabs in parallel crawl jobs are wrapped with `asyncio.wait_for(fetch(), timeout=3.0)`. Slow network streams, deadlocks, or WAF stalls trip immediately without stalling the entire batch.
+* **Anti-Bot WAF Challenge Detection**: Intercepts `Challenge Validation`, `Just a moment...`, and `Attention Required` pages.
+* **Actionable Harness Guidance**: If a crawl job fails, structured diagnostics and fallback advice (e.g. switch to Google Finance or alternative search) are returned to the agent harness.
+
 ---
 
-## ⚡ Core Component & Workflow Design
+## ⚡ Accelerated Workflows (Workflow)
 
-### 1. Dual-Mode Viewport & Mode Decoupling Architecture
+`pi-nodriver-browser` replaces traditional multi-turn browser loops with compressed, atomic agent workflows:
 
-The architecture enforces strict separation between interactive page driving and bulk text crawling to optimize both human-in-the-loop inspection and LLM context extraction:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User (Pi / Web)
+    participant LLM as Pi Agent (Qwen 3.6 35B)
+    participant EXT as index.ts Client
+    participant Daemon as worker.py Daemon
+    participant Chrome as Chromium & DOM
 
-* **Interactive Mode (`open`, `click`, `snapshot`, `screenshot`, `fill`)**:
-  * **Default Viewport**: `1600 x 1000` (or user-configured session viewport).
-  * **Mobile Emulation Support**: Supports CDP `Network.setUserAgentOverride` and `Emulation.setDeviceMetricsOverride(mobile=True)` for Mobile Web testing (e.g. PChome 24h Mobile UI).
-  * **Target Use Case**: Form filling, login flows, SPA navigation, and visual verification.
+    Note over User,LLM: Fast 2-Step E-Commerce Workflow
+    User->>LLM: "現在 PChome 上 PS5 Slim 多少錢？"
+    
+    rect rgb(240, 248, 255)
+    Note over LLM,Daemon: Step 1: Open with Inline Auto-Snapshot
+    LLM->>EXT: browser("open https://24h.pchome.com.tw/")
+    EXT->>Daemon: {command: "open ...", sessionId}
+    Daemon->>Chrome: Navigate & Fast-Path Settle (80ms)
+    Daemon->>Chrome: Execute SNAPSHOT_JS
+    Daemon-->>EXT: Returns DOM snapshot with @refs (@e1 Search, @e2 Cart)
+    EXT-->>LLM: DOM elements returned in Round 1
+    end
 
-* **Parallel Crawl Mode (`crawl [url1, url2, ...]`)**:
-  * **Dedicated Viewport**: Forced **`1920 x 1080 Full-Desktop Viewport`** (`mobile=False`) via CDP per background tab.
-  * **RWD Protection**: Guaranteeing 100% desktop Multi-Column RWD layout rendering so text, sidebars, and data tables are never hidden by mobile CSS `@media` rules.
-  * **Tab Isolation**: Each target URL is spawned in an isolated temporary background tab (`about:blank`, `new_tab=True`), sets its own CDP metrics override, extracts `document.body.innerText`, and closes immediately upon completion.
-  * **Zero Mutex Contamination**: Crawl background tabs operate independently without mutating or polluting the active interactive session tab or its viewport mode.
+    rect rgb(245, 255, 245)
+    Note over LLM,Daemon: Step 2: Atomic Fill-Submit & Live Results Return
+    LLM->>EXT: browser("fill-submit @e1 'PS5 Slim'")
+    EXT->>Daemon: {command: "fill-submit @e1 'PS5 Slim'"}
+    Daemon->>Chrome: Clear -> Type -> Dispatch Events -> requestSubmit()
+    Daemon->>Chrome: Settle Results DOM
+    Daemon-->>EXT: Returns search results DOM snapshot & price list
+    EXT-->>LLM: Extracted PS5 prices in Round 2
+    end
 
----
-
-### 2. Fast-Path DOM-Ready Adaptive Polling Engine
-
-Traditional browser automation waits for `window.onload` or full network idle, incurring 4–10 second delays due to external ads, trackers, and unoptimized media.
-
-`pi-nodriver-browser` incorporates an **Adaptive Fast-Path DOM Poller**:
-
-```python
-async def wait_for_page_ready(self, page, timeout_sec=4.0, poll_interval=0.08):
-    deadline = asyncio.get_running_loop().time() + timeout_sec
-    while asyncio.get_running_loop().time() < deadline:
-        state = await page.evaluate("document.readyState")
-        if state in ("interactive", "complete"):
-            has_content = await page.evaluate(
-                "Boolean(document.body && (document.body.innerText.length > 0 || document.body.children.length > 0))"
-            )
-            if has_content:
-                await asyncio.sleep(0.05)
-                return
-        await asyncio.sleep(poll_interval)
+    LLM->>User: 📊 Report prices, inventory, and promotions (Completed in 2 turns!)
 ```
 
-* **80ms Polling Frequency**: Checks `document.readyState` and body DOM node existence every 80ms.
-* **Early Exit**: Returns as soon as text is readable, cutting single-page scrape latency to **~0.32 - 0.40 seconds**.
-* **`asyncio.gather` Concurrency**: Crawls 5–15 URLs simultaneously, delivering 14.0x faster throughput than sequential scraping API pipelines.
+### 1. Fast 2-Step Interactive Pattern
+Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
+1. **`open <url>`**: Automatically waits for DOM readiness and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
+2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
+
+### 2. Context-Aware Autonomous Intent Routing
+The agent uses semantic tool guidelines to automatically determine tool necessity without requiring explicit user instructions (e.g. "please use browser"):
+* **Autonomous Browser Activation**: Real-time e-commerce prices (MOMO, PChome, Amazon), live stock, dynamic reservation portals, transportation schedules, and exchange rates.
+* **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
+* *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
+
+### 3. Parallel Multi-Tab Scraping (`crawl`)
+* **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
+* **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
+* **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
 
 ---
 
-### 3. Loop Guard & Safety System Design
+## 📖 Command Reference
 
-To prevent LLM loop lock when a web element is missing or unclickable:
-
-* **Per-Session Loop Guard**:
-  * Tracks consecutive verbatim commands per Pi session.
-  * Observing commands (`wait`, `snapshot`, `screenshot`, `get`, `downloads`, `download-info`) are rejected on the **3rd verbatim repeat** with a `LOOP_GUARD` error, forcing the LLM to leave the browser loop and fallback to web search.
-  * State-changing commands (`click`, `fill`, `scroll`) reset the loop counter.
-
-* **Stale Reference Auto-Recovery**:
-  * Snapshot elements are assigned short, token-efficient `@e1`, `@e2` references.
-  * If a DOM mutation renders a reference stale, the tool rejects the action, invalidates old refs, and atomically returns a fresh current-viewport DOM structure + viewport JPG for LLM vision inspection.
-
----
-
-## 🛠️ Features
-
-- Registers the standard Pi tool name `browser`
-- Persistent Chrome/Xvfb daemon that survives Pi tasks and session shutdowns
-- Headful Chrome rendered on an Xvfb virtual display
-- Persistent browser profile for shared cookies/local state, with one active tab per Pi session ID
-- Compact current-viewport `@e1`, `@e2`, … references generated by `snapshot -i`, including custom controls and open Shadow DOM
-- Vision-first `snapshot -i --full` overview that emits no page-wide DOM dump; scroll and re-snapshot relevant viewports to interact
-- Click by reference, text, CSS selector, or viewport coordinates, plus fill, type, select, keyboard, scroll, wait, text extraction, screenshots, and safe overlay dismissal
-- Supports new tabs opened by clicks
-- Serializes commands within each Pi session while other sessions remain responsive
-- Disconnects Pi clients on session shutdown without closing Chrome
-- Replaces the conflicting `npm:pi-agent-browser` package during installation
+| Command | Syntax | Output & Behavior | Viewport Scope |
+|---|---|---|---|
+| **`open`** | `open <url>` | Navigates to URL and **automatically returns interactive `@refs` snapshot** | Interactive Tab (1600x1000 / iPhone) |
+| **`fill-submit`** | `fill-submit <@ref> <text>` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
+| **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** with 3.0s circuit breaker and anti-bot challenge detection | 1920x1080 Full-Desktop CDP Override |
+| **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` for elements in current viewport | Interactive Tab |
+| **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
+| **`click`** | `click <@ref>` | Clicks snapshot element (auto-returns updated DOM snapshot) | Interactive Tab |
+| **`click` (coords)** | `click <x> <y>` | Clicks viewport coordinates (fallback for canvas / shadow DOM) | Interactive Tab |
+| **`fill`** | `fill <@ref> <text>` | Clears input field and types text | Interactive Tab |
+| **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
+| **`select`** | `select <@ref> <val>` | Selects dropdown option by value or visible label | Interactive Tab |
+| **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
+| **`scroll`** | `scroll <up\|down> [px]` | Scrolls active viewport | Interactive Tab |
+| **`get`** | `get text\|url\|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
+| **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot | Interactive Tab |
+| **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
+| **`close`** | `close` | Closes active session tab | Session Scope |
+| **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome | Global Daemon Scope |
 
 ---
 
-## 📋 Requirements & Prerequisites
+## 🚀 Installation & Setup
 
-| Dependency | Purpose | Required |
-|---|---|---|
-| Linux | Current supported platform | Yes |
-| Pi coding agent | Loads `index.ts` and exposes the tool | Yes |
-| Python 3.10+ | Runs the Nodriver worker | Yes |
-| `venv` + `pip` | Creates the isolated Python environment | Yes |
-| Nodriver 0.50.3 | Controls Chrome through the DevTools protocol | Yes; installed automatically |
-| Google Chrome / Chromium | Browser engine | Yes |
-| Xvfb / `xvfb-run` | Virtual X11 display for headful Chrome | Yes |
+### Prerequisites
+* Linux (x86_64 or aarch64)
+* Google Chrome or Chromium installed (`google-chrome`, `google-chrome-stable`, or `chromium`)
+* `xvfb-run` and `python3` (3.10+)
+* [Pi coding agent](https://github.com/badlogic/pi-mono)
 
----
-
-## 📖 Browser Command Reference
-
-| Command | Description | Mode / Viewport Scope |
-|---|---|---|
-| `crawl <url1> [url2] ...` | **Parallel multi-tab crawl** across 1..N URLs | **1920x1080 Full-Desktop CDP Override** |
-| `open <url>` | Navigate to a URL in the session active tab | Interactive Session Viewport (Default: 1600x1000) |
-| `snapshot -i` | List compact interactive elements intersecting current viewport (`@eN`) | Interactive Session Viewport |
-| `snapshot -i --full` | Return full-page visual overview; scroll and inspect | Interactive Session Viewport |
-| `click <@ref>` | Click a snapshot element, including custom controls and Shadow DOM | Interactive Session Viewport |
-| `click <x> <y>` | Click viewport coordinates; fallback for canvas / cross-origin iframes | Interactive Session Viewport |
-| `fill <@ref> <text>` | Clear an input field and type text | Interactive Session Viewport |
-| `type <@ref> <text>` | Type text without clearing | Interactive Session Viewport |
-| `select <@ref> <value>` | Select a dropdown option by value or visible text | Interactive Session Viewport |
-| `press <key>` | Send Enter, Tab, Space, Backspace, or text | Interactive Session Viewport |
-| `scroll <direction> [px]` | Scroll up, down, left, or right | Interactive Session Viewport |
-| `get text [@ref]` | Extract page or element innerText | Interactive Session Viewport |
-| `dismiss overlays` | Dismiss cookie banners and modal overlays safely | Interactive Session Viewport |
-| `screenshot [--full]` | Return an inline PNG/JPG screenshot | Interactive Session Viewport |
-| `close` | Close only the active Pi session's tab | Interactive Session Viewport |
-| `shutdown` | Stop persistent browser daemon and close Chrome | Daemon Level |
-
----
-
-## 🚀 Automated Installation & Setup
-
+### One-Step Automated Installation:
 ```bash
 git clone git@github.com:AyaSakura-comp/pi-nodriver-browser.git
 cd pi-nodriver-browser
 ./install.sh
 ```
 
-Then reload Pi or start a new session:
+The installer will:
+1. Validate system dependencies (`python3`, `xvfb-run`, `google-chrome`).
+2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `mss`, `websockets`).
+3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
+4. Automatically disable conflicting legacy browser packages.
 
+Then reload Pi or launch a new session:
 ```text
 /reload
 ```
@@ -178,20 +187,18 @@ Then reload Pi or start a new session:
 
 ## 🧪 Testing & Verification
 
-Run pure unit tests:
-
+### Run Pure Unit Tests (74 test cases):
 ```bash
-python3 -m unittest discover -s tests -v
+/home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Run real Chrome/Xvfb integration tests:
-
+### Run Real Headful Chrome / Xvfb Integration Tests:
 ```bash
-RUN_BROWSER_INTEGRATION=1 NODRIVER_PYTHON="$PWD/.venv/bin/python"   python3 -m unittest discover -s tests -v
+RUN_BROWSER_INTEGRATION=1 xvfb-run -a python3 -m unittest discover -s tests -v
 ```
 
 ---
 
 ## 📄 License
 
-MIT License
+MIT License. Developed with ❤️ for advanced agentic pair-programming workflows.
