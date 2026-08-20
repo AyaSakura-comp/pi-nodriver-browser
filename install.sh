@@ -48,6 +48,10 @@ install -m 0644 "$ROOT/index.ts" "$TARGET/index.ts"
 install -m 0755 "$ROOT/worker.py" "$TARGET/worker.py"
 install -m 0644 "$ROOT/browser_logic.py" "$TARGET/browser_logic.py"
 install -m 0644 "$ROOT/requirements.txt" "$TARGET/requirements.txt"
+if [[ -d "$ROOT/stealth-extension" ]]; then
+  mkdir -p "$TARGET/stealth-extension"
+  cp -rf "$ROOT/stealth-extension/"* "$TARGET/stealth-extension/"
+fi
 
 if [[ "${SKIP_PIP_INSTALL:-0}" != "1" ]]; then
   if [[ ! -x "$TARGET/.venv/bin/python" ]]; then

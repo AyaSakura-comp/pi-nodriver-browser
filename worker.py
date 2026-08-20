@@ -264,11 +264,15 @@ class BrowserWorker:
             profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
             try:
+                ext_path = Path(__file__).resolve().parent / 'stealth-extension'
+                b_args = ['--window-size=1600,1000', '--no-first-run', '--no-default-browser-check']
+                if ext_path.is_dir():
+                    b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
                 self.browser = await uc.start(
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
                     user_data_dir=str(profile),
-                    browser_args=['--window-size=1600,1000', '--no-first-run', '--no-default-browser-check'],
+                    browser_args=b_args,
                     sandbox=not should_disable_sandbox(),
                     lang='zh-TW',
                 )
