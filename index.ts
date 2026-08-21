@@ -41,6 +41,7 @@ Commands:
   wait-download [ms] - Wait for the active or most recent download
   downloads [limit] - List recent files and in-progress download percentages
   download-latest - Return metadata and the absolute path of the newest completed file
+  upload <@ref> <file1> [file2]... - Upload local file(s) into file input or button/dropzone wrapper
   fill <@ref> <text> - Clear and type
   type <@ref> <text> - Type without clearing
   select <@ref> <value> - Select dropdown option

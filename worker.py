@@ -866,7 +866,8 @@ class BrowserWorker:
         self.track_repeat(session_id, action, parts)
         uses_ref = (
             (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
-            or (action in {'fill', 'type', 'select'} and len(parts) > 1)
+            or (action in {'fill', 'type', 'select', 'upload'} and len(parts) > 1)
+            or (action in {'fill-submit', 'fill_submit'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action == 'get' and len(parts) > 2 and parts[2].startswith('@'))
             or (action == 'wait' and len(parts) > 1 and parts[1].startswith('@'))
         )
@@ -1172,6 +1173,93 @@ class BrowserWorker:
                 'text': f'Filled and submitted {parts[1]} with "{text}"\nURL: {page.url}\n\nResults / Updated Page Elements:\n{snapshot_text}',
                 'action': action,
                 'url': page.url,
+                'count': len(elements or [])
+            }
+
+        if action == 'upload':
+            if len(parts) < 3:
+                raise ValueError('usage: upload <@ref> <filepath1> [filepath2] ...')
+            page = await self.require_page(session_id)
+            target_ref = parts[1]
+            raw_files = parts[2:]
+
+            resolved_files = []
+            for f_path in raw_files:
+                p = Path(f_path).expanduser().resolve()
+                if not p.exists():
+                    raise FileNotFoundError(f'upload target file not found: {f_path}')
+                if not p.is_file():
+                    raise ValueError(f'upload target is not a regular file: {f_path}')
+                resolved_files.append(str(p))
+
+            ref_id = target_ref.removeprefix('@')
+            resolve_input_js = f'''JSON.stringify((() => {{
+                const target = document.querySelector('[data-pi-ref="{ref_id}"]');
+                const findFileInput = (el) => {{
+                    if (!el) return document.querySelector('input[type="file"]');
+                    if (el.tagName === 'INPUT' && el.type === 'file') return el;
+                    if (el.tagName === 'LABEL' && el.htmlFor) {{
+                        const forEl = document.getElementById(el.htmlFor);
+                        if (forEl && forEl.tagName === 'INPUT' && forEl.type === 'file') return forEl;
+                    }}
+                    const child = el.querySelector('input[type="file"]');
+                    if (child) return child;
+                    const container = el.closest('form, div, section, main, body') || document.body;
+                    if (container) {{
+                        const found = container.querySelector('input[type="file"]');
+                        if (found) return found;
+                    }}
+                    return document.querySelector('input[type="file"]');
+                }};
+
+                const fileInput = findFileInput(target);
+                if (!fileInput) return {{ found: false }};
+
+                document.querySelectorAll('[data-pi-upload-target]').forEach(e => e.removeAttribute('data-pi-upload-target'));
+                fileInput.setAttribute('data-pi-upload-target', 'true');
+                return {{
+                    found: true,
+                    id: fileInput.id || '',
+                    name: fileInput.name || '',
+                    multiple: fileInput.multiple
+                }};
+            }})())'''
+
+            res_raw = await page.evaluate(resolve_input_js)
+            res_meta = json.loads(res_raw) if res_raw else {'found': False}
+            if not res_meta.get('found'):
+                raise ValueError(f'no <input type="file"> found associated with {target_ref}')
+
+            input_element = await page.select('[data-pi-upload-target="true"]')
+            if not input_element:
+                raise ValueError(f'failed to select file input element for {target_ref}')
+
+            await page.send(uc.cdp.dom.set_file_input_files(
+                files=resolved_files,
+                backend_node_id=input_element.backend_node_id
+            ))
+
+            event_dispatch_js = '''(() => {
+                const el = document.querySelector('[data-pi-upload-target="true"]');
+                if (el) {
+                    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                    el.removeAttribute('data-pi-upload-target');
+                }
+            })()'''
+            await page.evaluate(event_dispatch_js)
+            await self.wait_for_page_ready(page)
+
+            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            self.snapshot_required_sessions.discard(session_id)
+            snapshot_text = format_snapshot(elements or [])
+            file_basenames = [Path(f).name for f in resolved_files]
+
+            return {
+                'text': f'Successfully uploaded {len(resolved_files)} file(s) ({", ".join(file_basenames)}) to {target_ref}.\n\nUpdated Page Elements:\n{snapshot_text}',
+                'action': action,
+                'target': target_ref,
+                'files': resolved_files,
                 'count': len(elements or [])
             }
 

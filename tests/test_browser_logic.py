@@ -37,6 +37,12 @@ class ParseCommandTests(unittest.TestCase):
             ['fill', '@e2', '鼎泰豐 101 店'],
         )
 
+    def test_parses_upload_command_with_multiple_paths(self):
+        self.assertEqual(
+            parse_command('upload @e1 "/tmp/doc 1.pdf" /tmp/doc2.png'),
+            ['upload', '@e1', '/tmp/doc 1.pdf', '/tmp/doc2.png'],
+        )
+
     def test_rejects_empty_command(self):
         with self.assertRaisesRegex(ValueError, 'empty browser command'):
             parse_command('   ')
