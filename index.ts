@@ -46,7 +46,7 @@ Commands:
   type <@ref> <text> - Type without clearing
   select <@ref> <value> - Select dropdown option
   press <key> - Press Enter, Tab, Space, Backspace, or text
-  scroll <up|down|left|right> [px] - Scroll page
+  scroll <down|up|top|bottom|left|right> [px] - Smart scroll page or nested container (returns position & 100% boundary feedback)
   get text|url|title [@ref] - Get information
   wait-popup [ms] - Wait for an OAuth/login popup and switch to it
   wait-popup-close [ms] - Wait for the active popup to close and return to its opener

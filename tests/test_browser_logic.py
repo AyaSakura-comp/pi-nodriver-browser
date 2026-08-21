@@ -43,6 +43,12 @@ class ParseCommandTests(unittest.TestCase):
             ['upload', '@e1', '/tmp/doc 1.pdf', '/tmp/doc2.png'],
         )
 
+    def test_parses_scroll_commands(self):
+        self.assertEqual(parse_command('scroll down'), ['scroll', 'down'])
+        self.assertEqual(parse_command('scroll bottom'), ['scroll', 'bottom'])
+        self.assertEqual(parse_command('scroll top'), ['scroll', 'top'])
+        self.assertEqual(parse_command('scroll down 1000'), ['scroll', 'down', '1000'])
+
     def test_rejects_empty_command(self):
         with self.assertRaisesRegex(ValueError, 'empty browser command'):
             parse_command('   ')

@@ -149,7 +149,7 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 | **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
 | **`select`** | `select <@ref> <val>` | Selects dropdown option by value or visible label | Interactive Tab |
 | **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
-| **`scroll`** | `scroll <up\|down> [px]` | Scrolls active viewport | Interactive Tab |
+| **`scroll`** | `scroll <down\|up\|top\|bottom\|left\|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
 | **`get`** | `get text\|url\|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
 | **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |

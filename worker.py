@@ -238,6 +238,145 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
   };
 })(__PI_CLICK_REQUEST__))'''
 
+SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
+  const docEl = document.scrollingElement || document.documentElement || document.body;
+  const candidates = [];
+
+  if (docEl) {
+    const maxY = Math.max(0, docEl.scrollHeight - window.innerHeight);
+    const maxX = Math.max(0, docEl.scrollWidth - window.innerWidth);
+    const curY = window.scrollY || docEl.scrollTop || 0;
+    const curX = window.scrollX || docEl.scrollLeft || 0;
+    candidates.push({
+      el: docEl,
+      isWindow: true,
+      maxY,
+      maxX,
+      curY,
+      curX,
+      totalScrollableY: maxY,
+      remainingDown: Math.max(0, maxY - curY),
+      remainingUp: curY,
+      remainingRight: Math.max(0, maxX - curX),
+      remainingLeft: curX,
+      area: window.innerWidth * window.innerHeight
+    });
+  }
+
+  const all = document.querySelectorAll('*');
+  for (const el of all) {
+    if (el === docEl || el === document.body || el === document.documentElement) continue;
+    const style = window.getComputedStyle(el);
+    const hasScrollY = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 5;
+    const hasScrollX = (style.overflowX === 'auto' || style.overflowX === 'scroll') && el.scrollWidth > el.clientWidth + 5;
+    if (hasScrollY || hasScrollX) {
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area > 500 && rect.width > 0 && rect.height > 0) {
+        const maxY = Math.max(0, el.scrollHeight - el.clientHeight);
+        const maxX = Math.max(0, el.scrollWidth - el.clientWidth);
+        const curY = el.scrollTop;
+        const curX = el.scrollLeft;
+        candidates.push({
+          el,
+          isWindow: false,
+          maxY,
+          maxX,
+          curY,
+          curX,
+          totalScrollableY: maxY,
+          remainingDown: Math.max(0, maxY - curY),
+          remainingUp: curY,
+          remainingRight: Math.max(0, maxX - curX),
+          remainingLeft: curX,
+          area
+        });
+      }
+    }
+  }
+
+  let best = candidates[0];
+  let bestScore = -1;
+
+  for (const c of candidates) {
+    let available = 0;
+    if (direction === 'down') available = c.remainingDown;
+    else if (direction === 'up') available = c.remainingUp;
+    else if (direction === 'bottom' || direction === 'to-bottom') available = c.totalScrollableY;
+    else if (direction === 'top' || direction === 'to-top') available = c.totalScrollableY;
+    else if (direction === 'right') available = c.remainingRight;
+    else if (direction === 'left') available = c.remainingLeft;
+
+    let score = (c.isWindow ? 1.0 : 3.0) * Math.min(c.area, 1000000);
+    if (available > 0) {
+      score *= 10.0 * (available > 50 ? 2.0 : 1.0);
+    } else if (c.totalScrollableY > 0) {
+      score *= 2.0;
+    } else {
+      score = 0;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+
+  const target = best ? best.el : docEl;
+  const isWindow = best ? best.isWindow : true;
+
+  const prevY = isWindow ? (window.scrollY || docEl.scrollTop || 0) : target.scrollTop;
+  const prevX = isWindow ? (window.scrollX || docEl.scrollLeft || 0) : target.scrollLeft;
+  const maxY = isWindow ? Math.max(0, docEl.scrollHeight - window.innerHeight) : Math.max(0, target.scrollHeight - target.clientHeight);
+  const maxX = isWindow ? Math.max(0, docEl.scrollWidth - window.innerWidth) : Math.max(0, target.scrollWidth - target.clientWidth);
+
+  if (direction === 'down') {
+    if (isWindow) { window.scrollBy(0, amount); docEl.scrollTop += amount; }
+    else { target.scrollTop += amount; }
+  } else if (direction === 'up') {
+    if (isWindow) { window.scrollBy(0, -amount); docEl.scrollTop -= amount; }
+    else { target.scrollTop -= amount; }
+  } else if (direction === 'bottom' || direction === 'to-bottom') {
+    if (isWindow) { window.scrollTo(0, docEl.scrollHeight); docEl.scrollTop = docEl.scrollHeight; }
+    else { target.scrollTop = target.scrollHeight; }
+  } else if (direction === 'top' || direction === 'to-top') {
+    if (isWindow) { window.scrollTo(0, 0); docEl.scrollTop = 0; }
+    else { target.scrollTop = 0; }
+  } else if (direction === 'right') {
+    if (isWindow) { window.scrollBy(amount, 0); docEl.scrollLeft += amount; }
+    else { target.scrollLeft += amount; }
+  } else if (direction === 'left') {
+    if (isWindow) { window.scrollBy(-amount, 0); docEl.scrollLeft -= amount; }
+    else { target.scrollLeft -= amount; }
+  }
+
+  const currY = isWindow ? (window.scrollY || docEl.scrollTop || 0) : target.scrollTop;
+  const currX = isWindow ? (window.scrollX || docEl.scrollLeft || 0) : target.scrollLeft;
+
+  const percentY = maxY > 0 ? Math.min(100, Math.max(0, Math.round((currY / maxY) * 100))) : 100;
+  const atBottom = currY >= maxY - 5;
+  const atTop = currY <= 5;
+  const moved = Math.abs(currY - prevY) > 1 || Math.abs(currX - prevX) > 1;
+
+  let targetLabel = 'Page Window';
+  if (!isWindow) {
+    targetLabel = target.tagName.toLowerCase();
+    if (target.id) targetLabel += '#' + target.id;
+    else if (target.className) targetLabel += '.' + String(target.className).split(' ')[0];
+  }
+
+  return {
+    direction,
+    targetName: targetLabel,
+    scrollY: Math.round(currY),
+    maxY: Math.round(maxY),
+    percentY,
+    atBottom,
+    atTop,
+    moved
+  };
+})(__DIRECTION__, __AMOUNT__))'''
+
 
 class BrowserWorker:
     def __init__(self):
@@ -249,6 +388,7 @@ class BrowserWorker:
         self.popup_just_closed = set()
         self.snapshot_required_sessions = set()
         self.repeated_commands = {}
+        self.scroll_history = {}
         configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
         self.download_dir = (
             Path(configured_download_dir).expanduser()
@@ -1330,16 +1470,45 @@ class BrowserWorker:
 
             direction = parts[1].lower() if len(parts) > 1 else 'down'
             amount = int(parts[2]) if len(parts) > 2 else 600
-            if direction == 'down':
-                await page.scroll_down(amount)
-            elif direction == 'up':
-                await page.scroll_up(amount)
-            elif direction in ('left', 'right'):
-                delta = amount if direction == 'right' else -amount
-                await page.evaluate(f'window.scrollBy({delta}, 0)')
+
+            valid_dirs = {'down', 'up', 'top', 'bottom', 'to-top', 'to-bottom', 'left', 'right'}
+            if direction not in valid_dirs:
+                raise ValueError(f'usage: scroll down|up|top|bottom|left|right [pixels]; invalid direction: {direction}')
+
+            script = SMART_SCROLL_JS.replace('__DIRECTION__', f"'{direction}'").replace('__AMOUNT__', str(amount))
+            res_raw = await page.evaluate(script)
+            res_meta = json.loads(res_raw) if res_raw else {}
+            await self.wait_for_page_ready(page)
+
+            target_name = res_meta.get('targetName', 'Page Window')
+            scroll_y = res_meta.get('scrollY', 0)
+            max_y = res_meta.get('maxY', 0)
+            percent_y = res_meta.get('percentY', 0)
+            at_bottom = res_meta.get('atBottom', False)
+            at_top = res_meta.get('atTop', False)
+            moved = res_meta.get('moved', True)
+
+            if direction in ('bottom', 'to-bottom') or at_bottom:
+                status_text = f'Scrolled to bottom of {target_name} ({scroll_y}/{max_y}px, 100%). Reached bottom, cannot scroll further down.'
+            elif direction in ('top', 'to-top') or at_top:
+                status_text = f'Scrolled to top of {target_name} (0/{max_y}px, 0%). Reached top, cannot scroll further up.'
+            elif not moved:
+                status_text = f'Already at boundary of {target_name} ({scroll_y}/{max_y}px, {percent_y}%). No further movement in direction "{direction}".'
             else:
-                raise ValueError('scroll direction must be up, down, left, or right')
-            return {'text': f'Scrolled {direction} {amount}px', 'action': action}
+                status_text = f'Scrolled {direction} {amount}px in {target_name} (Position: {scroll_y}/{max_y}px, {percent_y}%).'
+
+            return {
+                'text': status_text,
+                'action': action,
+                'direction': direction,
+                'target': target_name,
+                'scrollY': scroll_y,
+                'maxY': max_y,
+                'percent': percent_y,
+                'atBottom': at_bottom,
+                'atTop': at_top,
+                'moved': moved
+            }
 
         if action == 'get':
             if len(parts) < 2:
