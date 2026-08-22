@@ -115,23 +115,65 @@ sequenceDiagram
     LLM->>User: 📊 Report prices, inventory, and promotions (Completed in 2 turns!)
 ```
 
-### 1. Fast 2-Step Interactive Pattern
+### 1. Fast 2-Step Interactive Pattern (`fill-submit`)
 Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
 1. **`open <url>`**: Automatically waits for DOM readiness and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
 2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
 
-### 2. Context-Aware Autonomous Intent Routing
+### 2. Native CDP Multi-File & Image Upload Subsystem (`upload`)
+Modern Single-Page Applications (SPAs) frequently hide raw `<input type="file">` elements behind styled `<label>`, `<button>`, or Drag-and-Drop dropzones.
+* **Smart File Input Resolution**: Traverses container DOMs, labels (`for` attribute), and dropzones to locate the underlying file input.
+* **CDP Native Injection**: Calls `DOM.setFileInputFiles` with local absolute paths.
+* **Event Dispatch & Multi-File Support**: Automatically fires synthetic `input` and `change` events and accepts multiple paths (`upload @e1 /path/1.png /path/2.pdf`) in a single invocation.
+
+### 3. Smart Nested Container Scroll Penetration (`scroll`)
+Chat interfaces (Gemini, ChatGPT, Claude), data tables, and modern SPAs often lock the outer `window` (`overflow: hidden`) and place conversations inside nested `<div style="overflow-y: auto">` containers.
+* **Smart Container Penetration**: Dynamically evaluates candidate scroll containers across the DOM, scoring by scrollable range, area, and visibility, to scroll the active chat box rather than stalling on `window`.
+* **Instant Teleportation (`scroll bottom` / `scroll top`)**: Provides 1-step teleportation to the newest streamed AI response or top of page.
+* **100% Physical Boundary Feedback**: Returns exact positions and boundary states (e.g. `Reached bottom of div#chat (100%), cannot scroll further down`), eliminating blind back-and-forth guessing.
+* **`SCROLL_LOOP_GUARD`**: Hard 3-consecutive-scroll circuit breaker prevents infinite scrolling loops.
+
+### 4. Cross-Origin Image Rendering & Hotlink Bypass
+* **Native Markdown Image Syntax**: Supports embedding live external images via `![alt](image_url)` and HTML `<img src="..." referrerpolicy="no-referrer" />`.
+* **Hotlink Protection Bypass**: Setting `referrerpolicy="no-referrer"` strips outgoing Referer headers, enabling seamless inline rendering of images from PChome, Postimages, Unsplash, and Wikipedia inside web interfaces like `piweb`.
+
+### 5. Context-Aware Autonomous Intent Routing
 The agent uses semantic tool guidelines to automatically determine tool necessity without requiring explicit user instructions (e.g. "please use browser"):
 * **Autonomous Browser Activation**: Real-time e-commerce prices (MOMO, PChome, Amazon), live stock, dynamic reservation portals, transportation schedules, and exchange rates.
 * **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
-### 3. Parallel Multi-Tab Scraping (`crawl`)
+### 6. Parallel Multi-Tab Scraping (`crawl`)
 * **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
 * **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
 * **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
 
 ---
+
+## 🎬 Real-World Autonomous Verification Case Studies
+
+### 🛒 Case Study 1: Autonomous PChome 24h Cart Addition (Qwen 3.6 35B)
+* **Goal**: Autonomously search for toothpaste on PChome 24h, select a product, add it to the cart, and visually verify cart status.
+* **Model**: Local `local-llama/qwen3.6-35b-q4` running on AMD APU ROCm.
+* **Execution Trace**:
+  1. `browser("open https://24h.pchome.com.tw/")` ➔ Opened homepage with instant `@refs`.
+  2. `browser("fill-submit @e6 牙膏")` ➔ 1-step atomic search form submission.
+  3. `browser("click @e52")` ➔ Navigated to DARLIE 好來 雙重功效牙膏 (2+1 超值組).
+  4. `browser("click @e60")` ➔ Clicked "加入購物車" (Add to Cart).
+  5. `browser("click @e9")` ➔ Navigated to Cart Page (`https://ecssl.pchome.com.tw/fsrwd/cart`).
+  6. `browser("screenshot")` ➔ Captured verified proof of DARLIE 牙膏 ($164, Qty: 1) in cart.
+* **Total Execution Time**: **75.84s** (100% autonomous with 0 scroll loops).
+
+---
+
+### 🎨 Case Study 2: Multi-Modal AI Image Generation & Auto-Upload
+* **Goal**: Autonomously generate an anime illustration using local diffusion and upload it to Postimages via browser automation.
+* **Execution Trace**:
+  1. Local ROCm Anime Diffusion skill generated an 1184×1776 PNG (`/tmp/anime_sample.png`).
+  2. `browser("open https://postimages.org/")` ➔ Located upload dropzone.
+  3. `browser("upload @e2 /tmp/anime_sample.png")` ➔ Injected 2.04 MB image via CDP.
+  4. Extracted public CDN direct link: `https://i.postimg.cc/FRXknHvy/anime-sample.png` (`HTTP 200 OK`).
+* **Total Execution Time**: **42.1s**.
 
 ---
 
