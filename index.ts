@@ -22,7 +22,13 @@ ROUTING GUIDELINES:
 Guidelines:
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use 'fill-submit <@ref> <text>' to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
-- One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops.
+- One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops. A full overview is visual-only: run 'snapshot -i' before interacting.
+- Semantic-First Iframes: Controls inside same-origin iframes receive normal @refs plus frame labels. Use fill/select/click @ref, click-text, or click-css; never guess viewport coordinates for ordinary iframe controls.
+- Searchable Dropdowns: Native <select> controls show their label, selected value, option count, and option type. Do not click them open or infer their contents from the first option. Use find-option "fuzzy keywords", then copy a returned complete 'Select exactly' command; its index and fingerprint prevent stale-option mistakes.
+- Progressive Disclosure: Never crawl or get the full page merely to inspect a dropdown. find-option searches every option internally, includes control-label context, and diversifies the top candidates across dropdowns; ambiguous queries return choices instead of guessing.
+- Preserve Form State: After selecting options, do not navigate, reload, or click recalculation/reset controls unless the user explicitly requires it; dynamic quote/configurator pages may clear selections. Verify with snapshot or screenshot instead.
+- Exact Ref Before Text: When snapshot shows the desired control, click its @ref. Use click-text only when no suitable ref exists; broad ancestor text containers are intentionally rejected.
+- Coordinate Last Resort: Use 'click <x> <y>' only after snapshot -i and semantic targeting fail, or for canvas/cross-origin visual-only controls.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
 - Open Loop Guard: At most 2 consecutive open actions are allowed per session. The 3rd and later opens are blocked until a non-open browser action runs.
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
@@ -34,7 +40,7 @@ Commands:
   snapshot -i - List interactive elements in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
-  click <x> <y> - Click viewport coordinates (fallback for canvas, cross-origin iframes, and visual-only controls)
+  click <x> <y> - Last-resort viewport coordinates, only after semantic targeting fails (canvas, inaccessible cross-origin iframe, visual-only control)
   click-text <text> - Click the best visible element matching text or accessible label
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js <@ref> - Dispatch a deferred DOM click when a site's native mouse handler poisons CDP
@@ -46,7 +52,8 @@ Commands:
   upload <@ref> <file1> [file2]... - Upload local file(s) into file input or button/dropzone wrapper
   fill <@ref> <text> - Clear and type
   type <@ref> <text> - Type without clearing
-  select <@ref> <value> - Select dropdown option
+  find-option <keywords> - Fuzzy-search options across all labelled dropdowns and return ranked @ref/index candidates
+  select <@ref> <query|--index=N --fingerprint=HASH> - Fuzzy-select a confident option, or safely choose the exact candidate returned by find-option
   press <key> - Press Enter, Tab, Space, Backspace, or text
   scroll <down|up|top|bottom|left|right> [px] - Smart scroll page or nested container (returns position & 100% boundary feedback)
   get text|url|title [@ref] - Get information

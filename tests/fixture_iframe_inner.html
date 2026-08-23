@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<body>
+<label for="part-search">Part search</label>
+<input id="part-search" placeholder="Search components">
+<label for="cpu">CPU</label>
+<select id="cpu">
+  <option value="">Choose a CPU</option>
+  <option value="9700x">AMD Ryzen 7 9700X</option>
+  <option value="9800X3D">Wrong CPU with duplicate lookup value</option>
+  <option value="9800x3d">AMD Ryzen 7 9800X3D</option>
+</select>
+<button id="apply">Apply iframe selection</button>
+<div id="selection">No CPU selected</div>
+<form action="fixture_iframe_result.html">
+  <input id="iframe-submit" name="query" placeholder="Iframe submit query">
+  <button type="submit">Submit iframe form</button>
+</form>
+<script>
+  const partSearch = document.querySelector('#part-search');
+  const partSearchEvents = [];
+  for (const eventName of ['keydown', 'beforeinput', 'input', 'keyup', 'change']) {
+    partSearch.addEventListener(eventName, () => {
+      partSearchEvents.push(eventName);
+      partSearch.setAttribute('aria-label', partSearchEvents.join(','));
+    });
+  }
+  document.querySelector('#cpu').addEventListener('change', event => {
+    document.querySelector('#selection').textContent = event.target.options[event.target.selectedIndex].text;
+  });
+  document.querySelector('#apply').addEventListener('click', event => {
+    event.target.textContent = 'Iframe selection applied';
+  });
+</script>
+</body>
+</html>

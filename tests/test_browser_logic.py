@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, is_confident_option_match, parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -173,7 +173,161 @@ class TabActivityRegistryTests(unittest.TestCase):
             )
 
 
+class OptionMatchingTests(unittest.TestCase):
+    def test_ranks_visible_text_before_an_unrelated_exact_value(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'Wrong CPU with duplicate lookup value', 'value': '9800X3D'},
+            {'index': 2, 'text': 'AMD Ryzen 7 9800X3D', 'value': 'cpu-9800'},
+        ], '9800X3D')
+
+        self.assertEqual(matches[0]['index'], 2)
+        self.assertTrue(is_confident_option_match(matches, '9800X3D'))
+
+    def test_token_search_handles_spacing_punctuation_and_word_order(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'DDR5-5600 32GB CL46', 'value': 'slow'},
+            {'index': 2, 'text': 'FURY Beast 32GB(16GB*2), DDR5-6000 / CL30', 'value': 'fast'},
+        ], '32gb 6000 cl30')
+
+        self.assertEqual([match['index'] for match in matches], [2])
+
+    def test_similarly_ranked_product_variants_require_refinement(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'AMD R7 9800X3D 代理盒裝', 'value': 'boxed'},
+            {'index': 2, 'text': '搭板專案 AMD R7 9800X3D 代理盒裝', 'value': 'bundle'},
+        ], '9800X3D')
+
+        self.assertFalse(is_confident_option_match(matches, '9800X3D'))
+
+    def test_alphanumeric_model_tokens_match_with_optional_spacing(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'ASUS DUAL-RTX5070-O12G', 'value': 'gpu'},
+        ], 'RTX 5070')
+
+        self.assertEqual(matches[0]['index'], 1)
+        self.assertTrue(is_confident_option_match(matches, 'RTX 5070'))
+
+    def test_manufacturer_prefix_does_not_disable_model_pair_safety(self):
+        matches = rank_option_matches([
+            {
+                'index': 1,
+                'text': 'ASUS RTX chassis compatible with a 5070W power supply',
+                'value': 'wrong',
+            },
+            {
+                'index': 2,
+                'text': 'ASUS DUAL RTX 5070 O12G graphics card',
+                'value': 'right',
+            },
+        ], 'ASUS RTX 5070')
+
+        self.assertEqual([match['index'] for match in matches], [2])
+
+    def test_missing_numeric_query_token_is_not_a_full_fuzzy_match(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'NVIDIA RTX 4080 graphics card', 'value': 'gpu'},
+        ], 'NVIDIA RTX 5090')
+
+        self.assertEqual(matches, [])
+
+    def test_model_prefix_and_number_must_appear_together(self):
+        matches = rank_option_matches([
+            {
+                'index': 1,
+                'text': 'Ryzen 7 7800X3D desktop with RX9060XT',
+                'value': 'bundle',
+            },
+            {
+                'index': 2,
+                'text': 'Radeon RX 7800 XT graphics card',
+                'value': 'gpu',
+            },
+        ], 'RX 7800')
+
+        self.assertEqual([match['index'] for match in matches], [2])
+
+    def test_missing_alpha_anchor_does_not_match_a_price_number(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'DDR5 memory, $7800', 'value': 'ram'},
+        ], 'RX 7800')
+
+        self.assertEqual(matches, [])
+
+    def test_control_label_can_disambiguate_options_across_dropdowns(self):
+        matches = rank_option_matches([
+            {
+                'index': 1,
+                'text': 'RTX workstation product',
+                'searchText': 'Desktop systems RTX workstation product',
+                'value': 'desktop',
+            },
+            {
+                'index': 2,
+                'text': 'RTX gaming card',
+                'searchText': 'GraphicsVGA RTX gaming card',
+                'value': 'gpu',
+            },
+        ], 'Graphics card RTX')
+
+        self.assertEqual(matches[0]['index'], 2)
+
+    def test_numeric_tokens_do_not_match_inside_larger_numbers(self):
+        matches = rank_option_matches([
+            {'index': 1, 'text': 'DDR5-16000 MT/s', 'value': 'fast'},
+        ], '6000')
+
+        self.assertEqual(matches, [])
+        self.assertFalse(is_confident_option_match(matches, '6000'))
+
+    def test_exact_full_visible_text_is_confident_despite_similar_variants(self):
+        options = [
+            {'index': 1, 'text': 'AMD R7 9800X3D 代理盒裝', 'value': 'boxed'},
+            {'index': 2, 'text': '搭板專案 AMD R7 9800X3D 代理盒裝', 'value': 'bundle'},
+        ]
+        matches = rank_option_matches(options, 'AMD R7 9800X3D 代理盒裝')
+
+        self.assertEqual(matches[0]['index'], 1)
+        self.assertTrue(is_confident_option_match(matches, 'AMD R7 9800X3D 代理盒裝'))
+
+
 class SnapshotFormattingTests(unittest.TestCase):
+    def test_labels_elements_with_their_iframe_context(self):
+        output = format_snapshot([{
+            'ref': 'e7',
+            'tag': 'select',
+            'text': 'AMD Ryzen 7 9800X3D',
+            'frame': 'PC configurator',
+        }])
+
+        self.assertIn('frame="PC configurator"', output)
+
+    def test_marks_selected_option_for_select_controls(self):
+        output = format_snapshot([{
+            'ref': 'e8',
+            'tag': 'select',
+            'text': 'Choose AMD Ryzen 7 9800X3D',
+            'selected': 'AMD Ryzen 7 9800X3D',
+        }])
+
+        self.assertIn('selected="AMD Ryzen 7 9800X3D"', output)
+
+    def test_describes_large_dropdown_without_dumping_its_option_corpus(self):
+        output = format_snapshot([{
+            'ref': 'e9',
+            'tag': 'select',
+            'text': 'Intel first option AMD Ryzen 7 9800X3D much later',
+            'controlLabel': 'Processor / CPU',
+            'optionCount': 48,
+            'optionType': 'text',
+            'selected': 'Choose a processor',
+        }])
+
+        self.assertIn('label="Processor / CPU"', output)
+        self.assertIn('options="48 text"', output)
+        self.assertIn('selected="Choose a processor"', output)
+        self.assertNotIn('Intel first option', output)
+        self.assertIn('find-option', output)
+
     def test_marks_download_targets_with_the_suggested_filename(self):
         output = format_snapshot([{
             'ref': 'e2',

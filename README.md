@@ -5,7 +5,7 @@
 [![Nodriver: 0.50.3](https://img.shields.io/badge/Nodriver-0.50.3-orange.svg)](https://github.com/ultrafunkamsterdam/nodriver)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux%20%2F%20Xvfb-lightgrey.svg)]()
 
-A high-performance, persistent browser automation and parallel web crawling extension for the [Pi coding agent](https://github.com/badlogic/pi-mono), powered by **Nodriver**, headful **Chrome/Chromium**, **Xvfb**, and an integrated **Stealth & Anti-Bot Bypass Subsystem**.
+A high-performance, persistent browser automation and parallel web crawling extension for the [Pi coding agent](https://github.com/badlogic/pi-mono), powered by **Nodriver**, headful **Chrome/Chromium**, **Xvfb**, and an integrated **stealth and challenge-detection subsystem**.
 
 Designed specifically for autonomous agent pair-programming, dynamic SPA interaction, real-time e-commerce comparison, and high-throughput research scraping on local hardware (optimized for AMD APUs & ROCm local inference).
 
@@ -63,15 +63,15 @@ flowchart TB
 * **Per-Session Tab Routing**: Each Pi conversation maintains its own isolated `session_id` mapping. Session tabs, active viewports, and downloads operate independently without cross-session interference.
 * **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
 
-#### 2. Stealth & Anti-Bot Subsystem (`stealth-extension`)
-Integrated directly into Chrome via `--load-extension`, eliminating headless bot markers and automating challenge bypasses:
+#### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
+Integrated directly into Chrome via `--load-extension` to reduce common automation fingerprints and detect challenge widgets. It does not solve visual hCaptcha challenges or use third-party CAPTCHA bypass services; unresolved challenges require human completion before the agent resumes.
 * **`stealth.js`**:
   * **WebGL Hardware Spoofing**: Overrides WebGL `UNMASKED_VENDOR_WEBGL` and `UNMASKED_RENDERER_WEBGL` from software/Mesa drivers to `Google Inc. (NVIDIA)` / `NVIDIA GeForce RTX 4070 Direct3D11`.
   * **Bot Flag Erasure**: Completely removes `navigator.webdriver` and normalizes `navigator.plugins`, `navigator.languages` (`zh-TW`, `en-US`), and `Notification.permission`.
   * **Runtime Consistency**: Injects authentic `window.chrome.runtime`, `window.chrome.csi`, and `window.chrome.loadTimes` structures.
 * **`turnstile_solver.js`**:
-  * **Shadow DOM Scanner**: Automatically traverses closed/open Shadow DOMs and iframe hierarchies to detect Cloudflare Turnstile, hCaptcha, and challenge checkboxes.
-  * **Synthetic Human Pointer Dispatch**: Emulates natural `mousemove` → `mousedown` → `mouseup` → `click` sequences with randomized coordinate jitter.
+  * **Shadow DOM Scanner**: Traverses available Shadow DOM and iframe contexts to detect Cloudflare Turnstile, hCaptcha, and challenge checkboxes.
+  * **Checkbox Interaction**: Can dispatch pointer events to an ordinary accessible checkbox, but pauses for human handoff when a visual challenge appears.
 
 #### 3. Auto-Dismiss Overlay Engine & Taiwan E-Commerce Hooks
 * **Silent Background Execution**: Executes automatically inside `wait_for_page_ready` on every `open` navigation before generating the initial DOM snapshot.
@@ -158,6 +158,16 @@ sequenceDiagram
 Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
 1. **`open <url>`**: Automatically cleans overlays, waits for DOM readiness, and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
 2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
+
+#### Semantic-First Iframe Interaction
+`snapshot -i` recursively traverses accessible same-origin iframes and labels nested controls with `frame="…"`. `fill`, `type`, `select`, `fill-submit`, and `click-js` resolve those refs inside their owning frame instead of querying only the top document. The agent must use this priority order:
+
+1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `click`).
+2. Semantic fallback with `click-text` or `click-css`.
+3. Direct DOM fallback with `click-js @ref`.
+4. Raw `click <x> <y>` only for canvas, inaccessible cross-origin frames, or after semantic targeting fails.
+
+A full-page overview (`snapshot -i --full`) intentionally creates no refs and must never be used as the basis for guessed coordinate clicks; inspect it, move to the relevant viewport, then run `snapshot -i`.
 
 ### 2. Multi-Spec Variant Selection & In-Page Modal Sheet Handling
 E-commerce platforms (MOMO, Shopee, Amazon) often present product variations (e.g. 度數 200度~800度, 顏色, 尺寸) in dynamic bottom sheets or in-page spec drawers:
@@ -374,6 +384,33 @@ gantt
 
 ---
 
+## Searchable Dropdown Workflow
+
+Large native dropdowns use progressive disclosure instead of dumping every `<option>` into the model context. `snapshot -i` reports the control's accessible/structural label, selected value, option count, and whether its options are numeric or textual. Labels are derived generically from `aria-label`, associated `<label>`, fieldset legends, table-row context, groups, and nearby siblings—including same-origin iframe controls.
+
+```text
+@e43 <select> label="Processor / CPU" selected="Choose a processor" options="48 text"
+@e44 <select> label="Processor / CPU" selected="1" options="10 numeric"
+Dropdown options are searchable without opening them: find-option "keywords", then copy the returned complete Select exactly command.
+```
+
+Search all dropdown options without opening them or crawling the full page:
+
+```text
+find-option "32GB 6000 CL30"
+```
+
+The worker normalizes Unicode, spacing, punctuation, casing, token order, and letter/number boundaries (`RTX5070` matches `RTX 5070`). Control labels participate in ranking, numeric model prefixes must remain adjacent (`RX 7800` does not match a price or a CPU `7800` elsewhere), and the top results are diversified across dropdowns so one category cannot crowd out all alternatives. If a requested model is unavailable, `find-option` performs one safe alpha-family relaxation and labels the results as alternatives instead of forcing the model into repeated guesses. A clear winner can be selected by fuzzy query. Similar variants produce `AMBIGUOUS_OPTION` rather than silently choosing the first option; use the returned stable index immediately:
+
+```text
+select @e43 "32GB 6000 CL30"
+select @e43 --index=31 --fingerprint=8e2c1a7d29f2b612
+```
+
+Visible text outranks an unrelated exact `value`, numeric/model tokens require token-boundary matches, disabled controls/options (including inherited `<fieldset disabled>`) are excluded, and selection dispatches normal `input` and `change` events. Exact index commands include a text/value fingerprint; the final text/value verification and `selectedIndex` mutation occur atomically in the same frame evaluation, so a reordered or replaced option returns `STALE_OPTION` without changing the control. Hidden or frame-offscreen iframe and Shadow DOM branches are not traversed. This protocol is site-independent and works in the top document, visible open Shadow DOM, and visible same-origin iframes.
+
+---
+
 ## 📖 Command Reference
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
@@ -385,10 +422,11 @@ gantt
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` for elements in current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
 | **`click`** | `click <@ref>` | Clicks snapshot element (auto-returns updated DOM snapshot) | Interactive Tab |
-| **`click` (coords)** | `click <x> <y>` | Clicks viewport coordinates (fallback for canvas / shadow DOM) | Interactive Tab |
+| **`click` (coords)** | `click <x> <y>` | Last-resort viewport coordinates after semantic refs/text/CSS fail; intended for canvas or inaccessible visual-only controls | Interactive Tab |
 | **`fill`** | `fill <@ref> <text>` | Clears input field and types text | Interactive Tab |
 | **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
-| **`select`** | `select <@ref> <val>` | Selects dropdown option by value or visible label | Interactive Tab |
+| **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |
+| **`select`** | `select <@ref> <query\|--index=N --fingerprint=HASH>` | Selects a confidently ranked visible option; ambiguous queries return candidates instead of guessing, and the complete indexed command from `find-option` verifies the option has not changed | Interactive Tab |
 | **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
 | **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
 | **`get`** | `get text|url|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
@@ -450,7 +488,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **100 tests**: 59 fast tests run by default and 41 real-browser tests are skipped unless explicitly enabled.
+The current suite contains **124 tests**: 74 fast tests run by default and 50 real-browser tests are skipped unless explicitly enabled.
 
 ### Real Headful Chrome / Xvfb Suite
 

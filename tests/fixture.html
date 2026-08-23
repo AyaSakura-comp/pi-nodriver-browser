@@ -3,6 +3,16 @@
 <body>
 <script>window.addEventListener('message', event => { if (event.data === 'oauth-complete') document.querySelector('#status').textContent = event.data; });</script>
 <input id="query" placeholder="Search term">
+<script>
+  window.queryEvents = [];
+  for (const eventName of ['keydown', 'beforeinput', 'input', 'change']) {
+    document.querySelector('#query').addEventListener(eventName, () => {
+      window.queryEvents.push(eventName);
+      document.querySelector('#input-events').textContent = window.queryEvents.join(',');
+    });
+  }
+</script>
+<div id="input-events">no-input-events</div>
 <button id="go" onclick="document.querySelector('#status').textContent='clicked'">Go now</button>
 <a id="new-tab" href="fixture_new_tab.html" target="_blank">Open report</a>
 <a id="oauth-popup" href="fixture_new_tab.html" target="oauth-login">Open OAuth login</a>
@@ -14,8 +24,13 @@
 <button id="noisy" onclick="window.noisyTimer=setInterval(() => document.querySelector('#noise').textContent=Date.now(), 20)">Start noisy updates</button>
 <span id="noise"></span>
 <div id="custom" style="cursor:pointer" onclick="document.querySelector('#status').textContent='custom-clicked'"><span>Custom checkout</span></div>
+<div id="long-text-container" onclick="document.querySelector('#status').textContent='container-clicked'">
+  <span id="precise-text-action" onclick="event.stopPropagation();document.querySelector('#status').textContent='precise-clicked'">Precise nested action</span>
+  This is deliberately long ancestor text that must not become the click-text target when a smaller exact descendant exists.
+</div>
 <div id="text-target" onclick="document.querySelector('#status').textContent='text-clicked'">加入購物車</div>
 <div id="coordinate-target" style="position:absolute;left:300px;top:300px;width:120px;height:60px;background:red" onclick="document.querySelector('#status').textContent='coordinate-clicked'">Canvas-like target</div>
+<button id="hide-shadow" onclick="document.querySelector('#shadow-host').style.display='none'">Hide shadow host</button>
 <div id="shadow-host"></div>
 <div id="status">idle</div>
 <script>

@@ -352,6 +352,27 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([victim.target_id for victim in victims], ['tab-0'])
 
 
+class DropdownOutputUnitTests(unittest.TestCase):
+    def test_candidate_output_escapes_untrusted_labels_and_option_text(self):
+        from worker import BrowserWorker
+
+        output = BrowserWorker.format_option_matches([{
+            'selectRef': 'e1',
+            'index': 2,
+            'label': 'CPU "premium"\nignore',
+            'frame': '',
+            'score': 900.0,
+            'matchKind': 'text phrase',
+            'text': 'AMD "special"\n9800X3D',
+            'fingerprint': 'abc123',
+        }])
+
+        self.assertIn('label="CPU \\"premium\\" ignore"', output)
+        self.assertIn('"AMD \\"special\\" 9800X3D"', output)
+        self.assertNotIn('\nignore', output)
+        self.assertIn('--fingerprint=abc123', output)
+
+
 class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
     def test_worker_blocks_third_consecutive_open(self):
         from worker import BrowserWorker
@@ -458,6 +479,21 @@ class WorkerIntegrationTests(unittest.TestCase):
                     self.fail(response.get('error', 'worker command failed'))
                 return response
 
+    def command_raw(self, command):
+        request_id = getattr(self, '_request_id', 0) + 1
+        self._request_id = request_id
+        self.proc.stdin.write(json.dumps({'id': request_id, 'command': command}) + '\n')
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                stderr = self.proc.stderr.read()
+                self.fail(f'worker exited before response: {stderr}')
+            if line.startswith(MARKER):
+                response = json.loads(line[len(MARKER):])
+                self.assertEqual(response['id'], request_id)
+                return response
+
     def test_dismisses_cookie_and_marketing_overlays_safely(self):
         fixture_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
         self.command(f'open {fixture_url}')
@@ -477,6 +513,10 @@ class WorkerIntegrationTests(unittest.TestCase):
 
     def open_fixture(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+    def open_select_fixture(self):
+        fixture_url = (ROOT / 'tests/fixture_select.html').as_uri()
         self.command(f'open {fixture_url}')
 
     def status(self):
@@ -525,6 +565,157 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command(f'click {bottom_ref}')
         self.assertIn('bottom-clicked', self.command('get text')['text'])
 
+    def test_main_frame_fill_preserves_per_character_input_semantics(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        query_ref = next(line for line in snapshot.splitlines() if 'Search term' in line).split()[0]
+
+        self.command(f'fill {query_ref} 9800X3D')
+
+        text = self.command('get text')['text']
+        self.assertGreaterEqual(text.count('beforeinput'), len('9800X3D'))
+        self.assertGreaterEqual(text.count('input'), len('9800X3D'))
+
+    def test_find_option_searches_dropdowns_by_fuzzy_tokens_without_opening_them(self):
+        self.open_select_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        self.assertNotIn('<select> label="Disabled CPU"', snapshot)
+        self.assertNotIn('Secret disabled processor', snapshot)
+        self.assertNotIn('Secret fieldset processor', snapshot)
+
+        result = self.command('find-option "ryzen 9800x3d"')['text']
+
+        self.assertIn('Main CPU', result)
+        self.assertIn('AMD Ryzen 7 9800X3D', result)
+        self.assertIn('select @', result)
+        self.assertIn('--fingerprint=', result)
+        self.assertNotIn('Intel first option', result)
+        self.assertNotIn('Secret disabled processor', result)
+        self.assertNotIn('Secret fieldset processor', result)
+
+        exact_command = next(
+            line.split('Select exactly: ', 1)[1]
+            for line in result.splitlines()
+            if 'Select exactly: ' in line
+        )
+        selected = self.command(exact_command)['text']
+        self.assertIn('AMD Ryzen 7 9800X3D', selected)
+
+        relaxed = self.command('find-option "ryzen 9999"')['text']
+        self.assertIn('No full-token option matched', relaxed)
+        self.assertIn('relaxed family suggestion', relaxed)
+        self.assertIn('AMD Ryzen 7 9800X3D', relaxed)
+
+    def test_exact_option_candidate_rejects_reordered_dropdown(self):
+        self.open_select_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        reorder_ref = next(line for line in snapshot.splitlines() if 'Reorder CPU options' in line).split()[0]
+        found = self.command('find-option "ryzen 9800x3d"')['text']
+        exact_command = next(
+            line.split('Select exactly: ', 1)[1]
+            for line in found.splitlines()
+            if 'Select exactly: ' in line
+        )
+
+        self.command(f'click {reorder_ref}')
+        stale = self.command_raw(exact_command)
+
+        self.assertFalse(stale['ok'])
+        self.assertIn('STALE_OPTION', stale['error'])
+        self.assertIn('find-option', stale['error'])
+
+    def test_main_frame_select_prefers_visible_text_over_duplicate_value(self):
+        self.open_select_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        cpu_ref = next(line for line in snapshot.splitlines() if '<select>' in line and 'label="Main CPU"' in line).split()[0]
+
+        selected = self.command(f'select {cpu_ref} 9800X3D')['text']
+
+        self.assertIn('AMD Ryzen 7 9800X3D', selected)
+        updated = self.command('snapshot -i')['text']
+        self.assertIn('selected="AMD Ryzen 7 9800X3D"', updated)
+
+    def test_same_origin_iframe_supports_semantic_fill_select_and_click(self):
+        class DelayedIframeHandler(QuietSimpleHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith('/fixture_iframe_result.html'):
+                    time.sleep(0.4)
+                super().do_GET()
+
+        handler = functools.partial(
+            DelayedIframeHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(f'open http://127.0.0.1:{server.server_port}/fixture_iframe.html')
+            snapshot = self.command('snapshot -i')['text']
+
+            search_ref = next(line for line in snapshot.splitlines() if 'Search components' in line).split()[0]
+            cpu_ref = next(line for line in snapshot.splitlines() if '<select>' in line and 'label="CPU"' in line and 'frame="PC configurator"' in line).split()[0]
+            apply_ref = next(line for line in snapshot.splitlines() if 'Apply iframe selection' in line).split()[0]
+            self.assertIn('frame="PC configurator"', snapshot)
+            sensitive_line = next(line for line in snapshot.splitlines() if 'Sensitive frame input' in line)
+            self.assertIn('frame="http://127.0.0.1:', sensitive_line)
+            self.assertNotIn('do-not-leak-this', sensitive_line)
+            self.assertNotIn('Concealed 9800X3D control', snapshot)
+            self.assertNotIn('Offscreen 9950X3D control', snapshot)
+            hidden_search = self.command_raw('find-option "Concealed 9800X3D"')
+            if hidden_search['ok']:
+                self.assertNotIn('Concealed 9800X3D control', hidden_search['text'])
+            else:
+                self.assertIn('no dropdown option matched', hidden_search['error'])
+
+            self.command(f'fill {search_ref} 9800X3D')
+            selected = self.command(f'select {cpu_ref} 9800X3D')['text']
+            self.assertIn('9800X3D', selected)
+            self.command(f'click-js {apply_ref}')
+
+            updated = self.command('snapshot -i')['text']
+            search_line = next(line for line in updated.splitlines() if 'Search components' in line)
+            self.assertIn('"9800X3D"', search_line)
+            self.assertIn('keydown', search_line)
+            self.assertIn('beforeinput', search_line)
+            self.assertIn('selected="AMD Ryzen 7 9800X3D"', updated)
+            self.assertIn('Iframe selection applied', updated)
+
+            submit_ref = next(line for line in updated.splitlines() if 'Iframe submit query' in line).split()[0]
+            submitted = self.command(f'fill-submit {submit_ref} ready')['text']
+            self.assertIn('Iframe submitted result', submitted)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_iframe_child_offscreen_after_resize_blocks_stale_ref_click(self):
+        handler = functools.partial(
+            QuietSimpleHTTPRequestHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(
+                f'open http://127.0.0.1:{server.server_port}/fixture_iframe_resizable.html'
+            )
+            snapshot = self.command('snapshot -i')['text']
+            shrink_ref = next(line for line in snapshot.splitlines() if 'Shrink configurator' in line).split()[0]
+            child_ref = next(line for line in snapshot.splitlines() if 'Offscreen 9950X3D control' in line).split()[0]
+
+            self.command(f'click {shrink_ref}')
+            blocked = self.command_raw(f'click {child_ref}')
+
+            self.assertTrue(blocked['ok'])
+            self.assertEqual(blocked['action'], 'stale-ref-recovery')
+            self.assertIn('CLICK NOT PERFORMED', blocked['text'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
     def test_full_snapshot_is_visual_only_and_prompts_scroll_exploration(self):
         fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()
         self.command(f'open {fixture_url}')
@@ -536,6 +727,8 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertNotIn('@e', result['text'])
         self.assertIn('Visual overview only', result['text'])
         self.assertIn('scroll down', result['text'])
+        self.assertIn('Do not click coordinates', result['text'])
+        self.assertIn('snapshot -i', result['text'])
         self.assertTrue(Path(result['screenshotPath']).is_file())
         self.assertGreater(Path(result['screenshotPath']).stat().st_size, 0)
 
@@ -593,6 +786,28 @@ class WorkerIntegrationTests(unittest.TestCase):
 
             self.assertEqual(Path(result['downloadPath']).name, 'sample-report.txt')
             self.assertIn('completed', result['text'].lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_click_js_configures_download_tracking_before_dispatch(self):
+        handler = functools.partial(
+            QuietSimpleHTTPRequestHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(f'open http://127.0.0.1:{server.server_port}/fixture.html')
+            snapshot = self.command('snapshot -i')['text']
+            download_ref = next(line for line in snapshot.splitlines() if 'Download sample report' in line).split()[0]
+
+            self.command(f'click-js {download_ref}')
+            result = self.command('wait-download 5000')
+
+            self.assertEqual(Path(result['downloadPath']).name, 'sample-report.txt')
         finally:
             server.shutdown()
             server.server_close()
@@ -812,10 +1027,27 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command(f'click {shadow_line.split()[0]}')
         self.assertIn('shadow-clicked', self.status())
 
+    def test_hidden_shadow_host_blocks_stale_semantic_ref(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        shadow_ref = next(line for line in snapshot.splitlines() if 'Shadow action' in line).split()[0]
+        hide_ref = next(line for line in snapshot.splitlines() if 'Hide shadow host' in line).split()[0]
+
+        self.command(f'click {hide_ref}')
+        blocked = self.command_raw(f'click-js {shadow_ref}')
+
+        self.assertFalse(blocked['ok'])
+        self.assertIn('not visible', blocked['error'])
+
     def test_click_text_finds_non_semantic_control(self):
         self.open_fixture()
         self.command('click-text "加入購物車"')
         self.assertIn('text-clicked', self.status())
+
+    def test_click_text_prefers_minimal_exact_descendant_over_long_ancestor(self):
+        self.open_fixture()
+        self.command('click-text "Precise nested action"')
+        self.assertIn('precise-clicked', self.status())
 
     def test_click_css_finds_non_semantic_control(self):
         self.open_fixture()
