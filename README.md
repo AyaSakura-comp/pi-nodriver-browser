@@ -31,8 +31,11 @@ flowchart TB
 
     subgraph DaemonLayer["3. Python Daemon Core (worker.py)"]
         DAEMON --> SESSIONS["Session & Tab Manager\n(Strict Per-Session Isolation)"]
+        DAEMON --> URL_NORM["URL Typo Normalizer\n(momoshop.tw -> momoshop.com.tw)"]
         DAEMON --> GUARD["Per-Session Loop Guard\n(3-Repeat Deadlock Protection)"]
+        DAEMON --> SCROLL_GUARD["SCROLL_LOOP_GUARD\n(3-Consecutive / Ping-Pong Scroll Protector)"]
         DAEMON --> BREAKER["3.0s Per-Tab Circuit Breaker\n& Anti-Bot WAF Detection"]
+        DAEMON --> AUTO_DISMISS["Auto-Dismiss Overlay Engine\n(MOMO / PChome App Banner Hooks)"]
         DAEMON --> ENGINE["Dual-Mode Execution Engine"]
     end
 
@@ -69,10 +72,15 @@ Integrated directly into Chrome via `--load-extension`, eliminating headless bot
   * **Shadow DOM Scanner**: Automatically traverses closed/open Shadow DOMs and iframe hierarchies to detect Cloudflare Turnstile, hCaptcha, and challenge checkboxes.
   * **Synthetic Human Pointer Dispatch**: Emulates natural `mousemove` → `mousedown` → `mouseup` → `click` sequences with randomized coordinate jitter.
 
-#### 3. 3.0s Circuit Breaker & Diagnostic Feedback
-* **Hard 3.0s Per-Tab Timeout**: Individual background tabs in parallel crawl jobs are wrapped with `asyncio.wait_for(fetch(), timeout=3.0)`. Slow network streams, deadlocks, or WAF stalls trip immediately without stalling the entire batch.
-* **Anti-Bot WAF Challenge Detection**: Intercepts `Challenge Validation`, `Just a moment...`, and `Attention Required` pages.
-* **Actionable Harness Guidance**: If a crawl job fails, structured diagnostics and fallback advice (e.g. switch to Google Finance or alternative search) are returned to the agent harness.
+#### 3. Auto-Dismiss Overlay Engine & Taiwan E-Commerce Hooks
+* **Silent Background Execution**: Executes automatically inside `wait_for_page_ready` on every `open` navigation before generating the initial DOM snapshot.
+* **Native App Banner Dismissal**: Direct programmatic hooks (e.g. `window.backBtnWeb()`) and automatic destruction of backdrop overlays (`#blackBkforApp`, `#blackBk`, `.modal-backdrop`).
+* **Taiwanese Banner & Cookie Dictionary**: Matches localized dismiss phrases including 「繼續使用網頁版」、「留在網頁版」、「前往網頁版」、「繼續瀏覽」、「不用謝謝」、「我知道了」、「關閉」.
+* **Small-Model Coordinate Immunity**: Eliminates the need for 7B/14B/35B models to visually estimate pixel coordinates (`click 380 30`) on blocking interstitials.
+
+#### 4. Navigation Guard & URL Typo Normalization
+* **Domain Normalization**: Automatically repairs common domain typos during agent tool calls (e.g., `momoshop.tw` ➔ `momoshop.com.tw`, `pchome.tw` ➔ `pchome.com.tw`).
+* **3.0s Circuit Breaker**: Wraps background tabs in `asyncio.wait_for(fetch(), timeout=3.0)` to instantly abort hung connections or WAF blockages.
 
 ---
 
@@ -93,12 +101,13 @@ sequenceDiagram
     User->>LLM: "現在 PChome 上 PS5 Slim 多少錢？"
     
     rect rgb(240, 248, 255)
-    Note over LLM,Daemon: Step 1: Open with Inline Auto-Snapshot
+    Note over LLM,Daemon: Step 1: Open with Inline Auto-Dismiss & Auto-Snapshot
     LLM->>EXT: browser("open https://24h.pchome.com.tw/")
     EXT->>Daemon: {command: "open ...", sessionId}
     Daemon->>Chrome: Navigate & Fast-Path Settle (80ms)
+    Daemon->>Chrome: Execute Background Auto-Dismiss (Kill App Banners)
     Daemon->>Chrome: Execute SNAPSHOT_JS
-    Daemon-->>EXT: Returns DOM snapshot with @refs (@e1 Search, @e2 Cart)
+    Daemon-->>EXT: Returns clean DOM snapshot with @refs (@e1 Search, @e2 Cart)
     EXT-->>LLM: DOM elements returned in Round 1
     end
 
@@ -117,33 +126,38 @@ sequenceDiagram
 
 ### 1. Fast 2-Step Interactive Pattern (`fill-submit`)
 Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
-1. **`open <url>`**: Automatically waits for DOM readiness and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
+1. **`open <url>`**: Automatically cleans overlays, waits for DOM readiness, and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
 2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
 
-### 2. Native CDP Multi-File & Image Upload Subsystem (`upload`)
+### 2. Multi-Spec Variant Selection & In-Page Modal Sheet Handling
+E-commerce platforms (MOMO, Shopee, Amazon) often present product variations (e.g. 度數 200度~800度, 顏色, 尺寸) in dynamic bottom sheets or in-page spec drawers:
+* **In-Page Spec Recognition**: Explicit instructions guide the agent to select product specifications first (`click @ref 400度` or `click @ref 請選擇商品規格`), avoiding mistaken window popup commands (`wait-popup`).
+* **Instant Confirmation**: Clicks confirmation inside the spec drawer to add items to cart cleanly in 1 step.
+
+### 3. Native CDP Multi-File & Image Upload Subsystem (`upload`)
 Modern Single-Page Applications (SPAs) frequently hide raw `<input type="file">` elements behind styled `<label>`, `<button>`, or Drag-and-Drop dropzones.
 * **Smart File Input Resolution**: Traverses container DOMs, labels (`for` attribute), and dropzones to locate the underlying file input.
 * **CDP Native Injection**: Calls `DOM.setFileInputFiles` with local absolute paths.
 * **Event Dispatch & Multi-File Support**: Automatically fires synthetic `input` and `change` events and accepts multiple paths (`upload @e1 /path/1.png /path/2.pdf`) in a single invocation.
 
-### 3. Smart Nested Container Scroll Penetration (`scroll`)
+### 4. Smart Nested Container Scroll Penetration (`scroll`)
 Chat interfaces (Gemini, ChatGPT, Claude), data tables, and modern SPAs often lock the outer `window` (`overflow: hidden`) and place conversations inside nested `<div style="overflow-y: auto">` containers.
-* **Smart Container Penetration**: Dynamically evaluates candidate scroll containers across the DOM, scoring by scrollable range, area, and visibility, to scroll the active chat box rather than stalling on `window`.
+* **Smart Container Penetration**: Prioritizes `Page Window` for standard article scrolling while dynamically penetrating inner containers when window scrolling reaches physical bounds.
 * **Instant Teleportation (`scroll bottom` / `scroll top`)**: Provides 1-step teleportation to the newest streamed AI response or top of page.
 * **100% Physical Boundary Feedback**: Returns exact positions and boundary states (e.g. `Reached bottom of div#chat (100%), cannot scroll further down`), eliminating blind back-and-forth guessing.
-* **`SCROLL_LOOP_GUARD`**: Hard 3-consecutive-scroll circuit breaker prevents infinite scrolling loops.
+* **`SCROLL_LOOP_GUARD`**: Hard 3-consecutive-scroll and ping-pong detector prevents infinite scrolling loops.
 
-### 4. Cross-Origin Image Rendering & Hotlink Bypass
+### 5. Cross-Origin Image Rendering & Hotlink Bypass
 * **Native Markdown Image Syntax**: Supports embedding live external images via `![alt](image_url)` and HTML `<img src="..." referrerpolicy="no-referrer" />`.
 * **Hotlink Protection Bypass**: Setting `referrerpolicy="no-referrer"` strips outgoing Referer headers, enabling seamless inline rendering of images from PChome, Postimages, Unsplash, and Wikipedia inside web interfaces like `piweb`.
 
-### 5. Context-Aware Autonomous Intent Routing
+### 6. Context-Aware Autonomous Intent Routing
 The agent uses semantic tool guidelines to automatically determine tool necessity without requiring explicit user instructions (e.g. "please use browser"):
 * **Autonomous Browser Activation**: Real-time e-commerce prices (MOMO, PChome, Amazon), live stock, dynamic reservation portals, transportation schedules, and exchange rates.
 * **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
-### 6. Parallel Multi-Tab Scraping (`crawl`)
+### 7. Parallel Multi-Tab Scraping (`crawl`)
 * **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
 * **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
 * **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
@@ -166,7 +180,32 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 
 ---
 
-### 🎨 Case Study 2: Multi-Modal AI Image Generation & Auto-Upload
+### 👓 Case Study 2: MOMO 購物網 Prescription Goggles Spec Flow (Qwen 3.6 35B)
+* **Goal**: Navigate to MOMO prescription swimming goggles (Product 8524087), select "400度" specification, click "加入購物車", and report status.
+* **Execution Trace**:
+  1. `browser("open https://www.momoshop.com.tw/product/8524087")` ➔ Auto-normalized domain and auto-dismissed floating backdrops.
+  2. `browser("click @e20")` ➔ Expanded 「請選擇商品規格」 bottom sheet drawer.
+  3. `browser("click @e39")` ➔ Selected 「400度」 directly in 1 turn (0 scroll loops).
+  4. `browser("click @e35")` ➔ Clicked "加入購物車".
+  5. MOMO server triggered 302 redirect to `/mymomo/login.momo` (mandatory member login policy).
+  6. Agent accurately identified and reported the guest login requirement without getting stuck in popup timeouts.
+* **Total Execution Time**: **95.56s** (Clean execution, down from 260s+ infinite hanging).
+
+---
+
+### 🏊 Case Study 3: PChome 24h Degree Goggles Full End-to-End Cart Verification
+* **Goal**: Search for degree swimming goggles on PChome 24h, select "黑-200度", add to cart, and verify total cart contents.
+* **Execution Trace**:
+  1. `browser("open https://24h.pchome.com.tw/")` ➔ Opened store.
+  2. `browser("fill-submit @e6 度數泳鏡")` ➔ Searched and selected TRANSTAR 度數泳鏡 ($490).
+  3. `browser("click @e58")` ➔ Selected spec option `黑-200度`.
+  4. `browser("click @e62")` ➔ Clicked "加入購物車" (Guest cart supported).
+  5. `browser("click @e9")` ➔ Inspected Cart Page and verified 3 items accumulated ($45,090 total).
+* **Total Execution Time**: **272.50s** (100% autonomous completion).
+
+---
+
+### 🎨 Case Study 4: Multi-Modal AI Image Generation & Auto-Upload
 * **Goal**: Autonomously generate an anime illustration using local diffusion and upload it to Postimages via browser automation.
 * **Execution Trace**:
   1. Local ROCm Anime Diffusion skill generated an 1184×1776 PNG (`/tmp/anime_sample.png`).
@@ -174,6 +213,15 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
   3. `browser("upload @e2 /tmp/anime_sample.png")` ➔ Injected 2.04 MB image via CDP.
   4. Extracted public CDN direct link: `https://i.postimg.cc/FRXknHvy/anime-sample.png` (`HTTP 200 OK`).
 * **Total Execution Time**: **42.1s**.
+
+---
+
+### 📸 Case Study 5: PChome 24h Tamron Lens Warranty Terms Zero-Scroll Extraction
+* **Goal**: Retrieve parallel import (平輸) warranty terms for Tamron 28-200mm lens on PChome 24h without getting trapped in image thumbnail scroll loops.
+* **Execution Trace**:
+  1. `browser("open https://24h.pchome.com.tw/prod/DGBH50-A900BD5P0")` ➔ Opened product page.
+  2. Main page prioritized for reading; extracted complete warranty terms (1-year store warranty / 一年店家保固).
+* **Total Execution Time**: **115.15s** (0 scroll loops).
 
 ---
 
@@ -294,7 +342,7 @@ gantt
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL and **automatically returns interactive `@refs` snapshot** | Interactive Tab (1600x1000 / iPhone) |
+| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot** | Interactive Tab (1600x1000 / iPhone) |
 | **`fill-submit`** | `fill-submit <@ref> <text>` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload <@ref> <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into file input, button, or dropzone | Interactive Tab |
 | **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** with 3.0s circuit breaker and anti-bot challenge detection | 1920x1080 Full-Desktop CDP Override |
@@ -306,8 +354,8 @@ gantt
 | **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
 | **`select`** | `select <@ref> <val>` | Selects dropdown option by value or visible label | Interactive Tab |
 | **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
-| **`scroll`** | `scroll <down\|up\|top\|bottom\|left\|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
-| **`get`** | `get text\|url\|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
+| **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
+| **`get`** | `get text|url|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
 | **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
@@ -345,7 +393,7 @@ Then reload Pi or launch a new session:
 
 ## 🧪 Testing & Verification
 
-### Run Pure Unit Tests (74 test cases):
+### Run Pure Unit Tests (76 test cases):
 ```bash
 /home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python -m unittest discover -s tests -v
 ```
