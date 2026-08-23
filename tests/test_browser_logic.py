@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -78,6 +78,99 @@ class BrowserExecutableTests(unittest.TestCase):
         which.side_effect = lambda command: '/usr/bin/google-chrome' if command == 'google-chrome' else None
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_browser_executable(), '/usr/bin/google-chrome')
+
+
+class OpenActionGuardTests(unittest.TestCase):
+    def test_blocks_third_consecutive_open_even_when_urls_differ(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open')
+        guard.check('session-a', 'open')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open')
+
+    def test_remains_blocked_until_a_non_open_action(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open')
+        guard.check('session-a', 'open')
+
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'blocked until'):
+                guard.check('session-a', 'open')
+
+        guard.check('session-a', 'snapshot')
+        guard.check('session-a', 'open')
+        guard.check('session-a', 'open')
+
+    def test_tracks_sessions_independently(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open')
+        guard.check('session-a', 'open')
+        guard.check('session-b', 'open')
+        guard.check('session-b', 'open')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-b', 'open')
+
+
+class FakeTarget:
+    def __init__(self, target_id):
+        self.target_id = target_id
+
+
+class FakePage:
+    def __init__(self, target_id):
+        self.target = FakeTarget(target_id)
+
+
+class TabActivityRegistryTests(unittest.TestCase):
+    def test_opening_thirty_evicts_least_recently_used_and_keeps_recently_touched_old_tabs(self):
+        now = 0
+
+        def clock():
+            nonlocal now
+            now += 1
+            return now
+
+        registry = TabActivityRegistry(max_tabs=20, clock=clock)
+        pages = [FakePage(f'tab-{index}') for index in range(30)]
+
+        for index, page in enumerate(pages):
+            for victim in registry.evictions_for_new_tabs(1):
+                registry.remove(victim.page)
+            registry.register(page, f'session-{index}')
+            if index == 19:
+                registry.touch(pages[0])
+                registry.touch(pages[1])
+
+        remaining = {record.target_id for record in registry.records()}
+        self.assertEqual(len(remaining), 20)
+        self.assertIn('tab-0', remaining)
+        self.assertIn('tab-1', remaining)
+        self.assertTrue({f'tab-{index}' for index in range(2, 12)}.isdisjoint(remaining))
+        self.assertTrue({f'tab-{index}' for index in range(12, 30)}.issubset(remaining))
+
+    def test_active_sessions_are_not_eviction_candidates(self):
+        registry = TabActivityRegistry(max_tabs=2)
+        registry.register(FakePage('tab-a'), 'session-a')
+        registry.register(FakePage('tab-b'), 'session-b')
+
+        victims = registry.evictions_for_new_tabs(1, protected_sessions={'session-a'})
+
+        self.assertEqual([victim.target_id for victim in victims], ['tab-b'])
+
+    def test_raises_when_all_tabs_are_protected(self):
+        registry = TabActivityRegistry(max_tabs=2)
+        registry.register(FakePage('tab-a'), 'session-a')
+        registry.register(FakePage('tab-b'), 'session-b')
+
+        with self.assertRaisesRegex(TabLimitError, 'TAB_LIMIT'):
+            registry.evictions_for_new_tabs(
+                1,
+                protected_sessions={'session-a', 'session-b'},
+            )
 
 
 class SnapshotFormattingTests(unittest.TestCase):

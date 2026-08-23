@@ -24,6 +24,8 @@ Guidelines:
 - Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
 - One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
+- Open Loop Guard: At most 2 consecutive open actions are allowed per session. The 3rd and later opens are blocked until a non-open browser action runs.
+- Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
 Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto-returns results DOM) → report answer.
 Commands:
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
@@ -56,7 +58,7 @@ Commands:
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; ref-based commands remain blocked until you run snapshot -i, so never retry the old ref.
-Never send the same observing command (snapshot, screenshot, get, downloads, download-info) twice in a row: it cannot return anything new, and a third identical repeat is rejected with LOOP_GUARD. On LOOP_GUARD, leave the browser and answer with web search or your own knowledge rather than retrying.`;
+Never send the same observing command (snapshot, screenshot, get, downloads, download-info) twice in a row: it cannot return anything new, and a third identical repeat is rejected with LOOP_GUARD. Never issue more than 2 consecutive open actions: the 3rd and later attempts are rejected with OPEN_LOOP_GUARD until another browser action runs. On any loop guard, leave the browser and answer with web search or your own knowledge rather than retrying.`;
 
 type WorkerResponse = {
   id: number;
@@ -240,6 +242,8 @@ export default function (pi: ExtensionAPI) {
       "Batch that follow-up into ONE crawl call carrying every URL you want. The pages themselves fetch in well under a second either way; what costs real time is the agent round-trip around each call, so one call with ten URLs finishes in a fraction of the time ten calls take.",
       "Do not open browser for general research or factual look-ups that web_search already answers.",
       "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
+      "Never issue more than 2 consecutive browser open actions. The 3rd and later opens are blocked by OPEN_LOOP_GUARD until a non-open browser action runs; use the current page or batch URLs with crawl instead.",
+      "Browser enforces a global 20-tab LRU limit. Inactive least-recently-used tabs may be evicted automatically; tabs currently executing commands or downloading are protected.",
       "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text on page in 1 step, or 'screenshot --full' to view the entire layout.",
       "For e-commerce pages with specs or options (e.g. degrees, sizes, colors), select the spec first (e.g. click @ref for '400度' or '請選擇商品規格'), then click @ref to add to cart. Spec selection drawers are in-page modals; run snapshot -i after opening, and do NOT use wait-popup.",
       "A LOOP_GUARD or SCROLL_LOOP_GUARD error means the browser is not making progress: stop scrolling, and use 'get text', 'screenshot --full', or answer with your own knowledge.",

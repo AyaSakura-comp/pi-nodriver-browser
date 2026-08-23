@@ -32,7 +32,8 @@ flowchart TB
     subgraph DaemonLayer["3. Python Daemon Core (worker.py)"]
         DAEMON --> SESSIONS["Session & Tab Manager\n(Strict Per-Session Isolation)"]
         DAEMON --> URL_NORM["URL Typo Normalizer\n(momoshop.tw -> momoshop.com.tw)"]
-        DAEMON --> GUARD["Per-Session Loop Guard\n(3-Repeat Deadlock Protection)"]
+        DAEMON --> GUARD["Per-Session Loop Guards\n(Repeated Observations + Consecutive Opens)"]
+        DAEMON --> TAB_LRU["Global Tab LRU\n(20-Tab Capacity + Inactive Eviction)"]
         DAEMON --> SCROLL_GUARD["SCROLL_LOOP_GUARD\n(3-Consecutive / Ping-Pong Scroll Protector)"]
         DAEMON --> BREAKER["3.0s Per-Tab Circuit Breaker\n& Anti-Bot WAF Detection"]
         DAEMON --> AUTO_DISMISS["Auto-Dismiss Overlay Engine\n(MOMO / PChome App Banner Hooks)"]
@@ -157,7 +158,13 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 * **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
-### 7. Parallel Multi-Tab Scraping (`crawl`)
+### 7. Per-Session Open Loop Guard
+To prevent a runaway agent from repeatedly creating tabs, each session may attempt at most **2 consecutive `open` actions**. The 3rd and every later `open` returns `OPEN_LOOP_GUARD` without launching a tab; failed navigation attempts still count, so failures cannot create an open-retry loop. A valid non-`open` browser action resets the streak, while unsupported commands do not; for multiple independent URLs, use one batched `crawl` call instead.
+
+### 8. Global Tab LRU
+Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Each tab stores an immutable creation time and a `time.monotonic()` last-activity timestamp. Every page operation refreshes activity; when a new tab needs capacity, the least-recently-used inactive tab is closed first. Registry and download-routing state is removed only after Chrome confirms closure, preventing failed closes from bypassing the cap or leaking stale frame ownership. Tabs belonging to commands currently running and sessions with in-progress downloads are protected. If every tab is protected, creation fails with `TAB_LIMIT` instead of exceeding the cap. Crawl creation uses the same registry and a bounded semaphore.
+
+### 9. Parallel Multi-Tab Scraping (`crawl`)
 * **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
 * **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
 * **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
@@ -342,7 +349,7 @@ gantt
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot** | Interactive Tab (1600x1000 / iPhone) |
+| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, only 2 consecutive opens are allowed; the 3rd and later are blocked until a valid non-open action succeeds. | Interactive Tab (1600x1000 / iPhone) |
 | **`fill-submit`** | `fill-submit <@ref> <text>` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload <@ref> <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into file input, button, or dropzone | Interactive Tab |
 | **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** with 3.0s circuit breaker and anti-bot challenge detection | 1920x1080 Full-Desktop CDP Override |

@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = '__PI_NODRIVER__'
@@ -17,6 +18,385 @@ MARKER = '__PI_NODRIVER__'
 class QuietSimpleHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
+
+
+class FakeTarget:
+    def __init__(self, target_id):
+        self.target_id = target_id
+
+
+class FakeBrowser:
+    def __init__(self):
+        self.tabs = []
+
+    async def update_targets(self):
+        return None
+
+
+class FakePage:
+    def __init__(self, browser, target_id):
+        self.browser = browser
+        self.target = FakeTarget(target_id)
+        self.url = f'https://{target_id}.test/'
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+        if self in self.browser.tabs:
+            self.browser.tabs.remove(self)
+
+
+class CloseFailingPage(FakePage):
+    async def close(self):
+        raise RuntimeError('close failed')
+
+
+class CloseIgnoringPage(FakePage):
+    async def close(self):
+        return None
+
+
+class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_opening_thirty_tabs_evicts_old_inactive_tabs_but_keeps_recently_touched_tabs(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        pages = []
+
+        for index in range(30):
+            await worker.ensure_tab_capacity(required=1, protected_session_id=f'session-{index}')
+            page = FakePage(worker.browser, f'tab-{index}')
+            worker.browser.tabs.append(page)
+            worker.pages[f'session-{index}'] = page
+            worker.register_tab(page, f'session-{index}')
+            pages.append(page)
+            if index == 19:
+                worker.touch_tab(pages[0])
+                worker.touch_tab(pages[1])
+
+        remaining = {page.target.target_id for page in worker.browser.tabs}
+        self.assertEqual(len(remaining), 20)
+        self.assertIn('tab-0', remaining)
+        self.assertIn('tab-1', remaining)
+        self.assertTrue({f'tab-{index}' for index in range(2, 12)}.isdisjoint(remaining))
+        self.assertTrue({f'tab-{index}' for index in range(12, 30)}.issubset(remaining))
+        for index in range(2, 12):
+            self.assertTrue(pages[index].closed)
+            self.assertNotIn(f'session-{index}', worker.pages)
+
+    async def test_failed_eviction_keeps_live_tab_registered_and_mapped(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 1
+        worker.tab_registry.max_tabs = 1
+        worker.browser = FakeBrowser()
+        page = CloseFailingPage(worker.browser, 'tab-stuck')
+        worker.browser.tabs.append(page)
+        worker.pages['session-a'] = page
+        worker.register_tab(page, 'session-a')
+
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await worker.ensure_tab_capacity(required=1)
+
+        self.assertIn(page, worker.browser.tabs)
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-stuck'},
+        )
+
+    async def test_eviction_refuses_capacity_when_chrome_ignores_close(self):
+        from browser_logic import TabLimitError
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 1
+        worker.tab_registry.max_tabs = 1
+        worker.browser = FakeBrowser()
+        page = CloseIgnoringPage(worker.browser, 'tab-stuck')
+        worker.browser.tabs.append(page)
+        worker.pages['session-a'] = page
+        worker.register_tab(page, 'session-a')
+
+        with self.assertRaisesRegex(TabLimitError, 'did not close'):
+            await worker.ensure_tab_capacity(required=1)
+
+        self.assertIn(page, worker.browser.tabs)
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-stuck'},
+        )
+
+    async def test_successful_eviction_removes_only_that_tabs_download_routes(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        first = FakePage(worker.browser, 'tab-first')
+        second = FakePage(worker.browser, 'tab-second')
+        worker.browser.tabs.extend([first, second])
+        first_record = worker.register_tab(first, 'shared-session')
+        worker.register_tab(second, 'shared-session')
+        worker.download_target_sessions.update({
+            'tab-first': 'shared-session',
+            'tab-second': 'shared-session',
+        })
+        worker.download_frame_sessions.update({
+            'frame-first': 'shared-session',
+            'frame-second': 'shared-session',
+        })
+        worker.download_frame_targets.update({
+            'frame-first': 'tab-first',
+            'frame-second': 'tab-second',
+        })
+
+        await worker.evict_tab(first_record)
+
+        self.assertNotIn('tab-first', worker.download_target_sessions)
+        self.assertNotIn('frame-first', worker.download_frame_sessions)
+        self.assertNotIn('frame-first', worker.download_frame_targets)
+        self.assertEqual(worker.download_target_sessions['tab-second'], 'shared-session')
+        self.assertEqual(worker.download_frame_sessions['frame-second'], 'shared-session')
+        self.assertEqual(worker.download_frame_targets['frame-second'], 'tab-second')
+
+    async def test_reconcile_removes_records_for_tabs_closed_outside_the_worker(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        closed = FakePage(worker.browser, 'tab-closed')
+        alive = FakePage(worker.browser, 'tab-alive')
+        worker.browser.tabs.extend([closed, alive])
+        worker.register_tab(closed, 'session-closed')
+        worker.register_tab(alive, 'session-alive')
+        worker.browser.tabs.remove(closed)
+
+        await worker.reconcile_tabs()
+
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-alive'},
+        )
+
+    async def test_reconcile_restores_live_opener_when_current_popup_was_closed_externally(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.append(opener)
+        worker.pages['session-a'] = popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(popup, 'session-a', 'popup')
+
+        await worker.reconcile_tabs()
+
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertNotIn('session-a', worker.popup_openers)
+        self.assertNotIn('tab-popup', {record.target_id for record in worker.tab_registry.records()})
+
+    async def test_reconcile_removes_session_mapping_when_current_tab_was_closed_externally(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        closed = FakePage(worker.browser, 'tab-closed')
+        worker.pages['session-a'] = closed
+        worker.register_tab(closed, 'session-a')
+
+        await worker.reconcile_tabs()
+
+        self.assertNotIn('session-a', worker.pages)
+
+    async def test_capacity_protects_only_the_active_target_not_every_tab_in_its_session(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 2
+        worker.tab_registry.max_tabs = 2
+        worker.browser = FakeBrowser()
+        active = FakePage(worker.browser, 'tab-active')
+        idle = FakePage(worker.browser, 'tab-idle')
+        worker.browser.tabs.extend([active, idle])
+        worker.register_tab(active, 'shared-session')
+        worker.register_tab(idle, 'shared-session')
+        worker.begin_tab_activity(active)
+
+        victims = await worker.ensure_tab_capacity(required=1)
+
+        self.assertEqual([victim.target_id for victim in victims], ['tab-idle'])
+        self.assertFalse(active.closed)
+
+    async def test_evicting_current_popup_restores_its_live_opener(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, popup])
+        worker.pages['session-a'] = popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        popup_record = worker.register_tab(popup, 'session-a', 'popup')
+
+        await worker.evict_tab(popup_record)
+
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertNotIn('session-a', worker.popup_openers)
+        self.assertIn('session-a', worker.popup_just_closed)
+
+    async def test_popup_admission_rolls_back_when_existing_tabs_are_all_active(self):
+        from browser_logic import TabLimitError
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 2
+        worker.tab_registry.max_tabs = 2
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        other = FakePage(worker.browser, 'tab-other')
+        popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, other, popup])
+        worker.pages['session-a'] = opener
+        worker.pages['session-b'] = other
+        worker.register_tab(opener, 'session-a')
+        worker.register_tab(other, 'session-b')
+        worker.begin_tab_activity(opener)
+        worker.begin_tab_activity(other)
+
+        with self.assertRaisesRegex(TabLimitError, 'TAB_LIMIT'):
+            await worker.admit_popup('session-a', opener, popup)
+
+        self.assertTrue(popup.closed)
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertNotIn('session-a', worker.popup_openers)
+        self.assertNotIn('tab-popup', {record.target_id for record in worker.tab_registry.records()})
+
+    def test_crawl_concurrency_reserves_capacity_for_active_tabs(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 20
+        worker.begin_tab_activity(FakePage(FakeBrowser(), 'tab-active'))
+
+        self.assertEqual(worker.available_crawl_slots(), 19)
+
+    def test_unique_pages_deduplicates_unhashable_tabs_by_identity(self):
+        from worker import BrowserWorker
+
+        class UnhashablePage(FakePage):
+            __hash__ = None
+
+        browser = FakeBrowser()
+        first = UnhashablePage(browser, 'tab-first')
+        second = UnhashablePage(browser, 'tab-second')
+
+        self.assertEqual(
+            BrowserWorker.unique_pages([first, first, second]),
+            [first, second],
+        )
+
+    async def test_failed_open_keeps_the_previous_session_page(self):
+        from worker import BrowserWorker
+
+        class FailingPage(FakePage):
+            async def send(self, _command):
+                return None
+
+            async def get(self, _url):
+                raise RuntimeError('navigation failed')
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        previous = FakePage(worker.browser, 'tab-previous')
+        replacement = FailingPage(worker.browser, 'tab-replacement')
+        worker.browser.tabs.extend([previous, replacement])
+        worker.pages['session-a'] = previous
+        worker.register_tab(previous, 'session-a')
+        worker.ensure_browser = AsyncMock(return_value=worker.browser)
+        worker.configure_download_session = AsyncMock()
+
+        async def create_replacement(_session_id, _kind):
+            worker.register_tab(replacement, 'session-a')
+            return replacement
+
+        worker.create_managed_tab = AsyncMock(side_effect=create_replacement)
+
+        with self.assertRaisesRegex(RuntimeError, 'navigation failed'):
+            await worker.execute('open https://fail.test/', session_id='session-a')
+
+        self.assertIs(worker.pages['session-a'], previous)
+        self.assertFalse(previous.closed)
+        self.assertTrue(replacement.closed)
+
+    async def test_download_routing_metadata_does_not_protect_idle_tabs(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        for index in range(20):
+            page = FakePage(worker.browser, f'tab-{index}')
+            worker.browser.tabs.append(page)
+            worker.pages[f'session-{index}'] = page
+            worker.register_tab(page, f'session-{index}')
+            worker.download_target_sessions[f'tab-{index}'] = f'session-{index}'
+
+        victims = await worker.ensure_tab_capacity(required=1, protected_session_id='session-new')
+
+        self.assertEqual([victim.target_id for victim in victims], ['tab-0'])
+
+
+class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
+    def test_worker_blocks_third_consecutive_open(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.track_open_action('session-a', 'open')
+        worker.track_open_action('session-a', 'open')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            worker.track_open_action('session-a', 'open')
+
+    async def test_invalid_supported_command_does_not_reset_open_guard(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.track_open_action('session-a', 'open')
+        worker.track_open_action('session-a', 'open')
+
+        with self.assertRaisesRegex(ValueError, 'usage: crawl'):
+            await worker.execute('crawl', session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            worker.track_open_action('session-a', 'open')
+
+    async def test_successful_non_open_command_resets_open_guard(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.track_open_action('session-a', 'open')
+        worker.track_open_action('session-a', 'open')
+
+        await worker.execute('close', session_id='session-a')
+        worker.track_open_action('session-a', 'open')
+        worker.track_open_action('session-a', 'open')
+
+    async def test_unsupported_command_does_not_reset_open_guard(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.track_open_action('session-a', 'open')
+        worker.track_open_action('session-a', 'open')
+
+        with self.assertRaisesRegex(ValueError, 'unsupported browser command'):
+            await worker.execute('not-a-command', session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            worker.track_open_action('session-a', 'open')
 
 
 @unittest.skipUnless(os.environ.get('RUN_BROWSER_INTEGRATION') == '1', 'browser integration test')

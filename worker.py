@@ -17,9 +17,16 @@ from pathlib import Path
 
 import nodriver as uc
 
-from browser_logic import format_snapshot, parse_command, parse_devtools_active_port, parse_dismiss_options, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, format_snapshot, parse_command, parse_devtools_active_port, parse_dismiss_options, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
+SUPPORTED_ACTIONS = {
+    'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
+    'download', 'download-info', 'download-latest', 'downloads', 'fill',
+    'fill-submit', 'fill_submit', 'get', 'mobile', 'open', 'press', 'screenshot',
+    'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
+    'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
+}
 logging.basicConfig(level=logging.CRITICAL)
 
 
@@ -417,6 +424,12 @@ class BrowserWorker:
         self.popup_just_closed = set()
         self.snapshot_required_sessions = set()
         self.repeated_commands = {}
+        self.open_action_guard = OpenActionGuard(limit=2)
+        self.max_tabs = int(os.environ.get('PI_NODRIVER_MAX_TABS', '20'))
+        self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
+        self.tab_management_lock = asyncio.Lock()
+        self.active_target_counts = {}
+        self.session_action_targets = {}
         self.scroll_history = {}
         configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
         self.download_dir = (
@@ -425,8 +438,242 @@ class BrowserWorker:
         )
         self.downloads = {}
         self.download_frame_sessions = {}
+        self.download_frame_targets = {}
         self.download_target_sessions = {}
         self.download_route_session = 'default'
+
+    def register_tab(self, page, session_id, kind='page', *, last_active_at=None):
+        return self.tab_registry.register(
+            page,
+            session_id,
+            kind,
+            last_active_at=last_active_at,
+        )
+
+    def touch_tab(self, page):
+        self.tab_registry.touch(page)
+
+    def begin_tab_activity(self, page):
+        target_id = self.tab_registry.target_id(page)
+        self.active_target_counts[target_id] = self.active_target_counts.get(target_id, 0) + 1
+        self.touch_tab(page)
+
+    def end_tab_activity(self, page):
+        target_id = self.tab_registry.target_id(page)
+        count = self.active_target_counts.get(target_id, 0) - 1
+        if count > 0:
+            self.active_target_counts[target_id] = count
+        else:
+            self.active_target_counts.pop(target_id, None)
+
+    def begin_session_action(self, session_id):
+        page = self.pages.get(session_id)
+        self.session_action_targets.setdefault(session_id, []).append(page)
+        if page is not None:
+            self.begin_tab_activity(page)
+
+    def switch_session_action_target(self, session_id, page):
+        targets = self.session_action_targets.get(session_id)
+        if not targets:
+            return
+        previous = targets[-1]
+        if previous is page:
+            return
+        if previous is not None:
+            self.end_tab_activity(previous)
+        targets[-1] = page
+        if page is not None:
+            self.begin_tab_activity(page)
+
+    def end_session_action(self, session_id):
+        targets = self.session_action_targets.get(session_id)
+        if not targets:
+            return
+        page = targets.pop()
+        if not targets:
+            self.session_action_targets.pop(session_id, None)
+        if page is not None:
+            self.end_tab_activity(page)
+
+    def available_crawl_slots(self):
+        return max(1, self.max_tabs - len(self.active_target_counts))
+
+    @staticmethod
+    def unique_pages(pages):
+        unique = []
+        for page in pages:
+            if not any(existing is page for existing in unique):
+                unique.append(page)
+        return unique
+
+    def forget_closed_tab(self, record):
+        page = record.page
+        target_id = record.target_id
+        live_target_ids = {
+            self.tab_registry.target_id(live_page)
+            for live_page in self.browser.tabs
+        }
+        affected_sessions = []
+        for owner, active_page in list(self.pages.items()):
+            if active_page is not page:
+                continue
+            affected_sessions.append(owner)
+            openers = [
+                opener for opener in self.popup_openers.get(owner, [])
+                if opener is not page
+                and self.tab_registry.target_id(opener) in live_target_ids
+            ]
+            replacement = openers.pop() if openers else None
+            if openers:
+                self.popup_openers[owner] = openers
+            else:
+                self.popup_openers.pop(owner, None)
+            if replacement is not None:
+                self.pages[owner] = replacement
+                self.switch_session_action_target(owner, replacement)
+                self.popup_just_closed.add(owner)
+                self.touch_tab(replacement)
+            else:
+                self.pages.pop(owner, None)
+                self.switch_session_action_target(owner, None)
+        for owner, openers in list(self.popup_openers.items()):
+            remaining = [opener for opener in openers if opener is not page]
+            if remaining:
+                self.popup_openers[owner] = remaining
+            else:
+                self.popup_openers.pop(owner, None)
+        self.download_target_sessions.pop(target_id, None)
+        for frame_id, frame_target_id in list(self.download_frame_targets.items()):
+            if frame_target_id == target_id:
+                self.download_frame_targets.pop(frame_id, None)
+                self.download_frame_sessions.pop(frame_id, None)
+        self.tab_registry.remove(page)
+        self.active_target_counts.pop(target_id, None)
+        for owner in affected_sessions:
+            self.snapshot_required_sessions.discard(owner)
+
+    async def evict_tab(self, record):
+        await record.page.close()
+        for _ in range(20):
+            await self.browser.update_targets()
+            live_target_ids = {
+                self.tab_registry.target_id(page)
+                for page in self.browser.tabs
+            }
+            if record.target_id not in live_target_ids:
+                self.forget_closed_tab(record)
+                return
+            await asyncio.sleep(0.05)
+        raise TabLimitError(
+            f'TAB_LIMIT: Chrome did not close tab {record.target_id}; refusing to open another tab'
+        )
+
+    async def reconcile_tabs(self):
+        if self.browser is None:
+            return
+        await self.browser.update_targets()
+        live_target_ids = {
+            self.tab_registry.target_id(page)
+            for page in self.browser.tabs
+        }
+        for owner, openers in list(self.popup_openers.items()):
+            live_openers = [
+                opener for opener in openers
+                if self.tab_registry.target_id(opener) in live_target_ids
+            ]
+            if live_openers:
+                self.popup_openers[owner] = live_openers
+            else:
+                self.popup_openers.pop(owner, None)
+        for owner, current_page in list(self.pages.items()):
+            if self.tab_registry.target_id(current_page) in live_target_ids:
+                continue
+            openers = self.popup_openers.get(owner, [])
+            replacement = openers.pop() if openers else None
+            if openers:
+                self.popup_openers[owner] = openers
+            else:
+                self.popup_openers.pop(owner, None)
+            if replacement is not None:
+                self.pages[owner] = replacement
+                self.switch_session_action_target(owner, replacement)
+                self.popup_just_closed.add(owner)
+                self.touch_tab(replacement)
+            else:
+                self.pages.pop(owner, None)
+                self.switch_session_action_target(owner, None)
+                self.popup_just_switched.discard(owner)
+                self.popup_just_closed.discard(owner)
+                self.snapshot_required_sessions.discard(owner)
+        for record in self.tab_registry.records():
+            if record.target_id not in live_target_ids:
+                self.forget_closed_tab(record)
+        known = {record.target_id for record in self.tab_registry.records()}
+        for page in self.browser.tabs:
+            target_id = self.tab_registry.target_id(page)
+            if target_id in known:
+                continue
+            owner = next(
+                (session_id for session_id, active_page in self.pages.items() if active_page is page),
+                '__unowned__',
+            )
+            self.register_tab(page, owner, 'unowned', last_active_at=0.0)
+
+    async def _ensure_tab_capacity(self, required=1, protected_target_ids=None):
+        await self.reconcile_tabs()
+        protected_sessions = {
+            record.get('sessionId', 'default')
+            for record in self.downloads.values()
+            if record.get('state') == 'inProgress'
+        }
+        protected_targets = set(self.active_target_counts)
+        protected_targets.update(protected_target_ids or set())
+        victims = self.tab_registry.evictions_for_new_tabs(
+            required,
+            protected_sessions=protected_sessions,
+            protected_target_ids=protected_targets,
+        )
+        for victim in victims:
+            await self.evict_tab(victim)
+        return victims
+
+    async def ensure_tab_capacity(self, required=1, protected_session_id=None):
+        protected_targets = set()
+        if protected_session_id is not None:
+            page = self.pages.get(protected_session_id)
+            if page is not None:
+                protected_targets.add(self.tab_registry.target_id(page))
+        async with self.tab_management_lock:
+            return await self._ensure_tab_capacity(required, protected_targets)
+
+    async def create_managed_tab(self, session_id, kind='page'):
+        async with self.tab_management_lock:
+            await self._ensure_tab_capacity(required=1)
+            page = await self.browser.get('about:blank', new_tab=True)
+            self.register_tab(page, session_id, kind)
+            return page
+
+    async def admit_popup(self, session_id, opener, popup):
+        async with self.tab_management_lock:
+            self.register_tab(popup, session_id, 'popup')
+            popup_target_id = self.tab_registry.target_id(popup)
+            try:
+                await self._ensure_tab_capacity(
+                    required=0,
+                    protected_target_ids={popup_target_id},
+                )
+            except Exception:
+                popup_record = next(
+                    record for record in self.tab_registry.records()
+                    if record.page is popup
+                )
+                await self.evict_tab(popup_record)
+                raise
+        self.popup_openers.setdefault(session_id, []).append(opener)
+        self.pages[session_id] = popup
+        self.switch_session_action_target(session_id, popup)
+        self.touch_tab(popup)
+        return popup
 
     async def ensure_browser(self):
         if self.browser is None:
@@ -525,24 +772,35 @@ class BrowserWorker:
         except Exception:
             return
 
+        target_id = str(page.target.target_id)
+
         def register(tree):
-            self.download_frame_sessions[str(tree.frame.id_)] = session_id
+            frame_id = str(tree.frame.id_)
+            self.download_frame_sessions[frame_id] = session_id
+            self.download_frame_targets[frame_id] = target_id
             for child in tree.child_frames or []:
                 register(child)
 
         register(frame_tree)
 
     def on_frame_attached(self, event):
-        session_id = self.download_frame_sessions.get(str(event.parent_frame_id))
+        parent_frame_id = str(event.parent_frame_id)
+        session_id = self.download_frame_sessions.get(parent_frame_id)
+        target_id = self.download_frame_targets.get(parent_frame_id)
         if session_id is not None:
-            self.download_frame_sessions[str(event.frame_id)] = session_id
+            frame_id = str(event.frame_id)
+            self.download_frame_sessions[frame_id] = session_id
+            if target_id is not None:
+                self.download_frame_targets[frame_id] = target_id
 
     def on_target_created(self, event):
         target = event.target_info
         session_id = self.download_target_sessions.get(str(target.opener_id))
         if session_id is not None:
-            self.download_target_sessions[str(target.target_id)] = session_id
-            self.download_frame_sessions[str(target.target_id)] = session_id
+            target_id = str(target.target_id)
+            self.download_target_sessions[target_id] = session_id
+            self.download_frame_sessions[target_id] = session_id
+            self.download_frame_targets[target_id] = target_id
 
     def on_download_will_begin(self, event):
         frame_id = str(event.frame_id)
@@ -741,7 +999,11 @@ class BrowserWorker:
             self.popup_just_switched.clear()
             self.popup_just_closed.clear()
             self.download_frame_sessions.clear()
+            self.download_frame_targets.clear()
             self.download_target_sessions.clear()
+            self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
+            self.active_target_counts.clear()
+            self.session_action_targets.clear()
 
     async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.08):
         """
@@ -777,10 +1039,13 @@ class BrowserWorker:
                     if opener in self.browser.tabs:
                         await opener.bring_to_front()
                         self.pages[session_id] = opener
+                        self.switch_session_action_target(session_id, opener)
+                        self.touch_tab(opener)
                         self.popup_just_switched.discard(session_id)
                         self.popup_just_closed.add(session_id)
                         return opener
                 raise ValueError('popup and its opener are no longer available')
+        self.touch_tab(page)
         return page
 
     def stale_ref_error(self, session_id, ref):
@@ -943,7 +1208,7 @@ class BrowserWorker:
             if not self.is_owned_popup(previous, page):
                 page = previous
             else:
-                self.popup_openers.setdefault(session_id, []).append(previous)
+                await self.admit_popup(session_id, previous, page)
                 self.popup_just_switched.add(session_id)
                 await self.configure_download_session(session_id, page)
         if self.popup_openers.get(session_id):
@@ -955,9 +1220,14 @@ class BrowserWorker:
                 opener = openers.pop()
                 if opener in self.browser.tabs:
                     await opener.bring_to_front()
+                    self.switch_session_action_target(session_id, opener)
                     self.popup_just_closed.add(session_id)
                     return opener
         return page
+
+    def track_open_action(self, session_id, action):
+        if action == 'open':
+            self.open_action_guard.check(session_id, action)
 
     def track_repeat(self, session_id, action, parts):
         signature = ' '.join(parts)
@@ -1030,6 +1300,17 @@ class BrowserWorker:
         return result
 
     async def execute(self, command, session_id='default'):
+        parts = parse_command(command)
+        action = parts[0].lower()
+        if action not in SUPPORTED_ACTIONS:
+            raise ValueError(f'unsupported browser command: {action}')
+        self.track_open_action(session_id, action)
+        result = await self._execute(command, session_id)
+        if action != 'open':
+            self.open_action_guard.clear(session_id)
+        return result
+
+    async def _execute(self, command, session_id='default'):
         parts = parse_command(command)
         action = parts[0].lower()
         self.track_repeat(session_id, action, parts)
@@ -1119,38 +1400,70 @@ class BrowserWorker:
             if 'momoshop.com.tw/mymomo/login.momo' in target_url:
                 target_url = 'https://account.momoshop.com.tw/mobile'
 
-            browser = await self.ensure_browser()
+            await self.ensure_browser()
             previous = self.pages.get(session_id)
-            previous_openers = self.popup_openers.pop(session_id, [])
+            previous_openers = list(self.popup_openers.get(session_id, []))
             await self.configure_download_session(session_id)
-            page = await browser.get('about:blank', new_tab=True)
+            page = await self.create_managed_tab(session_id, 'page')
+            self.begin_tab_activity(page)
 
-            # Enforce iPhone Mobile Mode (Portrait 390x844 with Touch Emulation)
-            ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-            w, h = 390, 844
-            await page.send(uc.cdp.network.set_user_agent_override(user_agent=ua))
-            await page.send(uc.cdp.emulation.set_device_metrics_override(
-                width=w, height=h, device_scale_factor=3.0, mobile=True
-            ))
-            await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
-            page._is_mobile_mode = True
-
-            await page.get(target_url)
-            self.pages[session_id] = page
-            await self.configure_download_session(session_id, page)
-            for old_page in [previous, *previous_openers]:
-                if old_page is not None:
-                    try:
-                        await old_page.close()
-                    except Exception:
-                        pass
-            await self.wait_for_page_ready(page)
             try:
-                await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
-                await page.sleep(0.3)
+                # Enforce iPhone Mobile Mode (Portrait 390x844 with Touch Emulation)
+                ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+                w, h = 390, 844
+                await page.send(uc.cdp.network.set_user_agent_override(user_agent=ua))
+                await page.send(uc.cdp.emulation.set_device_metrics_override(
+                    width=w, height=h, device_scale_factor=3.0, mobile=True
+                ))
+                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
+                page._is_mobile_mode = True
+
+                await page.get(target_url)
+                await self.configure_download_session(session_id, page)
+                await self.wait_for_page_ready(page)
+                try:
+                    await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
+                    await page.sleep(0.3)
+                except Exception:
+                    pass
+                elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             except Exception:
-                pass
-            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+                async with self.tab_management_lock:
+                    record = next(
+                        (item for item in self.tab_registry.records() if item.page is page),
+                        None,
+                    )
+                    if record is not None:
+                        await self.evict_tab(record)
+                    else:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                raise
+            finally:
+                self.end_tab_activity(page)
+
+            self.pages[session_id] = page
+            self.switch_session_action_target(session_id, page)
+            self.touch_tab(page)
+            self.popup_openers.pop(session_id, None)
+            async with self.tab_management_lock:
+                for old_page in self.unique_pages([previous, *previous_openers]):
+                    if old_page is None or old_page is page:
+                        continue
+                    record = next(
+                        (item for item in self.tab_registry.records() if item.page is old_page),
+                        None,
+                    )
+                    if record is not None:
+                        await self.evict_tab(record)
+                    else:
+                        try:
+                            await old_page.close()
+                        except Exception:
+                            pass
+
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
             return {
@@ -1599,8 +1912,7 @@ class BrowserWorker:
                     if tab != page and tab.target.opener_id == opener_id
                 ), None)
                 if popup is not None:
-                    self.popup_openers.setdefault(session_id, []).append(page)
-                    self.pages[session_id] = popup
+                    await self.admit_popup(session_id, page, popup)
                     self.popup_just_switched.add(session_id)
                     await self.configure_download_session(session_id, popup)
                     await popup.bring_to_front()
@@ -1625,6 +1937,8 @@ class BrowserWorker:
                 if opener in self.browser.tabs:
                     await opener.bring_to_front()
                     self.pages[session_id] = opener
+                    self.switch_session_action_target(session_id, opener)
+                    self.touch_tab(opener)
                     self.popup_just_switched.discard(session_id)
                     return {
                         'text': f'Switched to popup opener\nURL: {opener.url}',
@@ -1653,11 +1967,19 @@ class BrowserWorker:
             while loop.time() < deadline:
                 await self.browser.update_targets()
                 if page not in self.browser.tabs:
+                    record = next(
+                        (item for item in self.tab_registry.records() if item.page is page),
+                        None,
+                    )
+                    if record is not None:
+                        self.forget_closed_tab(record)
                     while openers:
                         opener = openers.pop()
                         if opener in self.browser.tabs:
                             await opener.bring_to_front()
                             self.pages[session_id] = opener
+                            self.switch_session_action_target(session_id, opener)
+                            self.touch_tab(opener)
                             self.popup_just_switched.discard(session_id)
                             return {
                                 'text': f'Popup closed; returned to opener\nURL: {opener.url}',
@@ -1706,14 +2028,17 @@ class BrowserWorker:
                 raise ValueError('usage: crawl <url1> [url2] [url3] ...')
 
             await self.ensure_browser()
+            crawl_slots = asyncio.Semaphore(self.available_crawl_slots())
 
             async def crawl_single(target_url, idx):
                 tab = None
                 t0 = asyncio.get_running_loop().time()
+                await crawl_slots.acquire()
                 try:
                     async def fetch_tab():
                         nonlocal tab
-                        tab = await self.browser.get("about:blank", new_tab=True)
+                        tab = await self.create_managed_tab(session_id, 'crawl')
+                        self.begin_tab_activity(tab)
                         # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
                         try:
                             await tab.send(uc.cdp.emulation.set_device_metrics_override(
@@ -1795,10 +2120,17 @@ class BrowserWorker:
                     }
                 finally:
                     if tab is not None:
-                        try:
-                            await tab.close()
-                        except Exception:
-                            pass
+                        self.end_tab_activity(tab)
+                        async with self.tab_management_lock:
+                            record = next(
+                                (item for item in self.tab_registry.records() if item.page is tab),
+                                None,
+                            )
+                            if record is not None:
+                                await self.evict_tab(record)
+                            else:
+                                await tab.close()
+                    crawl_slots.release()
 
             results = await asyncio.gather(*(crawl_single(url, i) for i, url in enumerate(urls)))
             successful = [r for r in results if r["ok"]]
@@ -1838,16 +2170,21 @@ class BrowserWorker:
             }
 
         if action == 'close':
-            page = self.pages.pop(session_id, None)
+            page = self.pages.get(session_id)
+            if page is not None:
+                record = next(
+                    (item for item in self.tab_registry.records() if item.page is page),
+                    None,
+                )
+                if record is not None:
+                    await self.evict_tab(record)
+                else:
+                    await page.close()
+                    self.pages.pop(session_id, None)
             self.popup_openers.pop(session_id, None)
             self.popup_just_switched.discard(session_id)
             self.popup_just_closed.discard(session_id)
             self.repeated_commands.pop(session_id, None)
-            if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
             return {'text': 'Current Pi session tab closed', 'action': action}
 
         if action == 'shutdown':
@@ -1863,6 +2200,7 @@ class BrowserWorker:
 async def execute_request(worker, request):
     session_id = str(request.get('sessionId') or 'default')
     command_timeout = float(os.environ.get('PI_NODRIVER_COMMAND_TIMEOUT', '75'))
+    worker.begin_session_action(session_id)
     try:
         result = await asyncio.wait_for(
             worker.execute(request.get('command', ''), session_id=session_id),
@@ -1892,6 +2230,8 @@ async def execute_request(worker, request):
         }
     except Exception as error:
         return {'id': request.get('id'), 'sessionId': session_id, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
+    finally:
+        worker.end_session_action(session_id)
 
 
 async def stdio_main():
