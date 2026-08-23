@@ -241,6 +241,7 @@ export default function (pi: ExtensionAPI) {
       "Do not open browser for general research or factual look-ups that web_search already answers.",
       "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
       "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text on page in 1 step, or 'screenshot --full' to view the entire layout.",
+      "For e-commerce pages with specs or options (e.g. degrees, sizes, colors), select the spec first (e.g. click @ref for '400度' or '請選擇商品規格'), then click @ref to add to cart. Spec selection drawers are in-page modals; run snapshot -i after opening, and do NOT use wait-popup.",
       "A LOOP_GUARD or SCROLL_LOOP_GUARD error means the browser is not making progress: stop scrolling, and use 'get text', 'screenshot --full', or answer with your own knowledge.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
       "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",

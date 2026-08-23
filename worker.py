@@ -1097,6 +1097,12 @@ class BrowserWorker:
         if action == 'open':
             if len(parts) != 2:
                 raise ValueError('usage: open <url>')
+            target_url = parts[1]
+            if 'momoshop.tw' in target_url and 'momoshop.com.tw' not in target_url:
+                target_url = target_url.replace('momoshop.tw', 'momoshop.com.tw')
+            if 'pchome.tw' in target_url and 'pchome.com.tw' not in target_url:
+                target_url = target_url.replace('pchome.tw', 'pchome.com.tw')
+
             browser = await self.ensure_browser()
             previous = self.pages.get(session_id)
             previous_openers = self.popup_openers.pop(session_id, [])
@@ -1113,7 +1119,7 @@ class BrowserWorker:
             await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
             page._is_mobile_mode = True
 
-            await page.get(parts[1])
+            await page.get(target_url)
             self.pages[session_id] = page
             await self.configure_download_session(session_id, page)
             for old_page in [previous, *previous_openers]:
