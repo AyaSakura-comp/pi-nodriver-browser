@@ -248,6 +248,7 @@ export default function (pi: ExtensionAPI) {
       "A missing or stale @ref does not perform the action and automatically returns both a fresh DOM snapshot and viewport image for joint inspection; run snapshot -i next to unlock ref-based commands, and never retry the old ref.",
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
       "For downloads, inspect with download-info and prefer download <@ref> over clicking and guessing; use downloads to check progress.",
+      "To deliver a screenshot or downloaded file to the user on PiWeb / Discord, you MUST emit '[[image: <path>]]' or '[[file: <path>]]' in your reply prose. Do NOT use markdown '![alt](/tmp/...)' and do NOT rely on 'read'.",
       "Browser close affects only the current Pi session tab; browser shutdown stops the shared daemon for every session.",
     ],
     parameters: Type.Object({
@@ -266,9 +267,10 @@ export default function (pi: ExtensionAPI) {
         const image = readFileSync(response.screenshotPath);
         const extension = extname(response.screenshotPath).toLowerCase();
         const mimeType = extension === ".jpg" || extension === ".jpeg" ? "image/jpeg" : "image/png";
+        const returnText = `${text}\n(To send this screenshot to user, include '[[image: ${response.screenshotPath}]]' in your reply)`;
         return {
           content: [
-            { type: "text" as const, text },
+            { type: "text" as const, text: returnText },
             { type: "image" as const, data: image.toString("base64"), mimeType },
           ],
           details: response,
