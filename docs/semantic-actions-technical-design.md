@@ -60,7 +60,7 @@ flowchart TB
     CANDIDATES --> VERIFY[Index + fingerprint verification]
     VERIFY --> ACTION
 
-    SNAPSHOT -->|@ref| CLICK
+    SNAPSHOT -->|"@ref"| CLICK
     CLICK -->|DOM-derived center point| NATIVE[Native mouse click]
     ACTION -->|fill / type / select / submit / click-js| DOM[Owning document DOM]
 
@@ -198,14 +198,14 @@ sequenceDiagram
     Worker->>Page: re-inspect current dropdown options
     Worker->>Worker: verify SHA-256(text NUL value) prefix
     alt option missing or fingerprint differs
-        Worker-->>Agent: STALE_OPTION; no mutation
+        Worker-->>Agent: STALE_OPTION, no mutation
     else fingerprint still valid
         Worker->>Page: REF_ACTION_JS with expected text/value
         Page->>Page: verify index, enabled state, text, and value atomically
         alt option changed before mutation
-            Page-->>Worker: STALE_OPTION; no mutation
+            Page-->>Worker: STALE_OPTION, no mutation
         else option unchanged
-            Page->>Page: set selectedIndex; dispatch input + change
+            Page->>Page: set selectedIndex and dispatch input + change
             Page-->>Worker: selected text and index
             Worker-->>Agent: selection confirmation
         end
