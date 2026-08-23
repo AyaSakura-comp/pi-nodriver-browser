@@ -46,9 +46,7 @@ flowchart TB
     end
 
     subgraph StealthLayer["4. Stealth & Anti-Bot Subsystem"]
-        ENGINE --> EXT_LOADER["Multi-Extension Loader\ninstall-time CDP pipe + persistent profile"]
-        EXT_LOADER --> STEALTH_EXT["stealth-extension"]
-        EXT_LOADER --> BUSTER_EXT["Buster v3.4.0\nuser-initiated reCAPTCHA audio helper"]
+        ENGINE --> STEALTH_EXT["stealth-extension (Chrome Manifest V3)"]
         STEALTH_EXT --> S_STEALTH["stealth.js\n- WebGL NVIDIA RTX 4070 Spoof\n- navigator.webdriver Removal\n- window.chrome Runtime Mock\n- Plugins & Permissions Injections"]
         STEALTH_EXT --> S_SOLVER["turnstile_solver.js\n- Shadow DOM Inspection\n- Cloudflare Turnstile Auto-Click\n- Human-like Bezier Pointer Events"]
     end
@@ -71,7 +69,7 @@ flowchart TB
 * **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
 
 #### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
-Integrated directly into Chrome via `--load-extension` to reduce common automation fingerprints and detect challenge widgets. The built-in subsystem does not solve visual hCaptcha challenges or use third-party CAPTCHA bypass services; unresolved challenges require human completion before the agent resumes.
+Integrated directly into Chrome via `--load-extension` to reduce common automation fingerprints and detect challenge widgets. It does not solve visual hCaptcha challenges or use third-party CAPTCHA bypass services; unresolved challenges require human completion before the agent resumes.
 * **`stealth.js`**:
   * **WebGL Hardware Spoofing**: Overrides WebGL `UNMASKED_VENDOR_WEBGL` and `UNMASKED_RENDERER_WEBGL` from software/Mesa drivers to `Google Inc. (NVIDIA)` / `NVIDIA GeForce RTX 4070 Direct3D11`.
   * **Bot Flag Erasure**: Completely removes `navigator.webdriver` and normalizes `navigator.plugins`, `navigator.languages` (`zh-TW`, `en-US`), and `Notification.permission`.
@@ -80,22 +78,17 @@ Integrated directly into Chrome via `--load-extension` to reduce common automati
   * **Shadow DOM Scanner**: Traverses available Shadow DOM and iframe contexts to detect Cloudflare Turnstile, hCaptcha, and challenge checkboxes.
   * **Checkbox Interaction**: Can dispatch pointer events to an ordinary accessible checkbox, but pauses for human handoff when a visual challenge appears.
 
-#### 3. Bundled Chrome Extensions
-The worker discovers valid unpacked extensions under `chrome-extensions/*`. During deployment, `install_chrome_extensions.py` starts a short-lived Chrome over `--remote-debugging-pipe`, installs each path with CDP `Extensions.loadUnpacked`, verifies that Chrome reports it enabled, and stores the registration in the persistent managed profile. Normal Nodriver sessions then start with `--enable-unsafe-extension-debugging` and the profile loads those registered extensions. This is required on official Chrome 137+, where Google removed command-line `--load-extension` support and the Extensions CDP domain is unavailable over Nodriver's debugging port. With explicit `INSTALL_BUSTER=1` opt-in, the installer deploys the pinned official **Buster v3.4.0** Chrome release alongside `stealth-extension`, verifies its SHA-256 checksum and manifest, rejects unsafe archive paths, and rolls back a previous Buster deployment if registration fails.
-
-Buster only adds a **user-initiated** helper button inside Google reCAPTCHA audio challenges. It is not invoked automatically by Pi, does not support hCaptcha, Turnstile, or proprietary bot-block pages, and may use local or configured remote speech-recognition backends when a human activates it. Its broad privileges include `<all_urls>`, `webRequest`, `nativeMessaging`, and unrestricted extension-page network access. See `third_party/buster/README.md` for the corresponding source archive, provenance, and GPL-3.0 licensing.
-
-#### 4. Auto-Dismiss Overlay Engine & Taiwan E-Commerce Hooks
+#### 3. Auto-Dismiss Overlay Engine & Taiwan E-Commerce Hooks
 * **Silent Background Execution**: Executes automatically inside `wait_for_page_ready` on every `open` navigation before generating the initial DOM snapshot.
 * **Native App Banner Dismissal**: Direct programmatic hooks (e.g. `window.backBtnWeb()`) and automatic destruction of backdrop overlays (`#blackBkforApp`, `#blackBk`, `.modal-backdrop`).
 * **Taiwanese Banner & Cookie Dictionary**: Matches localized dismiss phrases including 「繼續使用網頁版」、「留在網頁版」、「前往網頁版」、「繼續瀏覽」、「不用謝謝」、「我知道了」、「關閉」.
 * **Small-Model Coordinate Immunity**: Eliminates the need for 7B/14B/35B models to visually estimate pixel coordinates (`click 380 30`) on blocking interstitials.
 
-#### 5. Navigation Guard & URL Typo Normalization
+#### 4. Navigation Guard & URL Typo Normalization
 * **Domain Normalization**: Automatically repairs common domain typos during agent tool calls (e.g., `momoshop.tw` ➔ `momoshop.com.tw`, `pchome.tw` ➔ `pchome.com.tw`).
 * **3.0s Circuit Breaker**: Wraps background tabs in `asyncio.wait_for(fetch(), timeout=3.0)` to instantly abort hung connections or WAF blockages.
 
-#### 6. Command Lifecycle, Concurrency, and Tab Admission
+#### 5. Command Lifecycle, Concurrency, and Tab Admission
 Every command follows the same ownership and capacity workflow:
 
 ```mermaid
@@ -467,19 +460,11 @@ cd pi-nodriver-browser
 ./install.sh
 ```
 
-Buster is deliberately opt-in because of its broad browser permissions. To deploy it as well:
-
-```bash
-INSTALL_BUSTER=1 ./install.sh
-```
-
 The installer will:
 1. Validate system dependencies (`python3`, `xvfb-run`, `google-chrome`).
 2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `mss`, `websockets`).
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
-4. When `INSTALL_BUSTER=1`, transactionally deploy the pinned official Buster release after warning about its permissions.
-5. Register deployed unpacked extensions in the persistent Chrome profile through pipe-only CDP `Extensions.loadUnpacked`.
-6. Automatically disable conflicting legacy browser packages.
+4. Automatically disable conflicting legacy browser packages.
 
 Then reload Pi or launch a new session:
 ```text
@@ -511,7 +496,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **134 tests**: 84 fast tests run by default and 50 real-browser tests are skipped unless explicitly enabled.
+The current suite contains **124 tests**: 74 fast tests run by default and 50 real-browser tests are skipped unless explicitly enabled.
 
 ### Real Headful Chrome / Xvfb Suite
 
@@ -562,6 +547,4 @@ Review the diff for credentials and unsafe process/shell changes, then run an in
 
 ## 📄 License
 
-Project-authored code is MIT licensed. The vendored Buster release remains licensed under GPL-3.0; see `third_party/buster/LICENSE` and its upstream provenance README.
-
-Developed with ❤️ for advanced agentic pair-programming workflows.
+MIT License. Developed with ❤️ for advanced agentic pair-programming workflows.

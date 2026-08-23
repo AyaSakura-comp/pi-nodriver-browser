@@ -56,38 +56,6 @@ class CloseIgnoringPage(FakePage):
         return None
 
 
-class BundledChromeExtensionTests(unittest.TestCase):
-    def test_discovers_stealth_and_sorted_additional_extensions(self):
-        from worker import bundled_extension_paths
-
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / 'stealth-extension').mkdir()
-            (root / 'stealth-extension/manifest.json').write_text('{}')
-            (root / 'chrome-extensions/buster').mkdir(parents=True)
-            (root / 'chrome-extensions/buster/manifest.json').write_text('{}')
-            (root / 'chrome-extensions/not-an-extension').mkdir()
-
-            self.assertEqual(
-                bundled_extension_paths(root),
-                [
-                    root / 'stealth-extension',
-                    root / 'chrome-extensions/buster',
-                ],
-            )
-
-    def test_enables_cdp_extension_debugging_when_extensions_exist(self):
-        from worker import bundled_extension_browser_args
-
-        paths = [Path('/extensions/stealth'), Path('/extensions/buster')]
-
-        self.assertEqual(
-            bundled_extension_browser_args(paths),
-            ['--enable-unsafe-extension-debugging'],
-        )
-        self.assertEqual(bundled_extension_browser_args([]), [])
-
-
 class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_opening_thirty_tabs_evicts_old_inactive_tabs_but_keeps_recently_touched_tabs(self):
         from worker import BrowserWorker

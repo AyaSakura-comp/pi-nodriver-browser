@@ -30,21 +30,6 @@ SUPPORTED_ACTIONS = {
 logging.basicConfig(level=logging.CRITICAL)
 
 
-def bundled_extension_paths(root=None):
-    root = Path(root or Path(__file__).resolve().parent)
-    candidates = [root / 'stealth-extension']
-    extension_root = root / 'chrome-extensions'
-    if extension_root.is_dir():
-        candidates.extend(sorted(path for path in extension_root.iterdir() if path.is_dir()))
-    return [path for path in candidates if (path / 'manifest.json').is_file()]
-
-
-def bundled_extension_browser_args(paths):
-    if not paths:
-        return []
-    return ['--enable-unsafe-extension-debugging']
-
-
 class StaleRefError(ValueError):
     def __init__(self, ref):
         self.ref = ref
@@ -1006,9 +991,10 @@ class BrowserWorker:
             profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
             try:
-                extension_paths = bundled_extension_paths()
+                ext_path = Path(__file__).resolve().parent / 'stealth-extension'
                 b_args = ['--window-size=1600,1000', '--no-first-run', '--no-default-browser-check']
-                b_args.extend(bundled_extension_browser_args(extension_paths))
+                if ext_path.is_dir():
+                    b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
                 self.browser = await uc.start(
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
