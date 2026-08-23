@@ -1116,6 +1116,8 @@ class BrowserWorker:
                 target_url = target_url.replace('momoshop.tw', 'momoshop.com.tw')
             if 'pchome.tw' in target_url and 'pchome.com.tw' not in target_url:
                 target_url = target_url.replace('pchome.tw', 'pchome.com.tw')
+            if 'momoshop.com.tw/mymomo/login.momo' in target_url:
+                target_url = 'https://account.momoshop.com.tw/mobile'
 
             browser = await self.ensure_browser()
             previous = self.pages.get(session_id)
