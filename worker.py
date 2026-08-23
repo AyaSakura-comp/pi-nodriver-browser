@@ -38,6 +38,16 @@ REPEAT_LIMIT = 3
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   document.querySelectorAll('[data-pi-dismiss-ref]').forEach(el => el.removeAttribute('data-pi-dismiss-ref'));
 
+  // 1. Direct function hooks for known app overlays (e.g. MOMO backBtnWeb)
+  try {
+    if (typeof window.backBtnWeb === 'function') {
+      window.backBtnWeb();
+    }
+  } catch (_) {}
+
+  // 2. Clear known blocking modal backdrops
+  document.querySelectorAll('#blackBkforApp, #blackBk, .blackBkforApp, .blackBk').forEach(el => el.remove());
+
   const visible = el => {
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
@@ -45,24 +55,25 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
       Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
   };
   const normalize = value => (value || '').toLowerCase()
-    .replace(/[\\s,，.!！。:：;；_\\-]+/g, '');
+    .replace(/[\s,，.!！。:：;；_\-]+/g, '');
   const label = el => (el.innerText || el.textContent || el.value ||
     el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
   const matches = (value, patterns) => {
     const normalized = normalize(value);
     return patterns.some(pattern => {
       const expected = normalize(pattern);
-      const mayContain = expected.length >= 3 || /[^\\x00-\\x7f]/.test(expected);
+      const mayContain = expected.length >= 3 || /[^\x00-\x7f]/.test(expected);
       return normalized === expected || (mayContain && normalized.includes(expected));
     });
   };
   const controls = container => Array.from(container.querySelectorAll(
-    'button,a,input[type="button"],input[type="submit"],[role="button"],[aria-label],[class*="close" i]'
+    'button,a,input[type="button"],input[type="submit"],[role="button"],[aria-label],[class*="close" i],[class*="backbtn" i],[class*="btn" i]'
   )).filter(visible);
 
   const containers = Array.from(new Set(Array.from(document.querySelectorAll(
     'dialog,[role="dialog"],[aria-modal="true"],[class*="modal" i],[id*="modal" i],' +
     '[class*="popup" i],[id*="popup" i],[class*="overlay" i],[id*="overlay" i],' +
+    '[class*="floatbtn" i],[id*="floatbtn" i],[class*="blackbk" i],[id*="blackbk" i],' +
     '[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]'
   )).filter(visible)));
 
@@ -71,8 +82,11 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   const otherContainers = containers.filter(container => !cookieContainers.includes(container));
   const acceptCookie = ['同意', '接受全部', '全部接受', '我同意', 'acceptall', 'allowall', 'agree', 'gotit', 'ok'];
   const rejectCookie = ['拒絕非必要', '僅必要', '只接受必要', '只允許必要', 'rejectall', 'declineall', 'necessaryonly', 'essentialonly'];
-  const declineMarketing = ['不用謝謝', '不用，謝謝', '不需要謝謝', '稍後', '暫時不要', 'nothanks', 'notnow', 'maybelater', 'skip'];
-  const closeWords = ['關閉', 'close', 'dismiss', '×', '✕', 'x'];
+  const declineMarketing = [
+    '繼續使用網頁版', '留在網頁版', '前往網頁版', '繼續瀏覽', '不用謝謝', '不用，謝謝',
+    '不需要謝謝', '暫時不要', '稍後', '稍後再說', '我知道了', '先不要', 'nothanks', 'notnow', 'maybelater', 'skip'
+  ];
+  const closeWords = ['關閉', 'close', 'dismiss', '×', '✕', 'x', 'cancel', '取消'];
 
   let candidate = null;
   if (policy !== 'ignore') {
@@ -1129,6 +1143,11 @@ class BrowserWorker:
                     except Exception:
                         pass
             await self.wait_for_page_ready(page)
+            try:
+                await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
+                await page.sleep(0.3)
+            except Exception:
+                pass
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
