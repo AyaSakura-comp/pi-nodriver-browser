@@ -83,6 +83,35 @@ Integrated directly into Chrome via `--load-extension`, eliminating headless bot
 * **Domain Normalization**: Automatically repairs common domain typos during agent tool calls (e.g., `momoshop.tw` ➔ `momoshop.com.tw`, `pchome.tw` ➔ `pchome.com.tw`).
 * **3.0s Circuit Breaker**: Wraps background tabs in `asyncio.wait_for(fetch(), timeout=3.0)` to instantly abort hung connections or WAF blockages.
 
+#### 5. Command Lifecycle, Concurrency, and Tab Admission
+Every command follows the same ownership and capacity workflow:
+
+```mermaid
+flowchart LR
+    REQUEST["Pi tool request\ncommand + sessionId"] --> VALIDATE["Parse and validate\nsupported action"]
+    VALIDATE --> OPEN_GUARD{"open action?"}
+    OPEN_GUARD -->|Yes| STREAK["Check per-session\n2-open streak"]
+    OPEN_GUARD -->|No| EXECUTE
+    STREAK --> EXECUTE["Acquire per-session lock\nand mark exact active target"]
+    EXECUTE --> NEW_TAB{"Needs or discovered\na new target?"}
+    NEW_TAB -->|Yes| CAPACITY["Acquire tab-management lock\nreconcile live Chrome targets"]
+    CAPACITY --> LRU["Reserve worker-created tab or\nadmit Chrome-created popup\nwith inactive-LRU eviction"]
+    LRU --> COMMAND["Execute navigation / DOM / crawl"]
+    NEW_TAB -->|No| COMMAND
+    COMMAND --> CLEANUP{"Temporary or evicted\ntarget to close?"}
+    CLEANUP -->|Yes| CLOSE["Confirm Chrome target closure\nbefore deleting registry state"]
+    CLEANUP -->|No| RESPONSE
+    CLOSE --> RESPONSE["Touch activity timestamp\nrelease locks and return result"]
+```
+
+* **Layered Locking**: A per-session lock serializes commands from one conversation. The server's browser-structure lock covers its selected structural command set (`open`, click variants, `download`, `press`, `close`, and `shutdown`); `tab_management_lock` independently makes capacity checks, worker-created tabs, popup admission, eviction, and cleanup atomic—including crawl lifecycle operations.
+* **Exact-Target Activity Protection**: Only the tab currently used by a running command is protected. Idle tabs from the same session remain valid LRU candidates.
+* **Global Capacity Invariant**: Before creating a managed page or crawl tab, the daemon reconciles its registry with Chrome and reserves capacity. Popups are created by Chrome first, then registered and admitted under the same capacity lock; admission evicts an eligible inactive tab or closes the popup as rollback. The default maximum is 20 tabs (`PI_NODRIVER_MAX_TABS`).
+* **Transactional Eviction**: Registry, session, and download-routing metadata are removed only after Chrome confirms that the target closed. A thrown close exception propagates while preserving tracked state; if close returns but Chrome still reports the target as live, the daemon raises `TAB_LIMIT`. Both paths prevent silent capacity overflow.
+* **Popup Recovery**: Popup opener stacks are maintained per session. If a popup closes externally or is evicted, the newest live opener becomes the active session page.
+* **Download Isolation**: Target and frame ownership are tracked separately. Closing a tab removes only that target's frame routes; active downloads protect their owning session from eviction.
+* **Guard Commit Semantics**: Failed `open` attempts count toward the consecutive-open limit. A non-`open` action resets the streak only after that action validates and succeeds.
+
 ---
 
 ## ⚡ Accelerated Workflows (Workflow)
@@ -400,15 +429,73 @@ Then reload Pi or launch a new session:
 
 ## 🧪 Testing & Verification
 
-### Run Pure Unit Tests (76 test cases):
+The test strategy is layered so fast state-machine checks run on every change, while real Chrome tests remain available for lifecycle behavior that mocks cannot prove.
+
+### Test Layers
+
+| Layer | Main files | What it verifies | Default behavior |
+|---|---|---|---|
+| Pure logic | `tests/test_browser_logic.py`, `tests/test_popup_logic.py` | Parsing, snapshots, repeated-command guards, open streaks, LRU ordering, protected targets, download isolation | Always runs |
+| Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, popup opener recovery, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
+| Installer | `tests/test_install.py` | Extension deployment and conflicting-package cleanup | Always runs in a temporary directory |
+| Real browser | `tests/test_worker_integration.py`, `tests/test_daemon_integration.py` | Headful Chrome navigation, popups, downloads, multi-session isolation, cancellation, daemon persistence | Opt-in with `RUN_BROWSER_INTEGRATION=1` |
+| Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival | Run before deployment of lifecycle changes |
+
+### Fast Suite
+
+Use the extension's isolated Python environment so the Nodriver version matches production:
+
 ```bash
-/home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python -m unittest discover -s tests -v
+PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
+"$PYTHON" -m unittest discover -s tests -v
 ```
 
-### Run Real Headful Chrome / Xvfb Integration Tests:
+The current suite contains **100 tests**: 59 fast tests run by default and 41 real-browser tests are skipped unless explicitly enabled.
+
+### Real Headful Chrome / Xvfb Suite
+
+The integration fixtures launch workers under Xvfb themselves:
+
 ```bash
-RUN_BROWSER_INTEGRATION=1 xvfb-run -a python3 -m unittest discover -s tests -v
+PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
+RUN_BROWSER_INTEGRATION=1 \
+NODRIVER_PYTHON="$PYTHON" \
+"$PYTHON" -m unittest discover -s tests -v
 ```
+
+For a quicker lifecycle smoke test:
+
+```bash
+PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
+RUN_BROWSER_INTEGRATION=1 NODRIVER_PYTHON="$PYTHON" \
+"$PYTHON" -m unittest \
+  tests.test_worker_integration.WorkerIntegrationTests.test_opens_snapshots_clicks_and_reads_page \
+  tests.test_worker_integration.WorkerIntegrationTests.test_popup_close_automatically_returns_to_its_opener -v
+```
+
+### Tab-Limit Release Scenario
+
+Lifecycle changes should also pass this real-browser acceptance scenario:
+
+1. Open 20 tabs across separate sessions (or run a successful non-`open` command between opens) so the per-session open guard is not the limiting factor; touch two older tabs to refresh their activity timestamps.
+2. Open 10 additional tabs under the same guard-safe pattern.
+3. Assert that Chrome never exceeds 20 tabs.
+4. Assert that the two touched tabs survive and the oldest untouched inactive tabs are evicted.
+5. Repeat with an active command and an in-progress download; the active target and every registered tab in the download-owning session must remain protected.
+6. Simulate a failed close; the tab must remain registered and new-tab admission must fail instead of exceeding capacity.
+
+### Pre-Commit Gates
+
+Before committing or deploying:
+
+```bash
+PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
+"$PYTHON" -m py_compile browser_logic.py worker.py
+"$PYTHON" -m unittest discover -s tests -q
+git diff --check
+```
+
+Review the diff for credentials and unsafe process/shell changes, then run an independent logic review of command guards, tab ownership, popup rollback, and download isolation. Deploy only after the source and extension copies match and a restarted daemon successfully opens `about:blank`.
 
 ---
 
