@@ -295,30 +295,45 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
     }
   }
 
+  // Smart Selection:
+  // 1. If the main page Window is scrollable in the requested direction, ALWAYS prioritize the Window.
+  // 2. If the main Window is fixed (overflow: hidden or maxY <= 5), pick the largest active nested container (e.g. Chat box).
   let best = candidates[0];
   let bestScore = -1;
 
-  for (const c of candidates) {
-    let available = 0;
-    if (direction === 'down') available = c.remainingDown;
-    else if (direction === 'up') available = c.remainingUp;
-    else if (direction === 'bottom' || direction === 'to-bottom') available = c.totalScrollableY;
-    else if (direction === 'top' || direction === 'to-top') available = c.totalScrollableY;
-    else if (direction === 'right') available = c.remainingRight;
-    else if (direction === 'left') available = c.remainingLeft;
+  const windowCandidate = candidates.find(c => c.isWindow);
+  const windowHasRemaining = windowCandidate && (
+    (direction === 'down' && windowCandidate.remainingDown > 5) ||
+    (direction === 'up' && windowCandidate.remainingUp > 5) ||
+    ((direction === 'bottom' || direction === 'to-bottom') && windowCandidate.totalScrollableY > 5) ||
+    ((direction === 'top' || direction === 'to-top') && windowCandidate.totalScrollableY > 5)
+  );
 
-    let score = (c.isWindow ? 1.0 : 3.0) * Math.min(c.area, 1000000);
-    if (available > 0) {
-      score *= 10.0 * (available > 50 ? 2.0 : 1.0);
-    } else if (c.totalScrollableY > 0) {
-      score *= 2.0;
-    } else {
-      score = 0;
-    }
+  if (windowHasRemaining) {
+    best = windowCandidate;
+  } else {
+    for (const c of candidates) {
+      let available = 0;
+      if (direction === 'down') available = c.remainingDown;
+      else if (direction === 'up') available = c.remainingUp;
+      else if (direction === 'bottom' || direction === 'to-bottom') available = c.totalScrollableY;
+      else if (direction === 'top' || direction === 'to-top') available = c.totalScrollableY;
+      else if (direction === 'right') available = c.remainingRight;
+      else if (direction === 'left') available = c.remainingLeft;
 
-    if (score > bestScore) {
-      bestScore = score;
-      best = c;
+      let score = Math.min(c.area, 1000000);
+      if (available > 0) {
+        score *= 10.0 * (available > 50 ? 2.0 : 1.0);
+      } else if (c.totalScrollableY > 0) {
+        score *= 2.0;
+      } else {
+        score = 0;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
     }
   }
 
@@ -331,22 +346,22 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
   const maxX = isWindow ? Math.max(0, docEl.scrollWidth - window.innerWidth) : Math.max(0, target.scrollWidth - target.clientWidth);
 
   if (direction === 'down') {
-    if (isWindow) { window.scrollBy(0, amount); docEl.scrollTop += amount; }
+    if (isWindow) { window.scrollBy(0, amount); }
     else { target.scrollTop += amount; }
   } else if (direction === 'up') {
-    if (isWindow) { window.scrollBy(0, -amount); docEl.scrollTop -= amount; }
+    if (isWindow) { window.scrollBy(0, -amount); }
     else { target.scrollTop -= amount; }
   } else if (direction === 'bottom' || direction === 'to-bottom') {
-    if (isWindow) { window.scrollTo(0, docEl.scrollHeight); docEl.scrollTop = docEl.scrollHeight; }
+    if (isWindow) { window.scrollTo(0, docEl.scrollHeight); }
     else { target.scrollTop = target.scrollHeight; }
   } else if (direction === 'top' || direction === 'to-top') {
-    if (isWindow) { window.scrollTo(0, 0); docEl.scrollTop = 0; }
+    if (isWindow) { window.scrollTo(0, 0); }
     else { target.scrollTop = 0; }
   } else if (direction === 'right') {
-    if (isWindow) { window.scrollBy(amount, 0); docEl.scrollLeft += amount; }
+    if (isWindow) { window.scrollBy(amount, 0); }
     else { target.scrollLeft += amount; }
   } else if (direction === 'left') {
-    if (isWindow) { window.scrollBy(-amount, 0); docEl.scrollLeft -= amount; }
+    if (isWindow) { window.scrollBy(-amount, 0); }
     else { target.scrollLeft -= amount; }
   }
 
@@ -1004,6 +1019,8 @@ class BrowserWorker:
         parts = parse_command(command)
         action = parts[0].lower()
         self.track_repeat(session_id, action, parts)
+        if action in {'click', 'click-js', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
+            self.scroll_history[session_id] = []
         uses_ref = (
             (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action in {'fill', 'type', 'select', 'upload'} and len(parts) > 1)
@@ -1463,12 +1480,18 @@ class BrowserWorker:
 
         if action == 'scroll':
             page = await self.require_page(session_id)
-            history = self.scroll_history.get(session_id, [])
-            scroll_count = sum(1 for a in history if a.startswith('scroll-'))
-            if scroll_count >= 3:
-                raise ValueError("SCROLL_LOOP_GUARD: You have scrolled 3 times consecutively without clicking or interacting. Stop scrolling back and forth. Use 'screenshot --full' or 'snapshot -i --full' to view the complete page in one step, or answer the user with the information already retrieved.")
-
+            history = self.scroll_history.setdefault(session_id, [])
             direction = parts[1].lower() if len(parts) > 1 else 'down'
+            history.append(f'scroll-{direction}')
+            scroll_count = sum(1 for a in history if a.startswith('scroll-'))
+            has_ping_pong = ('scroll-down' in history and 'scroll-up' in history)
+            if scroll_count >= 3 or has_ping_pong:
+                self.scroll_history[session_id] = []
+                raise ValueError(
+                    "SCROLL_LOOP_GUARD: Repeated back-and-forth scrolling detected (scrolled 3+ times without interacting). "
+                    "Stop scrolling. Use 'get text' to extract all text on the page in 1 step, or 'screenshot --full' to view the entire layout."
+                )
+
             amount = int(parts[2]) if len(parts) > 2 else 600
 
             valid_dirs = {'down', 'up', 'top', 'bottom', 'to-top', 'to-bottom', 'left', 'right'}
