@@ -11,6 +11,11 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 
 ---
 
+## 📚 Design Documents
+
+- [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
+- [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
+
 ## 🏛️ System & Software Architecture (SW Architecture)
 
 `pi-nodriver-browser` employs a decoupled **Client-Daemon Multi-Session Architecture** that isolates the lightweight TypeScript agent harness from the heavyweight Python/Chromium execution engine.
@@ -160,6 +165,9 @@ Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` →
 2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
 
 #### Semantic-First Iframe Interaction
+
+See [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) for the ref lifecycle, recursive resolver, dropdown transaction protocol, security boundaries, and sequence diagrams.
+
 `snapshot -i` recursively traverses accessible same-origin iframes and labels nested controls with `frame="…"`. `fill`, `type`, `select`, `fill-submit`, and `click-js` resolve those refs inside their owning frame instead of querying only the top document. The agent must use this priority order:
 
 1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `click`).
@@ -477,7 +485,7 @@ The test strategy is layered so fast state-machine checks run on every change, w
 | Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, popup opener recovery, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
 | Installer | `tests/test_install.py` | Extension deployment and conflicting-package cleanup | Always runs in a temporary directory |
 | Real browser | `tests/test_worker_integration.py`, `tests/test_daemon_integration.py` | Headful Chrome navigation, popups, downloads, multi-session isolation, cancellation, daemon persistence | Opt-in with `RUN_BROWSER_INTEGRATION=1` |
-| Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival | Run before deployment of lifecycle changes |
+| Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival, eight-part CoolPC selection, same-origin iframe report generation | Run before deployment of lifecycle or semantic-action changes |
 
 ### Fast Suite
 

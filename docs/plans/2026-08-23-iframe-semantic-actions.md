@@ -1,5 +1,7 @@
 # Iframe Semantic Actions Implementation Plan
 
+> **Status:** Completed in commit [`099de1b`](https://github.com/AyaSakura-comp/pi-nodriver-browser/commit/099de1bce801c3810c19eeb22ace55835e54b2b8). See the final [technical design, workflow, and architecture](../semantic-actions-technical-design.md) for the implemented protocol and release evidence.
+
 > **For Hermes:** Implement this plan task-by-task with strict test-first verification.
 
 **Goal:** Make Pi prefer semantic iframe interactions over raw viewport coordinates and prove Qwen can configure a CoolPC estimate containing a Ryzen 7 9800X3D.
