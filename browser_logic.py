@@ -1,4 +1,3 @@
-import math
 import os
 import re
 import shlex
@@ -170,70 +169,6 @@ def parse_command(command: str) -> list[str]:
     if any(token in {'&&', '||', ';', '|'} for token in parts):
         raise ValueError('run exactly one browser command per tool call; command chaining is not supported')
     return parts
-
-
-def parse_long_press(parts: list[str]) -> dict:
-    if not parts or parts[0].lower() != 'long-press':
-        raise ValueError('usage: long-press <@ref|x y> [--ms=1000]')
-    duration_ms = 1000
-    duration_seen = False
-    targets = []
-    for token in parts[1:]:
-        if token.startswith('--ms='):
-            if duration_seen:
-                raise ValueError('long-press --ms may only be provided once')
-            duration_seen = True
-            try:
-                duration_ms = int(token.split('=', 1)[1])
-            except ValueError as error:
-                raise ValueError('long-press duration must be an integer number of milliseconds') from error
-        elif token.startswith('--'):
-            raise ValueError(f'unknown long-press option: {token}')
-        else:
-            targets.append(token)
-    if not 100 <= duration_ms <= 5000:
-        raise ValueError('long-press duration must be between 100 and 5000 milliseconds')
-    if len(targets) == 1 and targets[0].startswith('@'):
-        return {'kind': 'ref', 'ref': targets[0], 'durationMs': duration_ms}
-    if len(targets) == 2:
-        try:
-            x, y = (float(value) for value in targets)
-        except ValueError as error:
-            raise ValueError('usage: long-press <@ref|x y> [--ms=1000]') from error
-        if not math.isfinite(x) or not math.isfinite(y):
-            raise ValueError('long-press viewport coordinates must be finite')
-        if x < 0 or y < 0:
-            raise ValueError('long-press viewport coordinates must be non-negative')
-        return {'kind': 'coordinates', 'x': x, 'y': y, 'durationMs': duration_ms}
-    raise ValueError('usage: long-press <@ref|x y> [--ms=1000]')
-
-
-def challenge_context_reason(url: object = '', text: object = '') -> str | None:
-    normalized_url = str(url or '').casefold()
-    url_markers = (
-        '/captcha', 'captcha-', 'recaptcha', 'hcaptcha', '/px/', 'perimeterx',
-        'arkoselabs', 'funcaptcha', 'challenge-platform', '/challenge/',
-        'turnstile', 'datadome', 'geetest',
-    )
-    for marker in url_markers:
-        if marker in normalized_url:
-            return f'URL contains challenge marker "{marker}"'
-
-    normalized_text = unicodedata.normalize('NFKC', str(text or '')).casefold()
-    text_markers = (
-        'verify you are human', 'please verify you are a human',
-        'are you a human', 'are you human', 'prove you are human',
-        'just a moment', 'checking your browser', 'attention required',
-        'complete the security check', 'security verification',
-        'unusual traffic', 'cloudflare ray id',
-        '您是人還是機器人', '按住不放', 'press and hold',
-        'challenge widget selector', 'g-recaptcha', 'h-captcha', 'cf-turnstile',
-        'arkose', 'funcaptcha',
-    )
-    for marker in text_markers:
-        if marker in normalized_text:
-            return f'page contains challenge marker "{marker}"'
-    return None
 
 
 def normalize_option_text(value: object) -> str:

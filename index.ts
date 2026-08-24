@@ -29,7 +29,6 @@ Guidelines:
 - Preserve Form State: After selecting options, do not navigate, reload, or click recalculation/reset controls unless the user explicitly requires it; dynamic quote/configurator pages may clear selections. Verify with snapshot or screenshot instead.
 - Exact Ref Before Text: When snapshot shows the desired control, click its @ref. Use click-text only when no suitable ref exists; broad ancestor text containers are intentionally rejected.
 - Coordinate Last Resort: Use 'click <x> <y>' only after snapshot -i and semantic targeting fail, or for canvas/cross-origin visual-only controls.
-- Long Press: Use 'long-press @ref --ms=1000' for ordinary press-and-hold UI; coordinates are a last resort. Long press is blocked on CAPTCHA and anti-bot challenge contexts and must never be used to bypass them.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
 - Open Loop Guard: At most 2 consecutive open actions are allowed per session. The 3rd and later opens are blocked until a non-open browser action runs.
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
@@ -42,7 +41,6 @@ Commands:
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
   click <x> <y> - Last-resort viewport coordinates, only after semantic targeting fails (canvas, inaccessible cross-origin iframe, visual-only control)
-  long-press <@ref|x y> [--ms=1000] - Hold touch input for 100–5000ms on ordinary UI; blocked on CAPTCHA/challenge pages
   click-text <text> - Click the best visible element matching text or accessible label
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js <@ref> - Dispatch a deferred DOM click when a site's native mouse handler poisons CDP

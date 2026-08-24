@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, challenge_context_reason, is_confident_option_match, parse_command, parse_dismiss_options, parse_long_press, format_snapshot, parse_devtools_active_port, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, is_confident_option_match, parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -56,49 +56,6 @@ class ParseCommandTests(unittest.TestCase):
     def test_rejects_shell_style_command_chaining(self):
         with self.assertRaisesRegex(ValueError, 'one browser command'):
             parse_command('wait 2000 && screenshot')
-
-
-class LongPressCommandTests(unittest.TestCase):
-    def test_parses_ref_and_coordinate_targets_with_bounded_duration(self):
-        self.assertEqual(
-            parse_long_press(['long-press', '@e7', '--ms=1250']),
-            {'kind': 'ref', 'ref': '@e7', 'durationMs': 1250},
-        )
-        self.assertEqual(
-            parse_long_press(['long-press', '120.5', '300', '--ms=900']),
-            {'kind': 'coordinates', 'x': 120.5, 'y': 300.0, 'durationMs': 900},
-        )
-
-    def test_defaults_to_one_second_and_rejects_unsafe_durations(self):
-        self.assertEqual(
-            parse_long_press(['long-press', '@e2']),
-            {'kind': 'ref', 'ref': '@e2', 'durationMs': 1000},
-        )
-        for duration in (99, 5001):
-            with self.assertRaisesRegex(ValueError, 'between 100 and 5000'):
-                parse_long_press(['long-press', '@e2', f'--ms={duration}'])
-        for coordinate in ('nan', 'inf'):
-            with self.assertRaisesRegex(ValueError, 'finite'):
-                parse_long_press(['long-press', coordinate, '20'])
-        with self.assertRaisesRegex(ValueError, 'only be provided once'):
-            parse_long_press(['long-press', '@e2', '--ms=500', '--ms=600'])
-
-    def test_detects_url_and_text_challenge_contexts(self):
-        self.assertIsNotNone(
-            challenge_context_reason(
-                'https://www.skyscanner.com.tw/sttc/px/captcha-v2/index.html',
-            )
-        )
-        self.assertIsNotNone(
-            challenge_context_reason('https://example.test/form', 'Verify you are human — press and hold')
-        )
-        for text in (
-            'Just a moment… Checking your browser',
-            'Attention Required — Please verify you are a human',
-            'Complete the security check to continue',
-        ):
-            self.assertIsNotNone(challenge_context_reason('https://example.test/form', text))
-        self.assertIsNone(challenge_context_reason('https://example.test/product', 'Hold to preview'))
 
 
 class BrowserExecutableTests(unittest.TestCase):

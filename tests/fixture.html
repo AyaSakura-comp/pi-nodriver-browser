@@ -14,23 +14,6 @@
 </script>
 <div id="input-events">no-input-events</div>
 <button id="go" onclick="document.querySelector('#status').textContent='clicked'">Go now</button>
-<button id="hold-target">Hold for action</button>
-<script>
-  const holdTarget = document.querySelector('#hold-target');
-  holdTarget.addEventListener('touchstart', () => window.holdStartedAt = performance.now());
-  holdTarget.addEventListener('touchend', () => {
-    const heldFor = performance.now() - (window.holdStartedAt || performance.now());
-    document.querySelector('#status').textContent = heldFor >= 450 ? 'long-pressed' : 'hold-too-short';
-  });
-</script>
-<button id="replace-hold" onclick="
-  const oldTarget = document.querySelector('#hold-target');
-  const replacement = document.createElement('button');
-  replacement.id = 'replacement-hold-target';
-  replacement.textContent = 'Replacement hold target';
-  replacement.setAttribute('data-pi-ref', oldTarget.getAttribute('data-pi-ref'));
-  oldTarget.replaceWith(replacement);
-">Replace hold target</button>
 <a id="new-tab" href="fixture_new_tab.html" target="_blank">Open report</a>
 <a id="oauth-popup" href="fixture_new_tab.html" target="oauth-login">Open OAuth login</a>
 <a id="download-sample" href="download_sample.txt" download="sample-report.txt">Download sample report</a>
