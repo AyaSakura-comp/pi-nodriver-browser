@@ -42,6 +42,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('cancelId', extension_source)
             self.assertIn('-screen 0 1600x1000x24', extension_source)
             self.assertIn('if (response.screenshotPath)', extension_source)
+            self.assertIn('vision-mark <x> <y>', extension_source)
+            self.assertIn('vision-click <preview-token>', extension_source)
+            self.assertIn('Raw coordinate clicks are blocked', extension_source)
+            self.assertIn('inspect the attached marked screenshot', extension_source)
             worker_source = (extension / 'worker.py').read_text()
             self.assertIn('--window-size=1600,1000', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]

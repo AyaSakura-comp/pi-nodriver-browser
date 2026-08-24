@@ -173,9 +173,9 @@ See [Semantic Browser Actions: Technical Design, Workflow, and Architecture](doc
 1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `click`).
 2. Semantic fallback with `click-text` or `click-css`.
 3. Direct DOM fallback with `click-js @ref`.
-4. Raw `click <x> <y>` only for canvas, inaccessible cross-origin frames, or after semantic targeting fails.
+4. For canvas or inaccessible visual-only controls, use the mandatory vision-correct sequence: `screenshot` → inspect image → `vision-mark <x> <y>` → inspect the marked image → re-mark until correct → `vision-click <preview-token>`.
 
-A full-page overview (`snapshot -i --full`) intentionally creates no refs and must never be used as the basis for guessed coordinate clicks; inspect it, move to the relevant viewport, then run `snapshot -i`.
+Raw `click <x> <y>` is blocked. `vision-mark` interprets `x y` directly in the returned screenshot's pixel coordinate system, draws the crosshair onto a copied PNG outside the untrusted page, and converts that point to dispatch coordinates using trusted CDP visual-viewport metrics. It returns a one-time token tied to the session, active tab, loader/document, URL, scroll/visual viewport, rendered-image hash, and a short TTL. Immediately before mouse dispatch, `vision-click` brings the tab forward, captures the viewport again, and requires the trusted state and clean screenshot hash to match. A newer marker or any mismatch permanently invalidates the older token. A full-page overview (`snapshot -i --full` or `screenshot --full`) intentionally cannot arm coordinate confirmation because scaled document coordinates are not current-viewport interaction coordinates.
 
 ### 2. Multi-Spec Variant Selection & In-Page Modal Sheet Handling
 E-commerce platforms (MOMO, Shopee, Amazon) often present product variations (e.g. 度數 200度~800度, 顏色, 尺寸) in dynamic bottom sheets or in-page spec drawers:
@@ -429,8 +429,9 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** with 3.0s circuit breaker and anti-bot challenge detection | 1920x1080 Full-Desktop CDP Override |
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` for elements in current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
-| **`click`** | `click <@ref>` | Clicks snapshot element (auto-returns updated DOM snapshot) | Interactive Tab |
-| **`click` (coords)** | `click <x> <y>` | Last-resort viewport coordinates after semantic refs/text/CSS fail; intended for canvas or inaccessible visual-only controls | Interactive Tab |
+| **`click`** | `click <@ref>` | Clicks snapshot element; raw coordinate form is blocked | Interactive Tab |
+| **`vision-mark`** | `vision-mark <x> <y>` | Uses screenshot-pixel coordinates; after a fresh normal screenshot, returns a marked current-viewport PNG and one-time preview token without clicking | Interactive Tab |
+| **`vision-click`** | `vision-click <preview-token>` | Consumes the latest visually confirmed marker token and clicks its stored viewport point | Interactive Tab |
 | **`fill`** | `fill <@ref> <text>` | Clears input field and types text | Interactive Tab |
 | **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
 | **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |
@@ -438,7 +439,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
 | **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
 | **`get`** | `get text|url|title [@ref]` | Extracts innerText, current URL, or title | Interactive Tab |
-| **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot | Interactive Tab |
+| **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot; only a normal current-viewport screenshot arms `vision-mark` | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
 | **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome | Global Daemon Scope |
@@ -462,7 +463,7 @@ cd pi-nodriver-browser
 
 The installer will:
 1. Validate system dependencies (`python3`, `xvfb-run`, `google-chrome`).
-2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `mss`, `websockets`).
+2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `Pillow==12.3.0`).
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
 4. Automatically disable conflicting legacy browser packages.
 
@@ -496,7 +497,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **124 tests**: 74 fast tests run by default and 50 real-browser tests are skipped unless explicitly enabled.
+The current suite contains **143 tests**: 92 fast tests run by default and 51 real-browser tests are skipped unless explicitly enabled.
 
 ### Real Headful Chrome / Xvfb Suite
 

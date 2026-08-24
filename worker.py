@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import signal
 import sys
 import tempfile
@@ -16,8 +17,9 @@ import urllib.request
 from pathlib import Path
 
 import nodriver as uc
+from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, format_snapshot, is_confident_option_match, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionPageState, format_snapshot, is_confident_option_match, map_screenshot_point_to_viewport, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -25,7 +27,7 @@ SUPPORTED_ACTIONS = {
     'download', 'download-info', 'download-latest', 'downloads', 'fill',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'mobile', 'open', 'press', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
-    'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
+    'vision-click', 'vision-mark', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
 
@@ -38,8 +40,13 @@ class StaleRefError(ValueError):
 
 # Commands that observe the page without changing it. Repeating one of these
 # verbatim cannot produce new information, so an identical repeat is a loop.
-NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'get', 'downloads', 'download-info', 'find-option'}
+NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'vision-mark', 'get', 'downloads', 'download-info', 'find-option'}
 REPEAT_LIMIT = 3
+VISION_INVALIDATING_ACTIONS = {
+    'click-css', 'click-js', 'click-text', 'close', 'dismiss', 'download', 'fill',
+    'fill-submit', 'fill_submit', 'open', 'press', 'scroll', 'select', 'shutdown',
+    'switch', 'type', 'upload', 'wait-popup', 'wait-popup-close',
+}
 
 
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
@@ -736,6 +743,9 @@ class BrowserWorker:
         self.snapshot_required_sessions = set()
         self.repeated_commands = {}
         self.open_action_guard = OpenActionGuard(limit=2)
+        self.vision_guard = VisionCorrectnessGuard(
+            ttl_seconds=float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
+        )
         self.max_tabs = int(os.environ.get('PI_NODRIVER_MAX_TABS', '20'))
         self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
         self.tab_management_lock = asyncio.Lock()
@@ -862,6 +872,7 @@ class BrowserWorker:
         self.active_target_counts.pop(target_id, None)
         for owner in affected_sessions:
             self.snapshot_required_sessions.discard(owner)
+            self.vision_guard.invalidate(owner)
 
     async def evict_tab(self, record):
         await record.page.close()
@@ -1386,6 +1397,86 @@ class BrowserWorker:
             'screenshotPath': str(output),
         }
 
+    async def vision_page_state(self, page):
+        frame_tree = await page.send(uc.cdp.page.get_frame_tree())
+        frame = frame_tree.frame
+        metrics = await page.send(uc.cdp.page.get_layout_metrics())
+        css_layout = metrics[3]
+        css_visual = metrics[4]
+        rounded = lambda value: round(float(value), 4)
+        return VisionPageState(
+            target_id=self.tab_registry.target_id(page),
+            url=str(frame.url or page.url or ''),
+            width=int(css_layout.client_width),
+            height=int(css_layout.client_height),
+            loader_id=str(frame.loader_id),
+            scroll_x=rounded(css_visual.page_x),
+            scroll_y=rounded(css_visual.page_y),
+            visual_offset_x=rounded(css_visual.offset_x),
+            visual_offset_y=rounded(css_visual.offset_y),
+            visual_width=rounded(css_visual.client_width),
+            visual_height=rounded(css_visual.client_height),
+            visual_scale=rounded(css_visual.scale),
+        )
+
+    async def save_viewport_screenshot(self, page, prefix):
+        output_dir = Path(tempfile.mkdtemp(prefix=prefix))
+        output = output_dir / 'screenshot.png'
+        screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+        try:
+            await asyncio.wait_for(
+                page.save_screenshot(output, format='png', full_page=False),
+                timeout=screenshot_timeout,
+            )
+        except TimeoutError as error:
+            raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
+        return output
+
+    @staticmethod
+    def screenshot_hash(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    @staticmethod
+    def annotate_vision_screenshot(clean_path, x, y):
+        clean_path = Path(clean_path)
+        output = clean_path.with_name('marked-screenshot.png')
+        with Image.open(clean_path) as source:
+            image = source.convert('RGB')
+        center_x = round(x)
+        center_y = round(y)
+        scale = max(1.0, min(image.width / 390, image.height / 844))
+        radius = round(26 * scale)
+        outer_width = max(7, round(7 * scale))
+        inner_width = max(4, round(4 * scale))
+        line_radius = round(38 * scale)
+        draw = ImageDraw.Draw(image)
+        bounds = (
+            center_x - radius,
+            center_y - radius,
+            center_x + radius,
+            center_y + radius,
+        )
+        draw.ellipse(bounds, outline='#ffffff', width=outer_width)
+        draw.ellipse(bounds, outline='#ff1744', width=inner_width)
+        draw.line(
+            (center_x - line_radius, center_y, center_x + line_radius, center_y),
+            fill='#ffffff', width=outer_width,
+        )
+        draw.line(
+            (center_x, center_y - line_radius, center_x, center_y + line_radius),
+            fill='#ffffff', width=outer_width,
+        )
+        draw.line(
+            (center_x - line_radius, center_y, center_x + line_radius, center_y),
+            fill='#ff1744', width=inner_width,
+        )
+        draw.line(
+            (center_x, center_y - line_radius, center_x, center_y + line_radius),
+            fill='#ff1744', width=inner_width,
+        )
+        image.save(output, format='PNG')
+        return output
+
     async def element(self, session_id, ref):
         page = await self.require_page(session_id)
         normalized = ref.removeprefix('@')
@@ -1549,7 +1640,7 @@ class BrowserWorker:
                 return False
             raise TimeoutError('native mouse click did not complete')
 
-    async def native_click(self, page, x, y):
+    async def native_click(self, page, x, y, before_dispatch=None):
         minimum_settle_seconds = 0.1
         maximum_settle_seconds = 0.5
         new_tab_timeout_seconds = 2.0
@@ -1584,6 +1675,8 @@ class BrowserWorker:
         except Exception:
             expect_new_tab = False
 
+        if before_dispatch is not None:
+            await before_dispatch()
         click_completed = await self.mouse_click_allowing_target_close(page, x, y)
         if not click_completed:
             return page
@@ -1701,7 +1794,7 @@ class BrowserWorker:
                 history.append(f'scroll-{direction}')
             elif action == 'screenshot':
                 history.append('screenshot')
-            elif action in ('click', 'click-text', 'click-css', 'fill', 'open', 'type', 'select', 'press'):
+            elif action in ('click', 'click-text', 'click-css', 'vision-click', 'fill', 'open', 'type', 'select', 'press'):
                 self.scroll_history[session_id] = []
                 history = []
 
@@ -1751,7 +1844,9 @@ class BrowserWorker:
         parts = parse_command(command)
         action = parts[0].lower()
         self.track_repeat(session_id, action, parts)
-        if action in {'click', 'click-js', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
+        if action in VISION_INVALIDATING_ACTIONS:
+            self.vision_guard.invalidate(session_id)
+        if action in {'click', 'click-js', 'vision-click', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
             self.scroll_history[session_id] = []
         uses_ref = (
             (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
@@ -1917,6 +2012,7 @@ class BrowserWorker:
             is_full = '--full' in args_str or '-full' in args_str
 
             if is_full:
+                self.vision_guard.invalidate(session_id)
                 output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-full-'))
                 output = output_dir / 'overview.jpg'
                 screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -1929,7 +2025,8 @@ class BrowserWorker:
                         'Visual overview only; no DOM refs were generated. Inspect the image first. '
                         'Do not click coordinates from this overview. Run snapshot -i in the relevant viewport, '
                         'then prefer @ref, click-text, click-css, fill, or select—including controls inside iframes. '
-                        'Use click <x> <y> only after semantic targeting fails or for a canvas/visual-only control. '
+                        'For a canvas or visual-only control, move to its real viewport and use screenshot, then '
+                        'vision-mark <x> <y>, inspect the marked image, and vision-click its preview token. '
                         'Use scroll down or scroll up to inspect additional sections before reporting an object missing.'
                     ),
                     'action': 'snapshot-full-vision',
@@ -2078,23 +2175,138 @@ class BrowserWorker:
             )
             return self.download_response(record, action, session_id)
 
+        if action == 'vision-mark':
+            x, y = parse_vision_mark(parts)
+            page = await self.require_page(session_id)
+            clean = None
+            output = None
+            try:
+                before_state = await self.vision_page_state(page)
+                clean = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-mark-')
+                page_state = await self.vision_page_state(page)
+                if before_state != page_state:
+                    raise ValueError(
+                        'VISION_SCREENSHOT_REQUIRED: page changed while the marked preview was captured; '
+                        'take and inspect a fresh screenshot'
+                    )
+                image_hash = self.screenshot_hash(clean)
+                with Image.open(clean) as screenshot_image:
+                    image_width, image_height = screenshot_image.size
+                click_x, click_y = map_screenshot_point_to_viewport(
+                    page_state, image_width, image_height, x, y
+                )
+                output = self.annotate_vision_screenshot(clean, x, y)
+                token = secrets.token_hex(12)
+                self.vision_guard.issue_marker(
+                    session_id,
+                    page_state,
+                    x,
+                    y,
+                    token,
+                    image_hash,
+                    image_width=image_width,
+                    image_height=image_height,
+                    click_x=click_x,
+                    click_y=click_y,
+                )
+            except Exception:
+                self.vision_guard.invalidate(session_id)
+                if output is not None:
+                    output.unlink(missing_ok=True)
+                raise
+            finally:
+                if clean is not None:
+                    clean.unlink(missing_ok=True)
+            self.touch_tab(page)
+            return {
+                'text': (
+                    f'VISION PREVIEW — NO CLICK PERFORMED\n'
+                    f'Marker {token} is centered at screenshot coordinates ({x:g}, {y:g}).\n'
+                    'Inspect the attached marked screenshot now. If the crosshair is wrong, run '
+                    '`vision-mark <x> <y>` again. Only if it is correct, run exactly:\n'
+                    f'vision-click {token}'
+                ),
+                'action': action,
+                'url': page.url,
+                'x': x,
+                'y': y,
+                'previewToken': token,
+                'screenshotPath': str(output),
+            }
+
+        if action == 'vision-click':
+            token = parse_vision_click(parts)
+            page = await self.require_page(session_id)
+            marker = self.vision_guard.current_marker(session_id, token)
+            previous = page
+            await self.configure_download_session(session_id, page)
+
+            async def verify_preview_immediately_before_click():
+                current = None
+                try:
+                    before_state = await self.vision_page_state(page)
+                    current = await self.save_viewport_screenshot(
+                        page, 'pi-nodriver-vision-verify-'
+                    )
+                    current_state = await self.vision_page_state(page)
+                    if before_state != current_state:
+                        raise ValueError(
+                            'VISION_CONFIRMATION_REQUIRED: page changed during final visual verification; '
+                            'take a fresh screenshot and mark again'
+                        )
+                    self.vision_guard.consume_marker(
+                        session_id,
+                        current_state,
+                        token,
+                        self.screenshot_hash(current),
+                    )
+                except Exception:
+                    self.vision_guard.invalidate(session_id)
+                    raise
+                finally:
+                    if current is not None:
+                        current.unlink(missing_ok=True)
+                self.vision_guard.invalidate(session_id)
+
+            page = await self.native_click(
+                page,
+                marker.click_x,
+                marker.click_y,
+                before_dispatch=verify_preview_immediately_before_click,
+            )
+            page = await self.track_clicked_page(session_id, previous, page)
+            self.pages[session_id] = page
+            return {
+                'text': (
+                    f'Vision-confirmed click from screenshot coordinates ({marker.x:g}, {marker.y:g})\n'
+                    f'URL: {page.url}'
+                ),
+                'action': action,
+                'url': page.url,
+                'x': marker.x,
+                'y': marker.y,
+                'clickX': marker.click_x,
+                'clickY': marker.click_y,
+            }
+
         if action == 'click':
             page = await self.require_page(session_id)
             if len(parts) == 3:
                 try:
-                    x, y = float(parts[1]), float(parts[2])
+                    float(parts[1]), float(parts[2])
                 except ValueError as error:
-                    raise ValueError('usage: click <@ref> or click <x> <y>') from error
-                previous = page
-                await self.configure_download_session(session_id, page)
-                page = await self.native_click(page, x, y)
-                page = await self.track_clicked_page(session_id, previous, page)
-                self.pages[session_id] = page
-                return {'text': f'Clicked viewport coordinates ({x:g}, {y:g})\nURL: {page.url}', 'action': action, 'url': page.url}
+                    raise ValueError('usage: click <@ref>') from error
+                raise ValueError(
+                    'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Run `screenshot`, inspect '
+                    'the image, run `vision-mark <x> <y>`, inspect the attached marked image, correct '
+                    'the marker until it is accurate, then run the exact `vision-click <preview-token>` '
+                    'command returned by vision-mark.'
+                )
             if len(parts) != 2 or not parts[1].startswith('@'):
-                raise ValueError('usage: click <@ref> or click <x> <y>')
+                raise ValueError('usage: click <@ref>')
             normalized = parts[1].removeprefix('@')
             target = await self.resolve_click_target(page, 'ref', normalized, session_id)
+            self.vision_guard.invalidate(session_id)
             previous = page
             await self.configure_download_session(session_id, page)
             page = await self.native_click(page, target['x'], target['y'])
@@ -2569,17 +2781,31 @@ class BrowserWorker:
             page = await self.require_page(session_id)
             args_str = ' '.join(parts[1:]).lower()
             full_page = '--full' in args_str or '-full' in args_str or '-i' in args_str and ('full' in args_str)
-            output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
-            output = output_dir / 'screenshot.png'
-            screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
-            try:
-                await asyncio.wait_for(
-                    page.save_screenshot(output, format='png', full_page=full_page),
-                    timeout=screenshot_timeout,
+            if full_page:
+                self.vision_guard.invalidate(session_id)
+                output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
+                output = output_dir / 'screenshot.png'
+                screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+                try:
+                    await asyncio.wait_for(
+                        page.save_screenshot(output, format='png', full_page=True),
+                        timeout=screenshot_timeout,
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
+                note = ' Full-page overviews cannot be used for coordinate confirmation.'
+            else:
+                output = await self.save_viewport_screenshot(page, 'pi-nodriver-shot-')
+                self.vision_guard.record_screenshot(
+                    session_id,
+                    await self.vision_page_state(page),
                 )
-            except TimeoutError as error:
-                raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
-            return {'text': f'Screenshot saved: {output}', 'action': action, 'screenshotPath': str(output)}
+                note = ' Current viewport is ready for vision-mark <x> <y>.'
+            return {
+                'text': f'Screenshot saved: {output}.{note}',
+                'action': action,
+                'screenshotPath': str(output),
+            }
 
         if action == 'crawl':
             remainder = command[len('crawl'):].strip()
@@ -2855,7 +3081,7 @@ async def server_main(socket_path):
                         response = await execute_request(worker, request)
                 else:
                     async with session_lock:
-                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'download', 'press', 'close'}:
+                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'vision-click', 'download', 'press', 'close'}:
                             async with browser_structure_lock:
                                 response = await execute_request(worker, request)
                         else:

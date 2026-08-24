@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Vision correctness canvas</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #07111f; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #__pi_vision_correctness_marker__ { display: none !important; opacity: 0 !important; }
+  #status {
+    position: fixed; left: 12px; bottom: 12px; margin: 0; padding: 8px 12px;
+    color: #dcecff; background: rgba(0, 0, 0, .72); border: 1px solid #47617d;
+    border-radius: 8px; font: 16px/1.2 sans-serif; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="surface"></canvas>
+<p id="status">vision-idle</p>
+<script>
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof HTMLElement && node.id === '__pi_vision_correctness_marker__') {
+          node.remove();
+        }
+      }
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  const canvas = document.querySelector('#surface');
+  const status = document.querySelector('#status');
+  const target = { x: 300, y: 330, radius: 48 };
+
+  function draw() {
+    canvas.width = innerWidth;
+    canvas.height = innerHeight;
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, innerHeight);
+    gradient.addColorStop(0, '#0b1f35');
+    gradient.addColorStop(1, '#07111f');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, innerWidth, innerHeight);
+
+    ctx.fillStyle = '#dcecff';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('Visual-only canvas', 22, 44);
+    ctx.font = '16px sans-serif';
+    ctx.fillStyle = '#8eacc9';
+    ctx.fillText('Click the green bullseye marked TARGET', 22, 72);
+
+    ctx.beginPath();
+    ctx.arc(target.x, target.y, target.radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#3ee88f';
+    ctx.fill();
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#ffffff';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(target.x, target.y, 17, 0, Math.PI * 2);
+    ctx.fillStyle = '#062d1d';
+    ctx.fill();
+    ctx.fillStyle = '#062d1d';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('TARGET', target.x, target.y + 76);
+    ctx.textAlign = 'start';
+  }
+
+  canvas.addEventListener('click', event => {
+    const distance = Math.hypot(event.clientX - target.x, event.clientY - target.y);
+    status.textContent = distance <= target.radius ? 'vision-clicked' : 'vision-missed';
+    draw();
+  });
+  addEventListener('resize', draw);
+  draw();
+</script>
+</body>
+</html>

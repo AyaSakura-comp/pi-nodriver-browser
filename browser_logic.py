@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import shlex
@@ -121,6 +122,167 @@ class OpenActionGuard:
         self._counts.pop(session_id, None)
 
 
+@dataclass(frozen=True)
+class VisionPageState:
+    target_id: str
+    url: str
+    width: int
+    height: int
+    loader_id: str = ''
+    scroll_x: float = 0
+    scroll_y: float = 0
+    visual_offset_x: float = 0
+    visual_offset_y: float = 0
+    visual_width: float = 0
+    visual_height: float = 0
+    visual_scale: float = 1
+
+
+def map_screenshot_point_to_viewport(
+    page: VisionPageState,
+    image_width: int,
+    image_height: int,
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    dimensions = (
+        float(image_width), float(image_height),
+        float(page.visual_width), float(page.visual_height),
+    )
+    if not all(math.isfinite(value) and value > 0 for value in dimensions):
+        raise ValueError('vision screenshot and visual viewport dimensions must be finite and positive')
+    if not all(math.isfinite(value) for value in (x, y)):
+        raise ValueError('vision screenshot coordinates must be finite')
+    return (
+        x * page.visual_width / image_width,
+        y * page.visual_height / image_height,
+    )
+
+
+@dataclass(frozen=True)
+class VisionMarker:
+    token: str
+    x: float
+    y: float
+    click_x: float
+    click_y: float
+    image_width: int
+    image_height: int
+    page: VisionPageState
+    image_hash: str
+    created_at: float
+
+
+class VisionCorrectnessGuard:
+    def __init__(self, ttl_seconds: float = 30, clock: Callable[[], float] = time.monotonic):
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0 or ttl_seconds > 300:
+            raise ValueError('vision preview ttl must be finite and between 0 and 300 seconds')
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+        self._screenshots: dict[str, tuple[VisionPageState, float]] = {}
+        self._markers: dict[str, VisionMarker] = {}
+
+    def record_screenshot(self, session_id: str, page: VisionPageState) -> None:
+        self._screenshots[session_id] = (page, self.clock())
+        self._markers.pop(session_id, None)
+
+    def issue_marker(
+        self,
+        session_id: str,
+        page: VisionPageState,
+        x: float,
+        y: float,
+        token: str,
+        image_hash: str,
+        image_width: int | None = None,
+        image_height: int | None = None,
+        click_x: float | None = None,
+        click_y: float | None = None,
+    ) -> VisionMarker:
+        screenshot = self._screenshots.get(session_id)
+        if screenshot is None:
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: run screenshot and inspect the current viewport image '
+                'before placing a click marker'
+            )
+        screenshot_page, captured_at = screenshot
+        if screenshot_page != page:
+            self.invalidate(session_id)
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: page or viewport changed; take and inspect a fresh screenshot'
+            )
+        if self.clock() - captured_at > self.ttl_seconds:
+            self.invalidate(session_id)
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: take and inspect a fresh screenshot because the previous one expired'
+            )
+        if not all(math.isfinite(value) for value in (x, y)) or x < 0 or y < 0:
+            raise ValueError('vision marker coordinates must be finite and non-negative')
+        image_width = page.width if image_width is None else image_width
+        image_height = page.height if image_height is None else image_height
+        click_x = x if click_x is None else click_x
+        click_y = y if click_y is None else click_y
+        if image_width < 1 or image_height < 1:
+            raise ValueError('vision marker screenshot dimensions must be positive')
+        if x >= image_width or y >= image_height:
+            raise ValueError(
+                f'vision marker coordinates ({x:g}, {y:g}) are outside the current '
+                f'{image_width}x{image_height} screenshot'
+            )
+        if not all(math.isfinite(value) for value in (click_x, click_y)):
+            raise ValueError('vision click coordinates must be finite')
+        if not image_hash:
+            raise ValueError('vision marker requires a rendered screenshot hash')
+        marker = VisionMarker(
+            token, x, y, click_x, click_y, int(image_width), int(image_height),
+            page, image_hash, self.clock()
+        )
+        self._markers[session_id] = marker
+        self._screenshots[session_id] = (page, self.clock())
+        return marker
+
+    def current_marker(self, session_id: str, token: str) -> VisionMarker:
+        marker = self._markers.get(session_id)
+        if marker is None or marker.token != token:
+            raise ValueError(
+                'VISION_CONFIRMATION_REQUIRED: token does not match the current marked preview; '
+                'inspect the latest marked screenshot'
+            )
+        if self.clock() - marker.created_at > self.ttl_seconds:
+            self._markers.pop(session_id, None)
+            raise ValueError(
+                'VISION_PREVIEW_EXPIRED: the marked preview expired; take a fresh screenshot and mark again'
+            )
+        return marker
+
+    def consume_marker(
+        self,
+        session_id: str,
+        page: VisionPageState,
+        token: str,
+        image_hash: str,
+    ) -> VisionMarker:
+        marker = self.current_marker(session_id, token)
+        if marker.page != page:
+            self._markers.pop(session_id, None)
+            raise ValueError(
+                'VISION_CONFIRMATION_REQUIRED: page changed after the marked preview; '
+                'take a fresh screenshot and mark again'
+            )
+        if marker.image_hash != image_hash:
+            self._markers.pop(session_id, None)
+            raise ValueError(
+                'VISION_CONFIRMATION_REQUIRED: rendered content changed after the marked preview; '
+                'take a fresh screenshot and mark again'
+            )
+        self._markers.pop(session_id, None)
+        return marker
+
+    def invalidate(self, session_id: str) -> None:
+        self._screenshots.pop(session_id, None)
+        self._markers.pop(session_id, None)
+
+
 def parse_devtools_active_port(content: str) -> int:
     port = int(content.splitlines()[0])
     if not 1 <= port <= 65535:
@@ -169,6 +331,27 @@ def parse_command(command: str) -> list[str]:
     if any(token in {'&&', '||', ';', '|'} for token in parts):
         raise ValueError('run exactly one browser command per tool call; command chaining is not supported')
     return parts
+
+
+def parse_vision_mark(parts: list[str]) -> tuple[float, float]:
+    if len(parts) != 3 or parts[0].lower() != 'vision-mark':
+        raise ValueError('usage: vision-mark <x> <y>')
+    try:
+        x, y = float(parts[1]), float(parts[2])
+    except ValueError as error:
+        raise ValueError('usage: vision-mark <x> <y>') from error
+    if not math.isfinite(x) or not math.isfinite(y) or x < 0 or y < 0:
+        raise ValueError('vision-mark coordinates must be finite and non-negative')
+    return x, y
+
+
+def parse_vision_click(parts: list[str]) -> str:
+    if len(parts) != 2 or parts[0].lower() != 'vision-click':
+        raise ValueError('usage: vision-click <preview-token>')
+    token = parts[1].lower()
+    if not re.fullmatch(r'[a-f0-9]{24}', token):
+        raise ValueError('vision-click requires the exact preview token returned by vision-mark')
+    return token
 
 
 def normalize_option_text(value: object) -> str:

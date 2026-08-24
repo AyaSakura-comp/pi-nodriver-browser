@@ -2,11 +2,11 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Add a mandatory screenshot → marked preview → visual confirmation → click workflow for last-resort viewport-coordinate interactions, then prove a Qwen 3.6 Pi agent receives and uses the screenshots.
+**Goal:** Add a mandatory screenshot → marked preview → visual confirmation → click workflow for last-resort screenshot-coordinate interactions, then prove a Qwen 3.6 Pi agent receives and uses the screenshots.
 
-**Architecture:** Add a session-scoped `VisionCorrectnessGuard` that records a fresh current-viewport screenshot, issues one-time marker tokens tied to the active page/URL/viewport, and consumes a matching token before clicking. `vision-mark <x> <y>` temporarily draws a non-interactive crosshair in the page and returns the annotated screenshot without clicking; `vision-click <token>` clicks the stored point only after the model has had a separate turn to inspect that image. Raw `click <x> <y>` is blocked so coordinate interaction cannot bypass visual verification; semantic `click @ref` remains unchanged.
+**Architecture:** Add a session-scoped `VisionCorrectnessGuard` that records a fresh current-viewport screenshot, issues one-time marker tokens tied to trusted CDP page/loader/layout state plus the clean rendered-image hash, and consumes a matching token before clicking. `vision-mark <x> <y>` draws a crosshair directly onto a copy of the captured PNG outside the untrusted page; screenshot-pixel coordinates are converted through trusted CDP visual-viewport metrics for dispatch. `vision-click <token>` recaptures and revalidates immediately before clicking, after the model has had a separate turn to inspect the marked image. Raw `click <x> <y>` is blocked; semantic `click @ref` remains unchanged.
 
-**Tech Stack:** Python 3.13, Nodriver/CDP, in-page DOM overlay, TypeScript Pi extension responses, unittest, real Chrome/Xvfb, Pi CLI with local Qwen 3.6 vision input.
+**Tech Stack:** Python 3.13, Nodriver/CDP, Pillow PNG annotation, TypeScript Pi extension responses, unittest, real Chrome/Xvfb, Pi CLI with local Qwen 3.6 vision input.
 
 ---
 
@@ -38,7 +38,7 @@
 1. Add a canvas-only fixture with a visually rendered target and no semantic `@ref`.
 2. Add opt-in tests requiring `screenshot` before `vision-mark`, comparing clean and marked screenshot bytes, checking that preview does not click, rejecting the superseded token, confirming the replacement token, rejecting out-of-viewport points, and blocking raw coordinate clicks.
 3. Run the focused tests with `RUN_BROWSER_INTEGRATION=1` and verify expected failures.
-4. Add session state, viewport capture, temporary marker overlay/cleanup, preview screenshot output, token confirmation, and click execution.
+4. Add session state, trusted CDP viewport capture, external PNG marker annotation/temporary-file cleanup, preview screenshot output, token confirmation, and click execution.
 5. Invalidate pending visual state on mutating/navigation actions and consume tokens before native click dispatch.
 6. Re-run focused tests and verify pass.
 

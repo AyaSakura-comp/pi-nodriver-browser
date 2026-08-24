@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import unittest
@@ -6,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, is_confident_option_match, parse_command, parse_dismiss_options, format_snapshot, parse_devtools_active_port, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionPageState, format_snapshot, is_confident_option_match, map_screenshot_point_to_viewport, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -56,6 +57,183 @@ class ParseCommandTests(unittest.TestCase):
     def test_rejects_shell_style_command_chaining(self):
         with self.assertRaisesRegex(ValueError, 'one browser command'):
             parse_command('wait 2000 && screenshot')
+
+
+class VisionCommandParsingTests(unittest.TestCase):
+    def test_parses_finite_non_negative_marker_coordinates(self):
+        self.assertEqual(parse_vision_mark(['vision-mark', '120.5', '300']), (120.5, 300.0))
+
+    def test_rejects_invalid_marker_coordinates(self):
+        invalid = (
+            ['vision-mark'],
+            ['vision-mark', '-1', '20'],
+            ['vision-mark', 'nan', '20'],
+            ['vision-mark', '20', 'inf'],
+            ['vision-mark', '20', '30', 'extra'],
+        )
+        for parts in invalid:
+            with self.subTest(parts=parts), self.assertRaisesRegex(ValueError, 'vision-mark'):
+                parse_vision_mark(parts)
+
+    def test_parses_exact_generated_preview_token(self):
+        token = '0123456789abcdef01234567'
+        self.assertEqual(parse_vision_click(['vision-click', token]), token)
+
+    def test_rejects_malformed_or_extra_preview_tokens(self):
+        for parts in (
+            ['vision-click'],
+            ['vision-click', 'not-a-token'],
+            ['vision-click', '0123456789abcdef01234567', 'extra'],
+        ):
+            with self.subTest(parts=parts), self.assertRaisesRegex(ValueError, 'vision-click'):
+                parse_vision_click(parts)
+
+
+class VisionCoordinateMappingTests(unittest.TestCase):
+    def test_maps_screenshot_pixels_through_scaled_visual_viewport(self):
+        page = VisionPageState(
+            'tab-a', 'https://example.test/', 390, 844,
+            visual_width=195, visual_height=422, visual_scale=2,
+        )
+
+        self.assertEqual(
+            map_screenshot_point_to_viewport(page, 390, 844, 300, 330),
+            (150.0, 165.0),
+        )
+
+    def test_maps_nonstandard_webui_screenshot_size(self):
+        page = VisionPageState(
+            'tab-a', 'chrome://extensions/', 390, 844,
+            visual_width=390, visual_height=844, visual_scale=1,
+        )
+        x, y = map_screenshot_point_to_viewport(page, 980, 2121, 490, 1060.5)
+
+        self.assertAlmostEqual(x, 195)
+        self.assertAlmostEqual(y, 422)
+
+    def test_rejects_invalid_screenshot_or_visual_dimensions(self):
+        page = VisionPageState(
+            'tab-a', 'https://example.test/', 390, 844,
+            visual_width=0, visual_height=844,
+        )
+        with self.assertRaisesRegex(ValueError, 'dimensions'):
+            map_screenshot_point_to_viewport(page, 390, 844, 20, 30)
+
+
+class VisionCorrectnessGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.0
+        self.guard = VisionCorrectnessGuard(ttl_seconds=30, clock=lambda: self.now)
+        self.page = VisionPageState(
+            target_id='tab-a',
+            url='https://example.test/',
+            width=390,
+            height=844,
+            loader_id='loader-a',
+            scroll_x=0,
+            scroll_y=0,
+            visual_offset_x=0,
+            visual_offset_y=0,
+            visual_width=390,
+            visual_height=844,
+            visual_scale=1,
+        )
+
+    def test_requires_fresh_current_viewport_screenshot_before_marker(self):
+        with self.assertRaisesRegex(ValueError, 'VISION_SCREENSHOT_REQUIRED'):
+            self.guard.issue_marker(
+                'session-a', self.page, 120, 300, '0123456789abcdef01234567', 'hash-a'
+            )
+
+    def test_rejects_marker_outside_screenshot_viewport(self):
+        self.guard.record_screenshot('session-a', self.page)
+
+        with self.assertRaisesRegex(ValueError, 'outside'):
+            self.guard.issue_marker(
+                'session-a', self.page, 390, 300, '0123456789abcdef01234567', 'hash-a'
+            )
+
+    def test_rejects_marker_after_page_or_viewport_changes(self):
+        self.guard.record_screenshot('session-a', self.page)
+        changed = VisionPageState('tab-a', 'https://example.test/next', 390, 844)
+
+        with self.assertRaisesRegex(ValueError, 'fresh screenshot'):
+            self.guard.issue_marker(
+                'session-a', changed, 120, 300, '0123456789abcdef01234567', 'hash-a'
+            )
+
+    def test_replacement_marker_invalidates_previous_token(self):
+        first = '0123456789abcdef01234567'
+        second = '89abcdef0123456701234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 20, 30, first, 'hash-a')
+        self.guard.issue_marker('session-a', self.page, 120, 300, second, 'hash-a')
+
+        with self.assertRaisesRegex(ValueError, 'current marked preview'):
+            self.guard.consume_marker('session-a', self.page, first, 'hash-a')
+        marker = self.guard.consume_marker('session-a', self.page, second, 'hash-a')
+        self.assertEqual((marker.x, marker.y), (120, 300))
+
+    def test_confirmation_is_one_time_and_bound_to_page(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+        wrong_page = VisionPageState(
+            **{**self.page.__dict__, 'target_id': 'tab-b'}
+        )
+
+        with self.assertRaisesRegex(ValueError, 'page changed'):
+            self.guard.consume_marker('session-a', wrong_page, token, 'hash-a')
+        with self.assertRaisesRegex(ValueError, 'current marked preview'):
+            self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_expired_screenshot_and_marker_fail_closed(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.now += 31
+        with self.assertRaisesRegex(ValueError, 'fresh screenshot'):
+            self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+        self.now += 31
+        with self.assertRaisesRegex(ValueError, 'expired'):
+            self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_invalidate_clears_screenshot_and_marker(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+        self.guard.invalidate('session-a')
+
+        with self.assertRaisesRegex(ValueError, 'VISION_SCREENSHOT_REQUIRED'):
+            self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+        with self.assertRaisesRegex(ValueError, 'current marked preview'):
+            self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_loader_identity_change_invalidates_same_url_preview(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+        reloaded = VisionPageState(**{**self.page.__dict__, 'loader_id': 'loader-b'})
+
+        with self.assertRaisesRegex(ValueError, 'page changed'):
+            self.guard.consume_marker('session-a', reloaded, token, 'hash-a')
+
+    def test_rendered_content_change_invalidates_preview(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+
+        with self.assertRaisesRegex(ValueError, 'rendered content changed'):
+            self.guard.consume_marker('session-a', self.page, token, 'hash-b')
+        with self.assertRaisesRegex(ValueError, 'current marked preview'):
+            self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_rejects_non_finite_preview_ttl(self):
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'ttl'):
+                VisionCorrectnessGuard(ttl_seconds=value)
 
 
 class BrowserExecutableTests(unittest.TestCase):

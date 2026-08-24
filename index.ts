@@ -28,7 +28,7 @@ Guidelines:
 - Progressive Disclosure: Never crawl or get the full page merely to inspect a dropdown. find-option searches every option internally, includes control-label context, and diversifies the top candidates across dropdowns; ambiguous queries return choices instead of guessing.
 - Preserve Form State: After selecting options, do not navigate, reload, or click recalculation/reset controls unless the user explicitly requires it; dynamic quote/configurator pages may clear selections. Verify with snapshot or screenshot instead.
 - Exact Ref Before Text: When snapshot shows the desired control, click its @ref. Use click-text only when no suitable ref exists; broad ancestor text containers are intentionally rejected.
-- Coordinate Last Resort: Use 'click <x> <y>' only after snapshot -i and semantic targeting fail, or for canvas/cross-origin visual-only controls.
+- Vision-Correct Coordinates: Raw coordinate clicks are blocked. For canvas/cross-origin visual-only controls, run 'screenshot', inspect the image, use its pixel coordinates with 'vision-mark <x> <y>', inspect the attached marked screenshot, re-mark until correct, then run the exact 'vision-click <preview-token>' command returned by the latest preview.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
 - Open Loop Guard: At most 2 consecutive open actions are allowed per session. The 3rd and later opens are blocked until a non-open browser action runs.
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
@@ -40,7 +40,8 @@ Commands:
   snapshot -i - List interactive elements in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click <@ref> - Click a snapshot element, including custom controls and open Shadow DOM
-  click <x> <y> - Last-resort viewport coordinates, only after semantic targeting fails (canvas, inaccessible cross-origin iframe, visual-only control)
+  vision-mark <x> <y> - Draw a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; requires a fresh normal screenshot first
+  vision-click <preview-token> - Click the latest marked point only after inspecting the attached marked screenshot
   click-text <text> - Click the best visible element matching text or accessible label
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js <@ref> - Dispatch a deferred DOM click when a site's native mouse handler poisons CDP
@@ -257,6 +258,7 @@ export default function (pi: ExtensionAPI) {
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
       "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",
       "A missing or stale @ref does not perform the action and automatically returns both a fresh DOM snapshot and viewport image for joint inspection; run snapshot -i next to unlock ref-based commands, and never retry the old ref.",
+      "Raw coordinate clicks are blocked. For a visual-only target, always use the image-bearing sequence: screenshot → inspect → vision-mark <x> <y> → inspect the attached marked screenshot → re-mark if needed → vision-click <preview-token>. Never confirm a marker before visually checking the image returned by vision-mark.",
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
       "For downloads, inspect with download-info and prefer download <@ref> over clicking and guessing; use downloads to check progress.",
       "To deliver a screenshot or downloaded file to the user on PiWeb / Discord, you MUST emit '[[image: <path>]]' or '[[file: <path>]]' in your reply prose. Do NOT use markdown '![alt](/tmp/...)' and do NOT rely on 'read'.",

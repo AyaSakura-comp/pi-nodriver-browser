@@ -56,6 +56,35 @@ class CloseIgnoringPage(FakePage):
         return None
 
 
+class FailingFullPageScreenshot:
+    def __init__(self):
+        self.target = FakeTarget('vision-page')
+        self.url = 'https://example.test/vision'
+
+    async def save_screenshot(self, *_args, **_kwargs):
+        raise RuntimeError('capture failed')
+
+
+class VisionScreenshotFailureUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_full_page_capture_invalidates_existing_marker(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FailingFullPageScreenshot()
+        worker.pages['session-a'] = page
+        state = VisionPageState('vision-page', page.url, 390, 844)
+        token = '0123456789abcdef01234567'
+        worker.vision_guard.record_screenshot('session-a', state)
+        worker.vision_guard.issue_marker('session-a', state, 120, 300, token, 'hash-a')
+
+        with self.assertRaisesRegex(RuntimeError, 'capture failed'):
+            await worker.execute('screenshot --full', session_id='session-a')
+
+        with self.assertRaisesRegex(ValueError, 'current marked preview'):
+            worker.vision_guard.current_marker('session-a', token)
+
+
 class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_opening_thirty_tabs_evicts_old_inactive_tabs_but_keeps_recently_touched_tabs(self):
         from worker import BrowserWorker
@@ -728,6 +757,8 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('Visual overview only', result['text'])
         self.assertIn('scroll down', result['text'])
         self.assertIn('Do not click coordinates', result['text'])
+        self.assertIn('vision-mark', result['text'])
+        self.assertNotIn('Use click <x> <y>', result['text'])
         self.assertIn('snapshot -i', result['text'])
         self.assertTrue(Path(result['screenshotPath']).is_file())
         self.assertGreater(Path(result['screenshotPath']).stat().st_size, 0)
@@ -1054,10 +1085,64 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command('click-css "#custom"')
         self.assertIn('custom-clicked', self.status())
 
-    def test_click_coordinates_uses_viewport_coordinates(self):
-        self.open_fixture()
-        self.command('click 360 330')
-        self.assertIn('coordinate-clicked', self.status())
+    def test_vision_correctness_marks_retries_and_confirms_before_coordinate_click(self):
+        fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
+        self.command(f'open {fixture_url}')
+        self.assertEqual(self.command('snapshot -i')['text'], '(no interactive elements)')
+
+        no_screenshot = self.command_raw('vision-mark 300 330')
+        self.assertFalse(no_screenshot['ok'])
+        self.assertIn('VISION_SCREENSHOT_REQUIRED', no_screenshot['error'])
+
+        raw_click = self.command_raw('click 300 330')
+        self.assertFalse(raw_click['ok'])
+        self.assertIn('VISION_CLICK_GUARD', raw_click['error'])
+        self.assertIn('vision-idle', self.command('get text')['text'])
+
+        clean = self.command('screenshot')
+        clean_bytes = Path(clean['screenshotPath']).read_bytes()
+        wrong = self.command('vision-mark 60 180')
+        self.assertEqual(wrong['action'], 'vision-mark')
+        self.assertTrue(Path(wrong['screenshotPath']).is_file())
+        self.assertNotEqual(clean_bytes, Path(wrong['screenshotPath']).read_bytes())
+        self.assertIn('NO CLICK PERFORMED', wrong['text'])
+        self.assertIn('vision-idle', self.command('get text')['text'])
+
+        corrected = self.command('vision-mark 300 330')
+        self.assertNotEqual(wrong['previewToken'], corrected['previewToken'])
+        stale_confirmation = self.command_raw(f"vision-click {wrong['previewToken']}")
+        self.assertFalse(stale_confirmation['ok'])
+        self.assertIn('current marked preview', stale_confirmation['error'])
+
+        clicked = self.command(f"vision-click {corrected['previewToken']}")
+        self.assertEqual(clicked['action'], 'vision-click')
+        self.assertIn('vision-clicked', self.command('get text')['text'])
+
+        reused = self.command_raw(f"vision-click {corrected['previewToken']}")
+        self.assertFalse(reused['ok'])
+        self.assertIn('current marked preview', reused['error'])
+
+    def test_full_page_images_invalidate_existing_viewport_marker(self):
+        fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
+        self.command(f'open {fixture_url}')
+        self.command('screenshot')
+        first = self.command('vision-mark 60 180')
+
+        self.command('snapshot -i --full')
+        snapshot_blocked = self.command_raw(f"vision-click {first['previewToken']}")
+        self.assertFalse(snapshot_blocked['ok'])
+        self.assertIn('current marked preview', snapshot_blocked['error'])
+
+        self.command('screenshot')
+        second = self.command('vision-mark 60 180')
+        self.command('screenshot --full')
+        screenshot_blocked = self.command_raw(f"vision-click {second['previewToken']}")
+        marker_blocked = self.command_raw('vision-mark 300 330')
+
+        self.assertFalse(screenshot_blocked['ok'])
+        self.assertIn('current marked preview', screenshot_blocked['error'])
+        self.assertFalse(marker_blocked['ok'])
+        self.assertIn('VISION_SCREENSHOT_REQUIRED', marker_blocked['error'])
 
 
 if __name__ == '__main__':
