@@ -19,7 +19,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionPageState, format_snapshot, is_confident_option_match, map_screenshot_point_to_viewport, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -36,6 +36,10 @@ class StaleRefError(ValueError):
     def __init__(self, ref):
         self.ref = ref
         super().__init__(f'element {ref} not found; run snapshot -i again')
+
+
+class SemanticClickTargetError(ValueError):
+    pass
 
 
 # Commands that observe the page without changing it. Repeating one of these
@@ -357,39 +361,50 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
   visit(document);
 
   let match = null;
-  if (request.kind === 'ref') {
-    match = entries.find(item => item.el.getAttribute('data-pi-ref') === request.value) || null;
-  } else if (request.kind === 'css') {
-    match = entries.find(item => {
-      try { return item.el.matches(request.value); } catch (_) { return false; }
-    }) || null;
-  } else if (request.kind === 'text') {
-    const wanted = normalize(request.value);
-    let candidates = entries.filter(item => {
-      const el = item.el;
-      const label = normalize(el.innerText || el.textContent || el.value ||
-        el.getAttribute('aria-label') || el.getAttribute('title'));
-      return label === wanted || (
-        label.includes(wanted) && label.length <= Math.max(160, wanted.length * 4)
-      );
-    });
-    candidates = candidates.filter(item => !candidates.some(other =>
-      other.el !== item.el && item.el.contains?.(other.el) &&
-      normalize(other.el.innerText || other.el.textContent || other.el.value ||
-        other.el.getAttribute('aria-label') || other.el.getAttribute('title')).length <=
-      normalize(item.el.innerText || item.el.textContent || item.el.value ||
-        item.el.getAttribute('aria-label') || item.el.getAttribute('title')).length
-    ));
-    candidates.sort((a, b) => {
-      const aText = normalize(a.el.innerText || a.el.textContent || a.el.value || a.el.getAttribute('aria-label'));
-      const bText = normalize(b.el.innerText || b.el.textContent || b.el.value || b.el.getAttribute('aria-label'));
-      const aScore = (aText === wanted ? 0 : 1000) + (interactive(a.el) ? 0 : 100) + aText.length;
-      const bScore = (bText === wanted ? 0 : 1000) + (interactive(b.el) ? 0 : 100) + bText.length;
-      return aScore - bScore;
-    });
-    match = candidates[0] || null;
+  let invalidSelector = false;
+  if (request.kind === 'css') {
+    try {
+      (document.body || document.documentElement || document.createElement('div')).matches(request.value);
+    } catch (_) {
+      invalidSelector = true;
+    }
   }
-  if (!match) return { found: false };
+  if (!invalidSelector) {
+    if (request.kind === 'ref') {
+      match = entries.find(item => item.el.getAttribute('data-pi-ref') === request.value) || null;
+    } else if (request.kind === 'css') {
+      match = entries.find(item => {
+        try { return item.el.matches(request.value); }
+        catch (_) { invalidSelector = true; return false; }
+      }) || null;
+    } else if (request.kind === 'text') {
+      const wanted = normalize(request.value);
+      let candidates = entries.filter(item => {
+        const el = item.el;
+        const label = normalize(el.innerText || el.textContent || el.value ||
+          el.getAttribute('aria-label') || el.getAttribute('title'));
+        return label === wanted || (
+          label.includes(wanted) && label.length <= Math.max(160, wanted.length * 4)
+        );
+      });
+      candidates = candidates.filter(item => !candidates.some(other =>
+        other.el !== item.el && item.el.contains?.(other.el) &&
+        normalize(other.el.innerText || other.el.textContent || other.el.value ||
+          other.el.getAttribute('aria-label') || other.el.getAttribute('title')).length <=
+        normalize(item.el.innerText || item.el.textContent || item.el.value ||
+          item.el.getAttribute('aria-label') || item.el.getAttribute('title')).length
+      ));
+      candidates.sort((a, b) => {
+        const aText = normalize(a.el.innerText || a.el.textContent || a.el.value || a.el.getAttribute('aria-label'));
+        const bText = normalize(b.el.innerText || b.el.textContent || b.el.value || b.el.getAttribute('aria-label'));
+        const aScore = (aText === wanted ? 0 : 1000) + (interactive(a.el) ? 0 : 100) + aText.length;
+        const bScore = (bText === wanted ? 0 : 1000) + (interactive(b.el) ? 0 : 100) + bText.length;
+        return aScore - bScore;
+      });
+      match = candidates[0] || null;
+    }
+  }
+  if (!match) return { found: false, invalidSelector };
 
   for (const frame of match.frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
   match.el.scrollIntoView({ block: 'center', inline: 'center' });
@@ -746,6 +761,7 @@ class BrowserWorker:
         self.vision_guard = VisionCorrectnessGuard(
             ttl_seconds=float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
         )
+        self.vision_fallback_guard = VisionFallbackGuard()
         self.max_tabs = int(os.environ.get('PI_NODRIVER_MAX_TABS', '20'))
         self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
         self.tab_management_lock = asyncio.Lock()
@@ -773,6 +789,13 @@ class BrowserWorker:
 
     def touch_tab(self, page):
         self.tab_registry.touch(page)
+
+    async def vision_fallback_context(self, page):
+        state = await self.vision_page_state(page)
+        return VisionFallbackContext(state.target_id, state.url, state.loader_id)
+
+    def semantic_target_resolved(self, session_id):
+        self.vision_fallback_guard.reset(session_id)
 
     def begin_tab_activity(self, page):
         target_id = self.tab_registry.target_id(page)
@@ -1503,6 +1526,7 @@ class BrowserWorker:
         ))
         if not result.get('found'):
             raise self.stale_ref_error(session_id, ref)
+        self.semantic_target_resolved(session_id)
         if not result.get('ok'):
             raise ValueError(result.get('error') or f'{action} failed for {ref}')
         return page, result
@@ -1620,7 +1644,9 @@ class BrowserWorker:
                 if session_id is not None:
                     raise self.stale_ref_error(session_id, f'@{value}')
                 raise ValueError(f'element @{value} not found; run snapshot -i again')
-            raise ValueError(f'click target not found by {kind}: {value}')
+            if kind == 'css' and result.get('invalidSelector'):
+                raise ValueError(f'invalid CSS selector: {value}')
+            raise SemanticClickTargetError(f'click target not found by {kind}: {value}')
         return result
 
     @staticmethod
@@ -1835,7 +1861,54 @@ class BrowserWorker:
         if action not in SUPPORTED_ACTIONS:
             raise ValueError(f'unsupported browser command: {action}')
         self.track_open_action(session_id, action)
-        result = await self._execute(command, session_id)
+        semantic_click = is_semantic_click_attempt(parts)
+        page = self.pages.get(session_id)
+        fallback_context = None
+        if page is not None:
+            try:
+                fallback_context = await self.vision_fallback_context(page)
+                self.vision_fallback_guard.observe_context(session_id, fallback_context)
+            except Exception:
+                pass
+        try:
+            result = await self._execute(command, session_id)
+        except (StaleRefError, SemanticClickTargetError) as error:
+            if semantic_click and fallback_context is not None:
+                current_page = self.pages.get(session_id)
+                fallback_context_after = None
+                if current_page is not None:
+                    try:
+                        fallback_context_after = await self.vision_fallback_context(current_page)
+                    except Exception:
+                        pass
+                if fallback_context_after == fallback_context:
+                    self.vision_guard.invalidate(session_id)
+                    count, unlocked = self.vision_fallback_guard.record_failure(
+                        session_id, fallback_context
+                    )
+                    state = 'UNLOCKED' if unlocked else 'PROGRESS'
+                    next_step = (
+                        'Vision fallback is now unlocked on this page. Take and inspect a fresh screenshot, '
+                        'then use vision-mark only if semantic interaction is genuinely unavailable.'
+                        if unlocked else
+                        'Vision fallback remains locked; continue with semantic controls and do not fabricate failures.'
+                    )
+                    progress_message = (
+                        f'VISION_FALLBACK_{state}: semantic target-resolution failure '
+                        f'{count}/{self.vision_fallback_guard.threshold}. {next_step}'
+                    )
+                    if isinstance(error, StaleRefError):
+                        error.vision_fallback_progress = (count, unlocked)
+                        error.vision_fallback_message = progress_message
+                        raise
+                    raise ValueError(f'{error}\n{progress_message}') from error
+                else:
+                    self.vision_fallback_guard.reset(session_id)
+            raise
+        if semantic_click or action in {
+            'open', 'close', 'switch', 'wait-popup', 'wait-popup-close', 'vision-click'
+        }:
+            self.vision_fallback_guard.reset(session_id)
         if action != 'open':
             self.open_action_guard.clear(session_id)
         return result
@@ -2025,8 +2098,10 @@ class BrowserWorker:
                         'Visual overview only; no DOM refs were generated. Inspect the image first. '
                         'Do not click coordinates from this overview. Run snapshot -i in the relevant viewport, '
                         'then prefer @ref, click-text, click-css, fill, or select—including controls inside iframes. '
-                        'For a canvas or visual-only control, move to its real viewport and use screenshot, then '
-                        'vision-mark <x> <y>, inspect the marked image, and vision-click its preview token. '
+                        f'For a canvas or visual-only control, coordinate fallback remains locked until '
+                        f'{self.vision_fallback_guard.threshold} consecutive semantic target-resolution failures '
+                        'occur on this page/document. Once unlocked, move to its real viewport and use '
+                        'screenshot, then vision-mark <x> <y>, inspect the marked image, and vision-click its preview token. '
                         'Use scroll down or scroll up to inspect additional sections before reporting an object missing.'
                     ),
                     'action': 'snapshot-full-vision',
@@ -2178,6 +2253,9 @@ class BrowserWorker:
         if action == 'vision-mark':
             x, y = parse_vision_mark(parts)
             page = await self.require_page(session_id)
+            self.vision_fallback_guard.require_unlocked(
+                session_id, await self.vision_fallback_context(page)
+            )
             clean = None
             output = None
             try:
@@ -2297,15 +2375,18 @@ class BrowserWorker:
                 except ValueError as error:
                     raise ValueError('usage: click <@ref>') from error
                 raise ValueError(
-                    'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Run `screenshot`, inspect '
-                    'the image, run `vision-mark <x> <y>`, inspect the attached marked image, correct '
-                    'the marker until it is accurate, then run the exact `vision-click <preview-token>` '
-                    'command returned by vision-mark.'
+                    'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Vision fallback unlocks only '
+                    f'after {self.vision_fallback_guard.threshold} consecutive legitimate semantic target-resolution failures '
+                    'on the same page; do not fabricate '
+                    'failures. Once unlocked, run `screenshot`, inspect the image, run `vision-mark <x> <y>`, '
+                    'inspect and correct the attached marked image, then run the exact '
+                    '`vision-click <preview-token>` command returned by vision-mark.'
                 )
             if len(parts) != 2 or not parts[1].startswith('@'):
                 raise ValueError('usage: click <@ref>')
             normalized = parts[1].removeprefix('@')
             target = await self.resolve_click_target(page, 'ref', normalized, session_id)
+            self.semantic_target_resolved(session_id)
             self.vision_guard.invalidate(session_id)
             previous = page
             await self.configure_download_session(session_id, page)
@@ -2321,6 +2402,7 @@ class BrowserWorker:
             value = ' '.join(parts[1:])
             kind = 'text' if action == 'click-text' else 'css'
             target = await self.resolve_click_target(page, kind, value)
+            self.semantic_target_resolved(session_id)
             previous = page
             await self.configure_download_session(session_id, page)
             page = await self.native_click(page, target['x'], target['y'])
@@ -2793,14 +2875,18 @@ class BrowserWorker:
                     )
                 except TimeoutError as error:
                     raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
-                note = ' Full-page overviews cannot be used for coordinate confirmation.'
+                note = ' Full-page overviews cannot be used for coordinate confirmation or unlock vision fallback.'
             else:
                 output = await self.save_viewport_screenshot(page, 'pi-nodriver-shot-')
                 self.vision_guard.record_screenshot(
                     session_id,
                     await self.vision_page_state(page),
                 )
-                note = ' Current viewport is ready for vision-mark <x> <y>.'
+                note = (
+                    ' Current viewport was captured. vision-mark additionally requires '
+                    f'VISION_FALLBACK_UNLOCKED after {self.vision_fallback_guard.threshold} consecutive '
+                    'semantic target-resolution failures on this page/document.'
+                )
             return {
                 'text': f'Screenshot saved: {output}.{note}',
                 'action': action,
@@ -3007,13 +3093,21 @@ async def execute_request(worker, request):
                 worker.stale_ref_recovery(session_id, error.ref),
                 timeout=command_timeout,
             )
+            progress_message = getattr(error, 'vision_fallback_message', '')
+            if progress_message and isinstance(recovery.get('text'), str):
+                recovery['text'] = recovery['text'].rstrip() + f'\n\n{progress_message}'
             return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **recovery}
         except Exception as recovery_error:
+            progress_message = getattr(error, 'vision_fallback_message', '')
+            progress_suffix = f'; {progress_message}' if progress_message else ''
             return {
                 'id': request.get('id'),
                 'sessionId': session_id,
                 'ok': False,
-                'error': f'{type(error).__name__}: {error}; visual recovery failed: {recovery_error}',
+                'error': (
+                    f'{type(error).__name__}: {error}; visual recovery failed: {recovery_error}'
+                    f'{progress_suffix}'
+                ),
             }
     except TimeoutError:
         return {

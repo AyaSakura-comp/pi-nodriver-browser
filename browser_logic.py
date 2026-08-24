@@ -123,6 +123,54 @@ class OpenActionGuard:
 
 
 @dataclass(frozen=True)
+class VisionFallbackContext:
+    target_id: str
+    url: str
+    loader_id: str
+
+
+class VisionFallbackGuard:
+    def __init__(self, threshold: int = 3):
+        if threshold != 3 or isinstance(threshold, bool):
+            raise ValueError('vision fallback threshold is fixed at 3')
+        self.threshold = threshold
+        self._failures: dict[str, tuple[VisionFallbackContext, int]] = {}
+
+    def record_failure(
+        self,
+        session_id: str,
+        context: VisionFallbackContext,
+    ) -> tuple[int, bool]:
+        previous = self._failures.get(session_id)
+        count = previous[1] + 1 if previous and previous[0] == context else 1
+        count = min(count, self.threshold)
+        self._failures[session_id] = (context, count)
+        return count, count >= self.threshold
+
+    def require_unlocked(self, session_id: str, context: VisionFallbackContext) -> None:
+        previous = self._failures.get(session_id)
+        if previous and previous[0] != context:
+            self._failures.pop(session_id, None)
+            previous = None
+        count = previous[1] if previous else 0
+        if count < self.threshold:
+            raise ValueError(
+                f'VISION_FALLBACK_LOCKED: vision-mark is available only after '
+                f'{self.threshold} consecutive semantic target-resolution failures on the current page/document '
+                f'({count}/{self.threshold} recorded). Keep using @ref, click-text, click-css, or '
+                f'click-js; do not fabricate failures just to unlock coordinate fallback.'
+            )
+
+    def observe_context(self, session_id: str, context: VisionFallbackContext) -> None:
+        previous = self._failures.get(session_id)
+        if previous and previous[0] != context:
+            self._failures.pop(session_id, None)
+
+    def reset(self, session_id: str) -> None:
+        self._failures.pop(session_id, None)
+
+
+@dataclass(frozen=True)
 class VisionPageState:
     target_id: str
     url: str
@@ -331,6 +379,17 @@ def parse_command(command: str) -> list[str]:
     if any(token in {'&&', '||', ';', '|'} for token in parts):
         raise ValueError('run exactly one browser command per tool call; command chaining is not supported')
     return parts
+
+
+def is_semantic_click_attempt(parts: list[str]) -> bool:
+    if not parts:
+        return False
+    action = parts[0].lower()
+    if action in {'click', 'click-js'}:
+        return len(parts) == 2 and parts[1].startswith('@') and len(parts[1]) > 1
+    if action in {'click-text', 'click-css'}:
+        return len(parts) >= 2 and bool(' '.join(parts[1:]).strip())
+    return False
 
 
 def parse_vision_mark(parts: list[str]) -> tuple[float, float]:

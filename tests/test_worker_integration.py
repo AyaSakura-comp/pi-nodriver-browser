@@ -65,6 +65,221 @@ class FailingFullPageScreenshot:
         raise RuntimeError('capture failed')
 
 
+class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker, SemanticClickTargetError
+
+        class Worker(BrowserWorker):
+            async def vision_fallback_context(self, page):
+                return VisionFallbackContext(page.target.target_id, page.url, 'loader-a')
+
+            async def _execute(self, command, session_id='default'):
+                if command == 'click-css #success':
+                    return {'text': 'clicked', 'action': 'click-css'}
+                if command == 'switch opener':
+                    return {'text': 'switched', 'action': 'switch'}
+                if command == 'get text':
+                    return {'text': 'page text', 'action': 'get'}
+                if command == 'click @stale':
+                    from worker import StaleRefError
+                    raise StaleRefError('stale')
+                if command == 'click @guarded':
+                    raise ValueError('STALE_REF_GUARD: run snapshot -i')
+                if command == 'click-css #missing':
+                    raise SemanticClickTargetError('DOM click target was unavailable')
+                if command == 'click-css #postdispatch':
+                    raise TimeoutError('click dispatched but settle failed')
+                if command == 'click-css [':
+                    raise ValueError('invalid CSS selector: [')
+                if command == 'click-js @disabled':
+                    self.semantic_target_resolved(session_id)
+                    raise ValueError('target control is disabled')
+                raise ValueError('DOM click failed')
+
+        self.worker = Worker()
+        browser = FakeBrowser()
+        self.page = FakePage(browser, 'semantic-page')
+        self.worker.pages['session-a'] = self.page
+
+    def context(self):
+        from browser_logic import VisionFallbackContext
+        return VisionFallbackContext('semantic-page', self.page.url, 'loader-a')
+
+    async def test_three_failed_semantic_clicks_unlock_vision_fallback(self):
+        for count in range(1, 4):
+            with self.assertRaisesRegex(ValueError, rf'{count}/3'):
+                await self.worker.execute('click-css #missing', 'session-a')
+
+        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_successful_semantic_click_resets_failure_progress(self):
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+        await self.worker.execute('click-css #success', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_context_switch_resets_failure_progress(self):
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+
+        await self.worker.execute('switch opener', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_stale_ref_preserves_recovery_exception_and_records_progress(self):
+        from worker import StaleRefError
+
+        with self.assertRaises(StaleRefError) as raised:
+            await self.worker.execute('click @stale', 'session-a')
+
+        self.assertEqual(raised.exception.vision_fallback_progress, (1, False))
+
+    async def test_stale_guard_retry_does_not_increment_progress(self):
+        from worker import StaleRefError
+
+        with self.assertRaises(StaleRefError):
+            await self.worker.execute('click @stale', 'session-a')
+        with self.assertRaisesRegex(ValueError, 'STALE_REF_GUARD'):
+            await self.worker.execute('click @guarded', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'1/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_stale_ref_recovery_response_reports_failure_progress(self):
+        from worker import execute_request
+
+        self.worker.stale_ref_recovery = AsyncMock(return_value={
+            'text': 'CLICK NOT PERFORMED',
+            'action': 'stale-ref-recovery',
+        })
+        response = await execute_request(self.worker, {
+            'id': 1,
+            'sessionId': 'session-a',
+            'command': 'click @stale',
+        })
+
+        self.assertTrue(response['ok'])
+        self.assertIn('CLICK NOT PERFORMED', response['text'])
+        self.assertIn('VISION_FALLBACK_PROGRESS', response['text'])
+        self.assertIn('1/3', response['text'])
+
+    async def test_stale_ref_recovery_failure_still_reports_progress(self):
+        from worker import execute_request
+
+        self.worker.stale_ref_recovery = AsyncMock(side_effect=RuntimeError('capture failed'))
+        response = await execute_request(self.worker, {
+            'id': 1,
+            'sessionId': 'session-a',
+            'command': 'click @stale',
+        })
+
+        self.assertFalse(response['ok'])
+        self.assertIn('visual recovery failed', response['error'])
+        self.assertIn('VISION_FALLBACK_PROGRESS', response['error'])
+        self.assertIn('1/3', response['error'])
+
+    async def test_resolving_a_semantic_target_breaks_failure_sequence(self):
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+
+        self.worker.semantic_target_resolved('session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_post_dispatch_or_infrastructure_failure_does_not_count(self):
+        with self.assertRaisesRegex(TimeoutError, 'settle failed'):
+            await self.worker.execute('click-css #postdispatch', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_invalid_css_does_not_count_as_semantic_failure(self):
+        with self.assertRaisesRegex(ValueError, 'invalid CSS selector'):
+            await self.worker.execute('click-css [', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_non_counting_action_on_different_context_clears_failure_progress_on_return(self):
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+        other_page = FakePage(FakeBrowser(), 'other-page')
+        self.worker.pages['session-a'] = other_page
+        await self.worker.execute('get text', 'session-a')
+
+        self.worker.pages['session-a'] = self.page
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_failure_during_loader_or_context_change_does_not_charge_progress(self):
+        from browser_logic import VisionFallbackContext
+
+        class ContextChangingWorker(self.worker.__class__):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            async def vision_fallback_context(self, page):
+                self.calls += 1
+                loader = 'loader-b' if self.calls > 1 else 'loader-a'
+                return VisionFallbackContext(page.target.target_id, page.url, loader)
+
+        worker = ContextChangingWorker()
+        worker.pages['session-a'] = self.page
+
+        with self.assertRaisesRegex(ValueError, 'DOM click target was unavailable') as raised:
+            await worker.execute('click-css #missing', 'session-a')
+        self.assertNotIn('VISION_FALLBACK_PROGRESS', str(raised.exception))
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_resolved_but_rejected_ref_action_resets_failure_progress(self):
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, 'target control is disabled'):
+            await self.worker.execute('click-js @disabled', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+    async def test_vision_mark_requires_fresh_screenshot_after_unlock(self):
+        from browser_logic import VisionPageState
+
+        state = VisionPageState('semantic-page', self.page.url, 390, 844, 'loader-a')
+        self.worker.vision_guard.record_screenshot('session-a', state)
+
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                await self.worker.execute('click-css #missing', 'session-a')
+
+        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+        with self.assertRaisesRegex(ValueError, 'VISION_SCREENSHOT_REQUIRED'):
+            self.worker.vision_guard.issue_marker(
+                'session-a', state, 100, 200, '0123456789abcdef01234567', 'hash-a'
+            )
+
+    async def test_raw_coordinate_failure_does_not_count(self):
+        with self.assertRaisesRegex(ValueError, 'DOM click failed'):
+            await self.worker.execute('click 20 30', 'session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+
 class VisionScreenshotFailureUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_full_page_capture_invalidates_existing_marker(self):
         from browser_logic import VisionPageState
@@ -585,12 +800,21 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command(f'click {top_ref}')
         self.assertIn('top-clicked', self.command('get text')['text'])
 
-        self.command('scroll down 650')
+        self.command('scroll down 1000')
         middle_snapshot = self.command('snapshot -i')['text']
         self.assertNotIn('Top viewport action', middle_snapshot)
-        self.assertNotIn('Middle viewport action', middle_snapshot)
-        self.assertIn('Bottom viewport action', middle_snapshot)
-        bottom_ref = next(line for line in middle_snapshot.splitlines() if 'Bottom viewport action' in line).split()[0]
+        self.assertIn('Middle viewport action', middle_snapshot)
+        self.assertNotIn('Bottom viewport action', middle_snapshot)
+        middle_ref = next(line for line in middle_snapshot.splitlines() if 'Middle viewport action' in line).split()[0]
+        self.command(f'click {middle_ref}')
+        self.assertIn('middle-clicked', self.command('get text')['text'])
+
+        self.command('scroll down 1000')
+        bottom_snapshot = self.command('snapshot -i')['text']
+        self.assertNotIn('Top viewport action', bottom_snapshot)
+        self.assertNotIn('Middle viewport action', bottom_snapshot)
+        self.assertIn('Bottom viewport action', bottom_snapshot)
+        bottom_ref = next(line for line in bottom_snapshot.splitlines() if 'Bottom viewport action' in line).split()[0]
         self.command(f'click {bottom_ref}')
         self.assertIn('bottom-clicked', self.command('get text')['text'])
 
@@ -1085,20 +1309,42 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command('click-css "#custom"')
         self.assertIn('custom-clicked', self.status())
 
+    def unlock_vision_fallback(self):
+        for count in range(1, 4):
+            blocked = self.command_raw('click-css "#pi-nodriver-missing-target"')
+            self.assertFalse(blocked['ok'])
+            self.assertIn(f'{count}/3', blocked['error'])
+        self.assertIn('VISION_FALLBACK_UNLOCKED', blocked['error'])
+
     def test_vision_correctness_marks_retries_and_confirms_before_coordinate_click(self):
         fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         self.command(f'open {fixture_url}')
         self.assertEqual(self.command('snapshot -i')['text'], '(no interactive elements)')
 
-        no_screenshot = self.command_raw('vision-mark 300 330')
-        self.assertFalse(no_screenshot['ok'])
-        self.assertIn('VISION_SCREENSHOT_REQUIRED', no_screenshot['error'])
+        self.command('screenshot')
+        locked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(locked['ok'])
+        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
+        self.assertIn('0/3', locked['error'])
 
         raw_click = self.command_raw('click 300 330')
         self.assertFalse(raw_click['ok'])
         self.assertIn('VISION_CLICK_GUARD', raw_click['error'])
         self.assertIn('vision-idle', self.command('get text')['text'])
 
+        still_locked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(still_locked['ok'])
+        self.assertIn('0/3', still_locked['error'])
+
+        for _ in range(3):
+            invalid_css = self.command_raw('click-css "["')
+            self.assertFalse(invalid_css['ok'])
+            self.assertIn('invalid CSS selector', invalid_css['error'])
+            self.assertNotIn('VISION_FALLBACK_PROGRESS', invalid_css['error'])
+        still_locked = self.command_raw('vision-mark 300 330')
+        self.assertIn('0/3', still_locked['error'])
+
+        self.unlock_vision_fallback()
         clean = self.command('screenshot')
         clean_bytes = Path(clean['screenshotPath']).read_bytes()
         wrong = self.command('vision-mark 60 180')
@@ -1122,9 +1368,22 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertFalse(reused['ok'])
         self.assertIn('current marked preview', reused['error'])
 
+    def test_successful_semantic_click_locks_vision_fallback_again(self):
+        self.open_fixture()
+        self.unlock_vision_fallback()
+        self.command('click-css "#custom"')
+        self.command('screenshot')
+
+        blocked = self.command_raw('vision-mark 300 330')
+
+        self.assertFalse(blocked['ok'])
+        self.assertIn('VISION_FALLBACK_LOCKED', blocked['error'])
+        self.assertIn('0/3', blocked['error'])
+
     def test_full_page_images_invalidate_existing_viewport_marker(self):
         fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         self.command(f'open {fixture_url}')
+        self.unlock_vision_fallback()
         self.command('screenshot')
         first = self.command('vision-mark 60 180')
 
@@ -1143,6 +1402,69 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('current marked preview', screenshot_blocked['error'])
         self.assertFalse(marker_blocked['ok'])
         self.assertIn('VISION_SCREENSHOT_REQUIRED', marker_blocked['error'])
+
+    def test_invalid_css_on_hidden_empty_document_does_not_unlock_vision_fallback(self):
+        fixture_url = (ROOT / 'tests/fixture_hidden_empty.html').as_uri()
+        self.command(f'open {fixture_url}')
+        for _ in range(3):
+            invalid_css = self.command_raw('click-css "["')
+            self.assertFalse(invalid_css['ok'])
+            self.assertIn('invalid CSS selector', invalid_css['error'])
+            self.assertNotIn('VISION_FALLBACK_PROGRESS', invalid_css['error'])
+        self.command('screenshot')
+        still_locked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(still_locked['ok'])
+        self.assertIn('VISION_FALLBACK_LOCKED', still_locked['error'])
+        self.assertIn('0/3', still_locked['error'])
+
+    def test_context_navigation_clears_failure_progress_on_return(self):
+        fixture_a = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
+        fixture_b = (ROOT / 'tests/fixture.html').as_uri()
+        self.command(f'open {fixture_a}')
+        self.unlock_vision_fallback()
+        self.command(f'open {fixture_b}')
+        self.command('get url')
+        self.command(f'open {fixture_a}')
+        self.command('screenshot')
+        locked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(locked['ok'])
+        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
+        self.assertIn('0/3', locked['error'])
+
+    def test_resolved_but_disabled_ref_resets_fallback_progress(self):
+        self.open_fixture()
+        for count in range(1, 3):
+            blocked = self.command_raw('click-css "#pi-nodriver-missing-target"')
+            self.assertFalse(blocked['ok'])
+            self.assertIn(f'{count}/3', blocked['error'])
+
+        snapshot = self.command('snapshot -i')['text']
+        go_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
+        disable_ref = next(line for line in snapshot.splitlines() if 'Disable go' in line).split()[0]
+        self.command(f'click {disable_ref}')
+
+        disabled_result = self.command_raw(f'click-js {go_ref}')
+        self.assertFalse(disabled_result['ok'])
+        self.assertIn('disabled', disabled_result['error'])
+
+        self.command('screenshot')
+        locked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(locked['ok'])
+        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
+        self.assertIn('0/3', locked['error'])
+
+    def test_vision_mark_requires_fresh_screenshot_after_unlocking_fallback(self):
+        fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
+        self.command(f'open {fixture_url}')
+        self.command('screenshot')
+        self.unlock_vision_fallback()
+        stale_shot_blocked = self.command_raw('vision-mark 300 330')
+        self.assertFalse(stale_shot_blocked['ok'])
+        self.assertIn('VISION_SCREENSHOT_REQUIRED', stale_shot_blocked['error'])
+
+        self.command('screenshot')
+        fresh_shot_ok = self.command('vision-mark 300 330')
+        self.assertEqual(fresh_shot_ok['action'], 'vision-mark')
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionPageState, format_snapshot, is_confident_option_match, map_screenshot_point_to_viewport, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -87,6 +87,91 @@ class VisionCommandParsingTests(unittest.TestCase):
         ):
             with self.subTest(parts=parts), self.assertRaisesRegex(ValueError, 'vision-click'):
                 parse_vision_click(parts)
+
+
+class VisionFallbackGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.guard = VisionFallbackGuard(threshold=3)
+        self.page = VisionFallbackContext('tab-a', 'https://example.test/', 'loader-a')
+
+    def test_stays_locked_until_three_semantic_click_failures(self):
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', self.page)
+
+        self.assertEqual(self.guard.record_failure('session-a', self.page), (1, False))
+        self.assertEqual(self.guard.record_failure('session-a', self.page), (2, False))
+        self.assertEqual(self.guard.record_failure('session-a', self.page), (3, True))
+        self.guard.require_unlocked('session-a', self.page)
+
+    def test_different_page_does_not_inherit_unlock(self):
+        for _ in range(3):
+            self.guard.record_failure('session-a', self.page)
+        other = VisionFallbackContext('tab-b', 'https://example.test/next', 'loader-b')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', other)
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', self.page)
+
+    def test_same_url_reload_does_not_inherit_unlock(self):
+        for _ in range(3):
+            self.guard.record_failure('session-a', self.page)
+        reloaded = VisionFallbackContext('tab-a', self.page.url, 'loader-b')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', reloaded)
+
+    def test_success_reset_locks_fallback_again(self):
+        for _ in range(3):
+            self.guard.record_failure('session-a', self.page)
+        self.guard.reset('session-a')
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', self.page)
+
+    def test_observe_context_clears_failures_when_context_changes(self):
+        for _ in range(3):
+            self.guard.record_failure('session-a', self.page)
+        other = VisionFallbackContext('tab-b', 'https://example.test/other', 'loader-b')
+        self.guard.observe_context('session-a', other)
+
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', self.page)
+        with self.assertRaisesRegex(ValueError, r'0/3'):
+            self.guard.require_unlocked('session-a', other)
+
+    def test_observe_context_keeps_failures_when_context_matches(self):
+        self.guard.record_failure('session-a', self.page)
+        self.guard.observe_context('session-a', self.page)
+        self.assertEqual(self.guard.record_failure('session-a', self.page), (2, False))
+
+    def test_threshold_is_fixed_at_three(self):
+        for threshold in (0, 1, 2, 4, 11):
+            with self.subTest(threshold=threshold), self.assertRaisesRegex(ValueError, 'fixed at 3'):
+                VisionFallbackGuard(threshold=threshold)
+
+    def test_only_well_formed_semantic_clicks_count_as_attempts(self):
+        accepted = [
+            ['click', '@e1'],
+            ['click-js', '@e1'],
+            ['click-text', 'Checkout'],
+            ['click-css', '#checkout'],
+        ]
+        rejected = [
+            ['click', '20', '30'],
+            ['click'],
+            ['click-js', 'button'],
+            ['click-text'],
+            ['click-css', ''],
+            ['vision-click', '0123456789abcdef01234567'],
+        ]
+
+        for parts in accepted:
+            with self.subTest(parts=parts):
+                self.assertTrue(is_semantic_click_attempt(parts))
+        for parts in rejected:
+            with self.subTest(parts=parts):
+                self.assertFalse(is_semantic_click_attempt(parts))
 
 
 class VisionCoordinateMappingTests(unittest.TestCase):
