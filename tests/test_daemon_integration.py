@@ -94,7 +94,7 @@ class DaemonIntegrationTests(unittest.TestCase):
 
         def wait_in_session_a():
             started.set()
-            return self.command('wait 2500', request_id=3, session_id='session-a')
+            return self.command_raw('wait-popup 2500', request_id=3, session_id='session-a')
 
         thread = threading.Thread(target=wait_in_session_a)
         thread.start()
@@ -113,7 +113,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         self.command(f'open {fixture_url}', session_id='session-a')
 
-        timed_out = self.command_raw('wait 5000', request_id=2, session_id='session-a')
+        timed_out = self.command_raw('wait-popup 5000', request_id=2, session_id='session-a')
         recovered = self.command('get text', request_id=3, session_id='session-a')
 
         self.assertFalse(timed_out['ok'])
@@ -128,7 +128,7 @@ class DaemonIntegrationTests(unittest.TestCase):
             client.settimeout(3)
             client.connect(str(self.socket_path))
             stream = client.makefile()
-            wait_request = {'id': 2, 'command': 'wait 5000', 'sessionId': 'session-a'}
+            wait_request = {'id': 2, 'command': 'wait-popup 5000', 'sessionId': 'session-a'}
             cancel_request = {'id': 3, 'cancelId': 2, 'sessionId': 'session-a'}
             client.sendall((json.dumps(wait_request) + '\n').encode())
             time.sleep(0.2)
@@ -301,9 +301,8 @@ class DaemonIntegrationTests(unittest.TestCase):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
         self.command(f'open {fixture_url}')
-        old_snapshot = self.command('snapshot -i', request_id=2)['text']
-        stale_ref = next(line for line in old_snapshot.splitlines() if 'Go now' in line).split()[0]
         self.command(f'open {overlay_url}', request_id=3)
+        stale_ref = '@e999'
 
         recovery = self.command_raw(f'click {stale_ref}', request_id=4)
         guarded_failure = self.command_raw(f'click {stale_ref}', request_id=5)
