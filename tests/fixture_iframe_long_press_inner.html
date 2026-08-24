@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<body>
+<button id="nested-hold" style="margin:60px 0 0 280px;width:100px">Nested hold target</button>
+<script>
+  const target = document.querySelector('#nested-hold');
+  target.addEventListener('touchstart', () => window.holdStartedAt = performance.now());
+  target.addEventListener('touchend', () => {
+    if (performance.now() - (window.holdStartedAt || performance.now()) >= 450) {
+      target.textContent = 'Nested long-pressed';
+    }
+  });
+</script>
+</body>
+</html>

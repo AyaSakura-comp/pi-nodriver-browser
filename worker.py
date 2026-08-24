@@ -17,13 +17,13 @@ from pathlib import Path
 
 import nodriver as uc
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, format_snapshot, is_confident_option_match, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, challenge_context_reason, format_snapshot, is_confident_option_match, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_long_press, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fill',
-    'fill-submit', 'fill_submit', 'find-option', 'get', 'mobile', 'open', 'press', 'screenshot',
+    'fill-submit', 'fill_submit', 'find-option', 'get', 'long-press', 'mobile', 'open', 'press', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
     'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
@@ -127,9 +127,129 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   };
 })(__PI_COOKIE_POLICY__))'''
 
+CHALLENGE_CONTEXT_JS = r'''JSON.stringify(((point) => {
+  const selectors = [
+    '.g-recaptcha', '.h-captcha', '.cf-turnstile', '[data-sitekey]',
+    'iframe[src*="recaptcha" i]', 'iframe[src*="hcaptcha" i]',
+    'iframe[src*="arkoselabs" i]', 'iframe[src*="funcaptcha" i]',
+    'iframe[src*="challenge" i]', 'iframe[src*="turnstile" i]',
+    'iframe[src*="captcha" i]'
+  ].join(',');
+  const textMarkers = [
+    'verify you are human', 'please verify you are a human', 'are you a human',
+    'are you human', 'prove you are human', 'just a moment',
+    'checking your browser', 'attention required', 'complete the security check',
+    'security verification', 'unusual traffic', 'cloudflare ray id',
+    '您是人還是機器人', '按住不放', 'press and hold'
+  ];
+  const matches = new Set();
+  const indicators = [];
+  const seenDocuments = new WeakSet();
+  const seenRoots = new WeakSet();
+
+  const scanText = value => {
+    const normalized = String(value || '').normalize('NFKC').toLowerCase();
+    for (const marker of textMarkers) {
+      if (normalized.includes(marker)) matches.add(marker);
+    }
+  };
+  const describe = element => [
+    element.tagName,
+    element.id,
+    typeof element.className === 'string' ? element.className : '',
+    element.getAttribute?.('src'),
+    element.getAttribute?.('title'),
+    element.getAttribute?.('aria-label')
+  ].filter(Boolean).join(' ');
+
+  const visitRoot = root => {
+    if (!root || seenRoots.has(root)) return;
+    seenRoots.add(root);
+    try {
+      root.querySelectorAll(selectors).forEach(element => {
+        matches.add('challenge widget selector');
+        if (indicators.length < 50) indicators.push(describe(element));
+      });
+      root.querySelectorAll('*').forEach(element => {
+        if (element.shadowRoot) {
+          scanText(element.shadowRoot.textContent);
+          visitRoot(element.shadowRoot);
+        }
+      });
+    } catch (_) {}
+  };
+
+  const visitDocument = doc => {
+    if (!doc || seenDocuments.has(doc)) return;
+    seenDocuments.add(doc);
+    scanText(doc.body?.innerText);
+    visitRoot(doc);
+    let frames = [];
+    try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) {}
+    for (const frame of frames) {
+      if (indicators.length < 50) indicators.push(describe(frame));
+      try {
+        const child = frame.contentDocument;
+        if (child?.documentElement) visitDocument(child);
+      } catch (_) {}
+    }
+  };
+  visitDocument(document);
+
+  const deepestHit = (root, x, y) => {
+    let hit = null;
+    try { hit = root.elementFromPoint(x, y); } catch (_) { return null; }
+    for (let depth = 0; hit?.shadowRoot && depth < 12; depth++) {
+      let nested = null;
+      try { nested = hit.shadowRoot.elementFromPoint(x, y); } catch (_) {}
+      if (!nested || nested === hit) break;
+      hit = nested;
+    }
+    return hit;
+  };
+
+  let iframeHit = false;
+  let crossOriginHit = false;
+  if (point && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+    let doc = document;
+    let x = point.x;
+    let y = point.y;
+    for (let depth = 0; depth < 12; depth++) {
+      const hit = deepestHit(doc, x, y);
+      if (!hit || hit.tagName !== 'IFRAME') break;
+      iframeHit = true;
+      let child = null;
+      try { child = hit.contentDocument; } catch (_) {}
+      if (!child?.documentElement) {
+        crossOriginHit = true;
+        break;
+      }
+      const rect = hit.getBoundingClientRect();
+      const outerScaleX = hit.offsetWidth ? rect.width / hit.offsetWidth : 1;
+      const outerScaleY = hit.offsetHeight ? rect.height / hit.offsetHeight : 1;
+      const contentWidth = Math.max(1, hit.clientWidth * outerScaleX);
+      const contentHeight = Math.max(1, hit.clientHeight * outerScaleY);
+      const childWidth = Math.max(1, hit.contentWindow?.innerWidth || hit.clientWidth);
+      const childHeight = Math.max(1, hit.contentWindow?.innerHeight || hit.clientHeight);
+      x = (x - rect.left - hit.clientLeft * outerScaleX) * childWidth / contentWidth;
+      y = (y - rect.top - hit.clientTop * outerScaleY) * childHeight / contentHeight;
+      doc = child;
+    }
+  }
+
+  return {
+    inspectionComplete: true,
+    matches: Array.from(matches),
+    indicators: indicators.join('\n'),
+    iframeHit,
+    crossOriginHit
+  };
+})(__PI_LONG_PRESS_POINT__))'''
+
 SNAPSHOT_JS = r'''JSON.stringify((() => {
   const seen = new Set();
   const entries = [];
+  const resetDocuments = new WeakSet();
   const semanticSelector = 'a,button,input,textarea,select,summary,details,label,' +
     '[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],' +
     '[role="checkbox"],[role="radio"],[role="switch"],[contenteditable="true"]';
@@ -188,6 +308,11 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
   };
   const visit = (root, frames = []) => {
     try {
+      const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
+      if (doc?.defaultView && !resetDocuments.has(doc)) {
+        resetDocuments.add(doc);
+        doc.defaultView.__piSnapshotRefElements = new Map();
+      }
       root.querySelectorAll('[data-pi-ref]').forEach(el => el.removeAttribute('data-pi-ref'));
       root.querySelectorAll('*').forEach(el => {
         if (!seen.has(el) && visible(el) && interactive(el)) {
@@ -206,6 +331,7 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
   return entries.map(({ el, frames }, index) => {
     const ref = `e${index + 1}`;
     el.setAttribute('data-pi-ref', ref);
+    try { el.ownerDocument.defaultView.__piSnapshotRefElements.set(ref, el); } catch (_) {}
     const frame = frames.map(item => {
       const named = item.getAttribute('title') || item.getAttribute('aria-label') || item.name || item.id;
       if (named) return named;
@@ -331,6 +457,33 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
         el.ownerDocument.defaultView.getComputedStyle(el).cursor
       ));
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const hasUnsafeTransform = element => {
+    for (let node = element; node; node = node.parentElement) {
+      try {
+        const view = node.ownerDocument.defaultView;
+        const style = view.getComputedStyle(node);
+        const rotate = String(style.rotate || 'none').trim().toLowerCase();
+        const scale = String(style.scale || 'none').trim().toLowerCase();
+        const perspective = String(style.perspective || 'none').trim().toLowerCase();
+        const offsetPath = String(style.offsetPath || 'none').trim().toLowerCase();
+        const hasIndividualTransform =
+          !['none', '0', '0deg'].includes(rotate) ||
+          !['none', '1', '1 1'].includes(scale) ||
+          perspective !== 'none' || offsetPath !== 'none';
+        if (hasIndividualTransform) return true;
+        const transform = style.transform;
+        if (!transform || transform === 'none') continue;
+        const matrix = new view.DOMMatrix(transform);
+        const reflectedOrReversed = matrix.a <= 0 || matrix.d <= 0 ||
+          matrix.a * matrix.d - matrix.b * matrix.c <= 0;
+        if (!matrix.is2D || reflectedOrReversed ||
+            Math.abs(matrix.b) > 0.0001 || Math.abs(matrix.c) > 0.0001) {
+          return true;
+        }
+      } catch (_) { return true; }
+    }
+    return false;
+  };
   const entries = [];
 
   const visit = (root, offsetX = 0, offsetY = 0, frames = []) => {
@@ -351,7 +504,12 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
 
   let match = null;
   if (request.kind === 'ref') {
-    match = entries.find(item => item.el.getAttribute('data-pi-ref') === request.value) || null;
+    match = entries.find(item => {
+      try {
+        const registry = item.el.ownerDocument.defaultView.__piSnapshotRefElements;
+        return registry instanceof Map && registry.get(request.value) === item.el;
+      } catch (_) { return false; }
+    }) || null;
   } else if (request.kind === 'css') {
     match = entries.find(item => {
       try { return item.el.matches(request.value); } catch (_) { return false; }
@@ -387,14 +545,35 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
   for (const frame of match.frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
   match.el.scrollIntoView({ block: 'center', inline: 'center' });
   const rect = match.el.getBoundingClientRect();
-  const currentOffset = match.frames.reduce((offset, frame) => {
-    const frameRect = frame.getBoundingClientRect();
-    return { x: offset.x + frameRect.left, y: offset.y + frameRect.top };
-  }, { x: 0, y: 0 });
+  let point = {
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2
+  };
+  let coordinateSafe = !hasUnsafeTransform(match.el);
+  for (const frame of [...match.frames].reverse()) {
+    try {
+      const frameRect = frame.getBoundingClientRect();
+      const outerScaleX = frame.offsetWidth ? frameRect.width / frame.offsetWidth : 1;
+      const outerScaleY = frame.offsetHeight ? frameRect.height / frame.offsetHeight : 1;
+      const contentWidth = Math.max(1, frame.clientWidth * outerScaleX);
+      const contentHeight = Math.max(1, frame.clientHeight * outerScaleY);
+      const childWidth = Math.max(1, frame.contentWindow.innerWidth || frame.clientWidth);
+      const childHeight = Math.max(1, frame.contentWindow.innerHeight || frame.clientHeight);
+      if (hasUnsafeTransform(frame)) coordinateSafe = false;
+      point = {
+        x: frameRect.left + frame.clientLeft * outerScaleX + point.x * contentWidth / childWidth,
+        y: frameRect.top + frame.clientTop * outerScaleY + point.y * contentHeight / childHeight
+      };
+    } catch (_) {
+      coordinateSafe = false;
+    }
+  }
   return {
     found: true,
-    x: currentOffset.x + rect.left + rect.width / 2,
-    y: currentOffset.y + rect.top + rect.height / 2,
+    x: point.x,
+    y: point.y,
+    coordinateSafe,
+    frameDepth: match.frames.length,
     tag: match.el.tagName.toLowerCase(),
     text: (match.el.innerText || match.el.textContent || match.el.value || '').trim(),
     href: match.el.href || match.el.closest?.('a')?.href || '',
@@ -1532,6 +1711,53 @@ class BrowserWorker:
             raise ValueError(f'click target not found by {kind}: {value}')
         return result
 
+    async def assert_long_press_allowed(self, page, x=None, y=None, block_iframe_hit=False):
+        reason = challenge_context_reason(page.url)
+        if reason:
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: long-press is disabled on CAPTCHA and '
+                f'challenge contexts ({reason}). Complete the challenge manually in the '
+                'headful Chrome session, then continue with semantic browser commands.'
+            )
+        point = None if x is None or y is None else {'x': float(x), 'y': float(y)}
+        script = CHALLENGE_CONTEXT_JS.replace(
+            '__PI_LONG_PRESS_POINT__',
+            json.dumps(point),
+        )
+        try:
+            context = json.loads(await page.evaluate(script))
+        except Exception as error:
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: challenge inspection could not complete; '
+                'long-press fails closed without dispatching input'
+            ) from error
+        if not isinstance(context, dict) or context.get('inspectionComplete') is not True:
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: challenge inspection returned an incomplete '
+                'result; long-press fails closed without dispatching input'
+            )
+        reason = challenge_context_reason(
+            page.url,
+            f"{' '.join(context.get('matches', []))}\n{context.get('indicators', '')}",
+        )
+        if reason:
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: long-press is disabled on CAPTCHA and '
+                f'challenge contexts ({reason}). Complete the challenge manually in the '
+                'headful Chrome session, then continue with semantic browser commands.'
+            )
+        if context.get('crossOriginHit'):
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: coordinate long-press on a cross-origin iframe '
+                'is ambiguous and is blocked without dispatching input'
+            )
+        if block_iframe_hit and context.get('iframeHit'):
+            raise ValueError(
+                'LONG_PRESS_CHALLENGE_GUARD: coordinate long-press through an iframe is '
+                'ambiguous and is blocked; use a semantic @ref from snapshot -i instead'
+            )
+        return context
+
     @staticmethod
     def is_owned_popup(opener, popup):
         return popup.target.opener_id == opener.target.target_id
@@ -1548,6 +1774,23 @@ class BrowserWorker:
             if page not in self.browser.tabs:
                 return False
             raise TimeoutError('native mouse click did not complete')
+
+    async def native_long_press(self, page, x, y, duration_ms, block_iframe_hit=False):
+        await page.bring_to_front()
+        await self.assert_long_press_allowed(page, x, y, block_iframe_hit)
+        touch = uc.cdp.input_.TouchPoint(
+            x=float(x),
+            y=float(y),
+            radius_x=1.0,
+            radius_y=1.0,
+            force=1.0,
+            id_=0.0,
+        )
+        try:
+            await page.send(uc.cdp.input_.dispatch_touch_event('touchStart', [touch]))
+            await page.sleep(duration_ms / 1000)
+        finally:
+            await page.send(uc.cdp.input_.dispatch_touch_event('touchEnd', []))
 
     async def native_click(self, page, x, y):
         minimum_settle_seconds = 0.1
@@ -1701,7 +1944,7 @@ class BrowserWorker:
                 history.append(f'scroll-{direction}')
             elif action == 'screenshot':
                 history.append('screenshot')
-            elif action in ('click', 'click-text', 'click-css', 'fill', 'open', 'type', 'select', 'press'):
+            elif action in ('click', 'click-text', 'click-css', 'fill', 'long-press', 'open', 'type', 'select', 'press'):
                 self.scroll_history[session_id] = []
                 history = []
 
@@ -1751,10 +1994,10 @@ class BrowserWorker:
         parts = parse_command(command)
         action = parts[0].lower()
         self.track_repeat(session_id, action, parts)
-        if action in {'click', 'click-js', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
+        if action in {'click', 'click-js', 'long-press', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
             self.scroll_history[session_id] = []
         uses_ref = (
-            (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
+            (action in {'click', 'click-js', 'download', 'download-info', 'long-press'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action in {'fill', 'type', 'select', 'upload'} and len(parts) > 1)
             or (action in {'fill-submit', 'fill_submit'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action == 'get' and len(parts) > 2 and parts[2].startswith('@'))
@@ -2077,6 +2320,57 @@ class BrowserWorker:
                 baseline_guids, before_files, timeout_ms, session_id
             )
             return self.download_response(record, action, session_id)
+
+        if action == 'long-press':
+            press = parse_long_press(parts)
+            page = await self.require_page(session_id)
+            if press['kind'] == 'ref':
+                target = await self.resolve_click_target(
+                    page,
+                    'ref',
+                    press['ref'].removeprefix('@'),
+                    session_id,
+                )
+                if not target.get('coordinateSafe', True):
+                    raise ValueError(
+                        'long-press target uses a rotated or otherwise unsafe iframe coordinate '
+                        'transform; use the current viewport and an accessible untransformed target'
+                    )
+                x, y = target['x'], target['y']
+                description = (
+                    f"{press['ref']} ({target.get('tag', 'element')}: "
+                    f"{target.get('text', '')[:120]})"
+                )
+            else:
+                x, y = press['x'], press['y']
+                viewport = json.loads(await page.evaluate(
+                    "JSON.stringify({width: window.innerWidth, height: window.innerHeight})"
+                ))
+                if x >= viewport['width'] or y >= viewport['height']:
+                    raise ValueError(
+                        f"long-press coordinates ({x:g}, {y:g}) are outside the current "
+                        f"{viewport['width']}x{viewport['height']} viewport"
+                    )
+                description = f'viewport coordinates ({x:g}, {y:g})'
+
+            await self.configure_download_session(session_id, page)
+            await self.native_long_press(
+                page,
+                x,
+                y,
+                press['durationMs'],
+                block_iframe_hit=press['kind'] == 'coordinates',
+            )
+            self.touch_tab(page)
+            return {
+                'text': (
+                    f"Long-pressed {description} for {press['durationMs']}ms\n"
+                    f'URL: {page.url}'
+                ),
+                'action': action,
+                'url': page.url,
+                'durationMs': press['durationMs'],
+            }
 
         if action == 'click':
             page = await self.require_page(session_id)
@@ -2855,7 +3149,7 @@ async def server_main(socket_path):
                         response = await execute_request(worker, request)
                 else:
                     async with session_lock:
-                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'download', 'press', 'close'}:
+                        if action in {'open', 'click', 'click-text', 'click-css', 'click-js', 'long-press', 'download', 'press', 'close'}:
                             async with browser_structure_lock:
                                 response = await execute_request(worker, request)
                         else:

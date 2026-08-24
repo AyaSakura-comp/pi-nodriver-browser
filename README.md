@@ -431,6 +431,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
 | **`click`** | `click <@ref>` | Clicks snapshot element (auto-returns updated DOM snapshot) | Interactive Tab |
 | **`click` (coords)** | `click <x> <y>` | Last-resort viewport coordinates after semantic refs/text/CSS fail; intended for canvas or inaccessible visual-only controls | Interactive Tab |
+| **`long-press`** | `long-press <@ref\|x y> [--ms=1000]` | Holds mobile touch input for 100–5000ms and always releases it; semantic refs are preferred and CAPTCHA/challenge contexts return `LONG_PRESS_CHALLENGE_GUARD` | Interactive Tab |
 | **`fill`** | `fill <@ref> <text>` | Clears input field and types text | Interactive Tab |
 | **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
 | **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |
@@ -496,7 +497,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **124 tests**: 74 fast tests run by default and 50 real-browser tests are skipped unless explicitly enabled.
+The current suite contains **143 tests**: 82 fast tests run by default and 61 real-browser tests are skipped unless explicitly enabled.
 
 ### Real Headful Chrome / Xvfb Suite
 

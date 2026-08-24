@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import http.server
 import json
@@ -54,6 +55,113 @@ class CloseFailingPage(FakePage):
 class CloseIgnoringPage(FakePage):
     async def close(self):
         return None
+
+
+class FakeLongPressPage:
+    url = 'https://example.test/ordinary-control'
+
+    def __init__(self, fail_during_hold=False, fail_touch_start=False, cancel_during_hold=False):
+        self.fail_during_hold = fail_during_hold
+        self.fail_touch_start = fail_touch_start
+        self.cancel_during_hold = cancel_during_hold
+        self.commands = []
+        self.sleep_seconds = []
+
+    async def bring_to_front(self):
+        return None
+
+    async def evaluate(self, _script):
+        return json.dumps({
+            'inspectionComplete': True,
+            'matches': [],
+            'indicators': '',
+            'crossOriginHit': False,
+        })
+
+    async def send(self, command):
+        request = next(command)
+        self.commands.append(request)
+        if self.fail_touch_start and len(self.commands) == 1:
+            raise RuntimeError('touch start interrupted')
+        try:
+            command.send({})
+        except StopIteration as result:
+            return result.value
+        raise AssertionError('CDP command did not finish')
+
+    async def sleep(self, seconds):
+        self.sleep_seconds.append(seconds)
+        if self.fail_during_hold:
+            raise RuntimeError('hold interrupted')
+        if self.cancel_during_hold:
+            raise asyncio.CancelledError()
+
+
+class FailingChallengeInspectionPage:
+    url = 'https://example.test/ordinary-looking-path'
+
+    async def evaluate(self, _script):
+        raise RuntimeError('execution context disappeared')
+
+
+class LongPressInputUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_mobile_touch_start_and_end_for_requested_duration(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakeLongPressPage()
+
+        await worker.native_long_press(page, 120.5, 300, 750)
+
+        self.assertEqual(page.sleep_seconds, [0.75])
+        self.assertEqual(
+            [command['method'] for command in page.commands],
+            ['Input.dispatchTouchEvent', 'Input.dispatchTouchEvent'],
+        )
+        self.assertEqual(page.commands[0]['params']['type'], 'touchStart')
+        self.assertEqual(page.commands[0]['params']['touchPoints'][0]['x'], 120.5)
+        self.assertEqual(page.commands[1]['params'], {'type': 'touchEnd', 'touchPoints': []})
+
+    async def test_challenge_inspection_fails_closed(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+
+        with self.assertRaisesRegex(ValueError, 'LONG_PRESS_CHALLENGE_GUARD'):
+            await worker.assert_long_press_allowed(FailingChallengeInspectionPage())
+
+    async def test_attempts_release_when_touch_start_request_is_interrupted(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakeLongPressPage(fail_touch_start=True)
+
+        with self.assertRaisesRegex(RuntimeError, 'touch start interrupted'):
+            await worker.native_long_press(page, 10, 20, 500)
+
+        self.assertEqual(page.commands[-1]['params'], {'type': 'touchEnd', 'touchPoints': []})
+
+    async def test_releases_touch_when_command_is_cancelled(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakeLongPressPage(cancel_during_hold=True)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.native_long_press(page, 10, 20, 500)
+
+        self.assertEqual(page.commands[-1]['params'], {'type': 'touchEnd', 'touchPoints': []})
+
+    async def test_releases_touch_when_hold_is_interrupted(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakeLongPressPage(fail_during_hold=True)
+
+        with self.assertRaisesRegex(RuntimeError, 'hold interrupted'):
+            await worker.native_long_press(page, 10, 20, 500)
+
+        self.assertEqual(page.commands[-1]['params'], {'type': 'touchEnd', 'touchPoints': []})
 
 
 class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -543,6 +651,225 @@ class WorkerIntegrationTests(unittest.TestCase):
         time.sleep(0.2)
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
+
+    def test_long_press_holds_a_semantic_ref_with_touch_input(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        hold_ref = next(line for line in snapshot.splitlines() if 'Hold for action' in line).split()[0]
+
+        result = self.command(f'long-press {hold_ref} --ms=600')
+
+        self.assertIn('Long-pressed', result['text'])
+        self.assertIn('long-pressed', self.command('get text')['text'])
+
+    def test_long_press_rejects_ref_reassigned_after_snapshot(self):
+        self.open_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        hold_ref = next(line for line in snapshot.splitlines() if 'Hold for action' in line).split()[0]
+        replace_ref = next(
+            line for line in snapshot.splitlines() if 'Replace hold target' in line
+        ).split()[0]
+
+        self.command(f'click {replace_ref}')
+        stale = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+        self.assertTrue(stale['ok'])
+        self.assertEqual(stale['action'], 'stale-ref-recovery')
+        self.assertIn('CLICK NOT PERFORMED', stale['text'])
+
+    def test_long_press_maps_nested_scaled_iframe_ref_to_mobile_viewport(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(
+                f'open http://127.0.0.1:{server.server_port}/fixture_iframe_long_press.html'
+            )
+            snapshot = self.command('snapshot -i')['text']
+            hold_ref = next(
+                line for line in snapshot.splitlines() if 'Nested hold target' in line
+            ).split()[0]
+
+            self.command(f'long-press {hold_ref} --ms=600')
+
+            updated = self.command('snapshot -i')['text']
+            self.assertIn('Nested long-pressed', updated)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_long_press_refuses_reflected_iframe_coordinates(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(
+                f'open http://127.0.0.1:{server.server_port}/fixture_iframe_reflected.html'
+            )
+            snapshot = self.command('snapshot -i')['text']
+            hold_ref = next(
+                line for line in snapshot.splitlines() if 'Nested hold target' in line
+            ).split()[0]
+
+            blocked = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('unsafe iframe coordinate transform', blocked['error'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_long_press_refuses_iframe_with_transformed_ancestor(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(
+                f'open http://127.0.0.1:{server.server_port}/fixture_iframe_ancestor_transformed.html'
+            )
+            snapshot = self.command('snapshot -i')['text']
+            hold_ref = next(
+                line for line in snapshot.splitlines() if 'Nested hold target' in line
+            ).split()[0]
+
+            blocked = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('unsafe iframe coordinate transform', blocked['error'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_long_press_refuses_challenge_pages(self):
+        challenge_url = (ROOT / 'tests/fixture_challenge.html').as_uri()
+        self.command(f'open {challenge_url}')
+        snapshot = self.command('snapshot -i')['text']
+        hold_ref = next(line for line in snapshot.splitlines() if 'Press and hold' in line).split()[0]
+
+        blocked = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+        self.assertFalse(blocked['ok'])
+        self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+        self.assertIn('challenge-idle', self.command('get text')['text'])
+
+    def test_long_press_detects_challenge_text_beyond_large_page_content(self):
+        fixture_url = (ROOT / 'tests/fixture_deep_challenge.html').as_uri()
+        self.command(f'open {fixture_url}')
+        snapshot = self.command('snapshot -i')['text']
+        hold_ref = next(line for line in snapshot.splitlines() if 'Continue deep form' in line).split()[0]
+
+        blocked = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+        self.assertFalse(blocked['ok'])
+        self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+
+    def test_long_press_refuses_challenge_text_inside_same_origin_iframe(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command(
+                f'open http://127.0.0.1:{server.server_port}/fixture_embedded_form.html'
+            )
+            snapshot = self.command('snapshot -i')['text']
+            hold_ref = next(line for line in snapshot.splitlines() if 'Continue' in line).split()[0]
+
+            blocked = self.command_raw(f'long-press {hold_ref} --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_long_press_refuses_coordinates_over_cross_origin_iframe(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        outer_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        frame_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        outer_thread = threading.Thread(target=outer_server.serve_forever, daemon=True)
+        frame_thread = threading.Thread(target=frame_server.serve_forever, daemon=True)
+        outer_thread.start()
+        frame_thread.start()
+        try:
+            frame_url = f'http://127.0.0.1:{frame_server.server_port}/fixture.html'
+            self.command(
+                f'open http://127.0.0.1:{outer_server.server_port}/fixture_cross_origin_frame.html?src={frame_url}'
+            )
+
+            blocked = self.command_raw('long-press 100 100 --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+            self.assertIn('cross-origin iframe', blocked['error'])
+        finally:
+            outer_server.shutdown()
+            frame_server.shutdown()
+            outer_server.server_close()
+            frame_server.server_close()
+            outer_thread.join(timeout=2)
+            frame_thread.join(timeout=2)
+
+    def test_long_press_refuses_coordinates_through_transformed_nested_iframe(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        outer_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        frame_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        outer_thread = threading.Thread(target=outer_server.serve_forever, daemon=True)
+        frame_thread = threading.Thread(target=frame_server.serve_forever, daemon=True)
+        outer_thread.start()
+        frame_thread.start()
+        try:
+            frame_url = f'http://127.0.0.1:{frame_server.server_port}/fixture.html'
+            self.command(
+                f'open http://127.0.0.1:{outer_server.server_port}/fixture_transformed_nested_frame.html?src={frame_url}'
+            )
+
+            blocked = self.command_raw('long-press 100 100 --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+            self.assertIn('iframe', blocked['error'])
+        finally:
+            outer_server.shutdown()
+            frame_server.shutdown()
+            outer_server.server_close()
+            frame_server.server_close()
+            outer_thread.join(timeout=2)
+            frame_thread.join(timeout=2)
+
+    def test_long_press_refuses_cross_origin_iframe_inside_open_shadow_root(self):
+        handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=str(ROOT / 'tests'))
+        outer_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        frame_server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        outer_thread = threading.Thread(target=outer_server.serve_forever, daemon=True)
+        frame_thread = threading.Thread(target=frame_server.serve_forever, daemon=True)
+        outer_thread.start()
+        frame_thread.start()
+        try:
+            frame_url = f'http://127.0.0.1:{frame_server.server_port}/fixture.html'
+            self.command(
+                f'open http://127.0.0.1:{outer_server.server_port}/fixture_shadow_cross_origin_frame.html?src={frame_url}'
+            )
+
+            blocked = self.command_raw('long-press 100 100 --ms=600')
+
+            self.assertFalse(blocked['ok'])
+            self.assertIn('LONG_PRESS_CHALLENGE_GUARD', blocked['error'])
+            self.assertIn('cross-origin iframe', blocked['error'])
+        finally:
+            outer_server.shutdown()
+            frame_server.shutdown()
+            outer_server.server_close()
+            frame_server.server_close()
+            outer_thread.join(timeout=2)
+            frame_thread.join(timeout=2)
 
     def test_snapshot_lists_only_interactive_objects_in_the_current_viewport(self):
         fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()

@@ -1,0 +1,9 @@
+<!doctype html>
+<html>
+<body style="margin:0">
+<iframe id="external" title="External embedded surface" style="width:300px;height:300px;border:0"></iframe>
+<script>
+  document.querySelector('#external').src = new URL(location.href).searchParams.get('src');
+</script>
+</body>
+</html>

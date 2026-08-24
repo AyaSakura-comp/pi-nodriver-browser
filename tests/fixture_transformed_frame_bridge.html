@@ -1,0 +1,7 @@
+<!doctype html>
+<html>
+<body style="margin:0">
+<iframe id="nested" style="width:300px;height:300px;border:0"></iframe>
+<script>document.querySelector('#nested').src = new URL(location.href).searchParams.get('src');</script>
+</body>
+</html>
