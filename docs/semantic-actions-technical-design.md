@@ -103,6 +103,12 @@ A frame path uses, in priority order:
 
 Anonymous iframe labels intentionally omit path and query data so sensitive URL parameters are not copied into model context.
 
+### Command preflight and stale-target isolation
+
+Every supported command first validates the preflight deadline before open/repeat/activity bookkeeping or page-less browser initialization. When a session owns a page, the worker then captures the trusted page/loader context used by the vision-fallback guard. This CDP preflight has a bounded deadline: 2 seconds by default, configurable with the positive finite-seconds `PI_NODRIVER_PREFLIGHT_TIMEOUT` environment variable. At the deadline the worker cancels the detached preflight task and tracks it for eventual result consumption without awaiting cancellation completion, quarantines only that session's poisoned page mapping, releases its active-target accounting, invalidates session-scoped vision state, and restores the newest live popup opener when one exists. Every `close` is bound to the page captured before preflight. If reconciliation replaces that mapping while preflight is running, close never re-resolves against the replacement—regardless of whether preflight succeeds, reaches its deadline, or raises a task-level error—so a restored healthy opener is not closed accidentally. Normal popup closure and deadline quarantine both preserve an immediate `wait-popup-close` acknowledgement; that acknowledgement is consumed before inspecting older opener-stack entries, so nested recovery reports the child closed instead of waiting on its live parent. A live poisoned target remains marked as quarantined and is excluded from popup admission until Chrome reports it gone or LRU eviction closes it, preventing `wait-popup` from attaching the session to the same target again.
+
+Quarantine does not claim that Chrome closed the target. A target that Chrome still reports as live remains registered with its original ownership so it continues to count toward the global tab cap, remains eligible for normal LRU handling, and retains any in-progress download and frame routes. Reconciliation removes its registry metadata only after Chrome reports it gone. Preflight task errors—including an `asyncio.TimeoutError` raised by the context operation rather than by the worker deadline—retain the current page and preserve the previous best-effort behavior.
+
 ### Action-time resolution
 
 `REF_ACTION_JS` recursively searches the current DOM for the requested ref. Before an action, it verifies:

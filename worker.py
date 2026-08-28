@@ -42,6 +42,10 @@ class SemanticClickTargetError(ValueError):
     pass
 
 
+class _PreflightDeadlineExpired(Exception):
+    pass
+
+
 # Commands that observe the page without changing it. Repeating one of these
 # verbatim cannot produce new information, so an identical repeat is a loop.
 NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'vision-mark', 'get', 'downloads', 'download-info', 'find-option'}
@@ -767,6 +771,8 @@ class BrowserWorker:
         self.tab_management_lock = asyncio.Lock()
         self.active_target_counts = {}
         self.session_action_targets = {}
+        self.detached_preflight_tasks = set()
+        self.quarantined_target_ids = set()
         self.scroll_history = {}
         configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
         self.download_dir = (
@@ -793,6 +799,49 @@ class BrowserWorker:
     async def vision_fallback_context(self, page):
         state = await self.vision_page_state(page)
         return VisionFallbackContext(state.target_id, state.url, state.loader_id)
+
+    @staticmethod
+    def preflight_timeout_seconds():
+        try:
+            timeout = float(os.environ.get('PI_NODRIVER_PREFLIGHT_TIMEOUT', '2'))
+        except (TypeError, ValueError):
+            raise ValueError(
+                'PI_NODRIVER_PREFLIGHT_TIMEOUT must be a positive finite number'
+            ) from None
+        if not 0 < timeout < float('inf'):
+            raise ValueError(
+                'PI_NODRIVER_PREFLIGHT_TIMEOUT must be a positive finite number'
+            )
+        return timeout
+
+    def consume_detached_preflight_task(self, task):
+        self.detached_preflight_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    def detach_preflight_task(self, task):
+        self.detached_preflight_tasks.add(task)
+        task.add_done_callback(self.consume_detached_preflight_task)
+        task.cancel()
+
+    async def bounded_vision_fallback_context(self, page, timeout):
+        task = asyncio.create_task(self.vision_fallback_context(page))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            self.detach_preflight_task(task)
+            raise
+        except Exception:
+            self.detach_preflight_task(task)
+            raise
+        if task not in done:
+            self.detach_preflight_task(task)
+            raise _PreflightDeadlineExpired()
+        return task.result()
 
     def semantic_target_resolved(self, session_id):
         self.vision_fallback_guard.reset(session_id)
@@ -853,6 +902,7 @@ class BrowserWorker:
     def forget_closed_tab(self, record):
         page = record.page
         target_id = record.target_id
+        self.quarantined_target_ids.discard(target_id)
         live_target_ids = {
             self.tab_registry.target_id(live_page)
             for live_page in self.browser.tabs
@@ -897,6 +947,60 @@ class BrowserWorker:
             self.snapshot_required_sessions.discard(owner)
             self.vision_guard.invalidate(owner)
 
+    def quarantine_session_page(self, session_id, page):
+        if self.pages.get(session_id) is not page:
+            return None
+        self.quarantined_target_ids.add(self.tab_registry.target_id(page))
+        live_target_ids = {
+            self.tab_registry.target_id(live_page)
+            for live_page in self.browser.tabs
+        }
+        openers = [
+            opener for opener in self.popup_openers.get(session_id, [])
+            if opener is not page
+            and self.tab_registry.target_id(opener) in live_target_ids
+        ]
+        replacement = openers.pop() if openers else None
+        if openers:
+            self.popup_openers[session_id] = openers
+        else:
+            self.popup_openers.pop(session_id, None)
+        if replacement is not None:
+            self.pages[session_id] = replacement
+            self.switch_session_action_target(session_id, replacement)
+            self.touch_tab(replacement)
+        else:
+            self.pages.pop(session_id, None)
+            self.switch_session_action_target(session_id, None)
+            self.popup_just_closed.discard(session_id)
+        self.popup_just_switched.discard(session_id)
+        self.snapshot_required_sessions.discard(session_id)
+        self.vision_guard.invalidate(session_id)
+        self.vision_fallback_guard.reset(session_id)
+        return replacement
+
+    async def close_session_page(self, session_id, expected_page):
+        self.vision_guard.invalidate(session_id)
+        if expected_page is not None and self.pages.get(session_id) is expected_page:
+            record = next(
+                (item for item in self.tab_registry.records() if item.page is expected_page),
+                None,
+            )
+            if record is not None:
+                await self.evict_tab(record)
+            else:
+                await expected_page.close()
+                if self.pages.get(session_id) is expected_page:
+                    self.pages.pop(session_id, None)
+                    self.switch_session_action_target(session_id, None)
+        self.popup_just_switched.discard(session_id)
+        self.snapshot_required_sessions.discard(session_id)
+        self.repeated_commands.pop(session_id, None)
+        if self.pages.get(session_id) is None:
+            self.popup_openers.pop(session_id, None)
+            self.popup_just_closed.discard(session_id)
+        return {'text': 'Current Pi session tab closed', 'action': 'close'}
+
     async def evict_tab(self, record):
         await record.page.close()
         for _ in range(20):
@@ -921,6 +1025,7 @@ class BrowserWorker:
             self.tab_registry.target_id(page)
             for page in self.browser.tabs
         }
+        self.quarantined_target_ids.intersection_update(live_target_ids)
         for owner, openers in list(self.popup_openers.items()):
             live_openers = [
                 opener for opener in openers
@@ -1000,8 +1105,10 @@ class BrowserWorker:
 
     async def admit_popup(self, session_id, opener, popup):
         async with self.tab_management_lock:
-            self.register_tab(popup, session_id, 'popup')
             popup_target_id = self.tab_registry.target_id(popup)
+            if popup_target_id in self.quarantined_target_ids:
+                raise ValueError('popup target is quarantined and cannot be readmitted')
+            self.register_tab(popup, session_id, 'popup')
             try:
                 await self._ensure_tab_capacity(
                     required=0,
@@ -1349,6 +1456,7 @@ class BrowserWorker:
             self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
             self.active_target_counts.clear()
             self.session_action_targets.clear()
+            self.quarantined_target_ids.clear()
 
     async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.08):
         """
@@ -1860,18 +1968,39 @@ class BrowserWorker:
         action = parts[0].lower()
         if action not in SUPPORTED_ACTIONS:
             raise ValueError(f'unsupported browser command: {action}')
+        preflight_timeout = self.preflight_timeout_seconds()
         self.track_open_action(session_id, action)
         semantic_click = is_semantic_click_attempt(parts)
         page = self.pages.get(session_id)
         fallback_context = None
+        recovered_popup_opener = None
         if page is not None:
             try:
-                fallback_context = await self.vision_fallback_context(page)
+                fallback_context = await self.bounded_vision_fallback_context(
+                    page, preflight_timeout
+                )
                 self.vision_fallback_guard.observe_context(session_id, fallback_context)
+            except _PreflightDeadlineExpired:
+                recovered_popup_opener = self.quarantine_session_page(
+                    session_id, page
+                )
+                if action == 'wait-popup-close' and recovered_popup_opener is not None:
+                    self.popup_just_closed.add(session_id)
             except Exception:
                 pass
         try:
-            result = await self._execute(command, session_id)
+            try:
+                if action == 'close':
+                    result = await self.close_session_page(session_id, page)
+                else:
+                    result = await self._execute(command, session_id)
+            finally:
+                if (
+                    recovered_popup_opener is not None
+                    and action != 'wait-popup-close'
+                    and self.pages.get(session_id) is recovered_popup_opener
+                ):
+                    self.popup_just_closed.add(session_id)
         except (StaleRefError, SemanticClickTargetError) as error:
             if semantic_click and fallback_context is not None:
                 current_page = self.pages.get(session_id)
@@ -2771,7 +2900,9 @@ class BrowserWorker:
                 await self.browser.update_targets()
                 popup = next((
                     tab for tab in reversed(self.browser.tabs)
-                    if tab != page and tab.target.opener_id == opener_id
+                    if tab != page
+                    and tab.target.opener_id == opener_id
+                    and self.tab_registry.target_id(tab) not in self.quarantined_target_ids
                 ), None)
                 if popup is not None:
                     await self.admit_popup(session_id, page, popup)
@@ -2815,14 +2946,14 @@ class BrowserWorker:
             timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
             page = await self.require_page(session_id)
             openers = self.popup_openers.get(session_id, [])
+            if session_id in self.popup_just_closed:
+                self.popup_just_closed.discard(session_id)
+                return {
+                    'text': f'Popup is already closed; opener is active\nURL: {page.url}',
+                    'action': action,
+                    'url': page.url,
+                }
             if not openers:
-                if session_id in self.popup_just_closed:
-                    self.popup_just_closed.discard(session_id)
-                    return {
-                        'text': f'Popup is already closed; opener is active\nURL: {page.url}',
-                        'action': action,
-                        'url': page.url,
-                    }
                 raise ValueError('the current page has no tracked popup opener')
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout_ms / 1000
@@ -3050,22 +3181,9 @@ class BrowserWorker:
             }
 
         if action == 'close':
-            page = self.pages.get(session_id)
-            if page is not None:
-                record = next(
-                    (item for item in self.tab_registry.records() if item.page is page),
-                    None,
-                )
-                if record is not None:
-                    await self.evict_tab(record)
-                else:
-                    await page.close()
-                    self.pages.pop(session_id, None)
-            self.popup_openers.pop(session_id, None)
-            self.popup_just_switched.discard(session_id)
-            self.popup_just_closed.discard(session_id)
-            self.repeated_commands.pop(session_id, None)
-            return {'text': 'Current Pi session tab closed', 'action': action}
+            return await self.close_session_page(
+                session_id, self.pages.get(session_id)
+            )
 
         if action == 'shutdown':
             await self.shutdown_browser()
@@ -3080,8 +3198,11 @@ class BrowserWorker:
 async def execute_request(worker, request):
     session_id = str(request.get('sessionId') or 'default')
     command_timeout = float(os.environ.get('PI_NODRIVER_COMMAND_TIMEOUT', '75'))
-    worker.begin_session_action(session_id)
+    action_started = False
     try:
+        worker.preflight_timeout_seconds()
+        worker.begin_session_action(session_id)
+        action_started = True
         result = await asyncio.wait_for(
             worker.execute(request.get('command', ''), session_id=session_id),
             timeout=command_timeout,
@@ -3119,7 +3240,8 @@ async def execute_request(worker, request):
     except Exception as error:
         return {'id': request.get('id'), 'sessionId': session_id, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
     finally:
-        worker.end_session_action(session_id)
+        if action_started:
+            worker.end_session_action(session_id)
 
 
 async def stdio_main():

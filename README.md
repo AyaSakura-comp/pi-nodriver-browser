@@ -93,12 +93,16 @@ Every command follows the same ownership and capacity workflow:
 
 ```mermaid
 flowchart LR
-    REQUEST["Pi tool request\ncommand + sessionId"] --> VALIDATE["Parse and validate\nsupported action"]
+    REQUEST["Pi tool request\ncommand + sessionId"] --> DEADLINE["Validate preflight deadline\nbefore command bookkeeping"]
+    DEADLINE --> VALIDATE["Parse and validate\nsupported action"]
     VALIDATE --> OPEN_GUARD{"open action?"}
     OPEN_GUARD -->|Yes| STREAK["Check per-session\n2-open streak"]
     OPEN_GUARD -->|No| EXECUTE
     STREAK --> EXECUTE["Acquire per-session lock\nand mark exact active target"]
-    EXECUTE --> NEW_TAB{"Needs or discovered\na new target?"}
+    EXECUTE --> PREFLIGHT{"Current target preflight\nfinishes before deadline?"}
+    PREFLIGHT -->|Timeout| QUARANTINE["Quarantine only the poisoned\nsession target mapping"]
+    PREFLIGHT -->|Ready or non-timeout error| NEW_TAB{"Needs or discovered\na new target?"}
+    QUARANTINE --> NEW_TAB
     NEW_TAB -->|Yes| CAPACITY["Acquire tab-management lock\nreconcile live Chrome targets"]
     CAPACITY --> LRU["Reserve worker-created tab or\nadmit Chrome-created popup\nwith inactive-LRU eviction"]
     LRU --> COMMAND["Execute navigation / DOM / crawl"]
@@ -111,6 +115,7 @@ flowchart LR
 
 * **Layered Locking**: A per-session lock serializes commands from one conversation. The server's browser-structure lock covers its selected structural command set (`open`, click variants, `download`, `press`, `close`, and `shutdown`); `tab_management_lock` independently makes capacity checks, worker-created tabs, popup admission, eviction, and cleanup atomic—including crawl lifecycle operations.
 * **Exact-Target Activity Protection**: Only the tab currently used by a running command is protected. Idle tabs from the same session remain valid LRU candidates.
+* **Hung-Target Quarantine**: Before each command, the worker bounds vision/context preflight to 2 seconds by default (`PI_NODRIVER_PREFLIGHT_TIMEOUT`, positive finite seconds; invalid values fail before open/repeat/activity bookkeeping or page-less browser initialization). At the deadline it cancels the preflight task, tracks it for eventual result consumption without awaiting cancellation completion, detaches only the poisoned target from that session, releases active-target accounting, invalidates its vision state, and lets the command continue or fail normally. A live popup opener is restored when available. Every `close` remains bound to the target captured before preflight, so reconciliation cannot redirect it to a healthy opener whether preflight succeeds, reaches its deadline, or raises a task-level error. Immediate `wait-popup-close` remains idempotent after both normal and quarantined popup closure, even when an older opener remains in a nested popup stack. The poisoned target remains marked as quarantined and excluded from popup admission until Chrome reports it gone or normal LRU closes it. It also remains registered while live, preserving the global tab cap, LRU eligibility, and in-progress download ownership; preflight task errors—including a nested `asyncio.TimeoutError` distinct from worker deadline expiry—preserve the current page mapping.
 * **Global Capacity Invariant**: Before creating a managed page or crawl tab, the daemon reconciles its registry with Chrome and reserves capacity. Popups are created by Chrome first, then registered and admitted under the same capacity lock; admission evicts an eligible inactive tab or closes the popup as rollback. The default maximum is 20 tabs (`PI_NODRIVER_MAX_TABS`).
 * **Transactional Eviction**: Registry, session, and download-routing metadata are removed only after Chrome confirms that the target closed. A thrown close exception propagates while preserving tracked state; if close returns but Chrome still reports the target as live, the daemon raises `TAB_LIMIT`. Both paths prevent silent capacity overflow.
 * **Popup Recovery**: Popup opener stacks are maintained per session. If a popup closes externally or is evicted, the newest live opener becomes the active session page.
@@ -211,7 +216,7 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 To prevent a runaway agent from repeatedly creating tabs, each session may attempt at most **2 consecutive `open` actions**. The 3rd and every later `open` returns `OPEN_LOOP_GUARD` without launching a tab; failed navigation attempts still count, so failures cannot create an open-retry loop. A valid non-`open` browser action resets the streak, while unsupported commands do not; for multiple independent URLs, use one batched `crawl` call instead.
 
 ### 8. Global Tab LRU
-Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Each tab stores an immutable creation time and a `time.monotonic()` last-activity timestamp. Every page operation refreshes activity; when a new tab needs capacity, the least-recently-used inactive tab is closed first. Registry and download-routing state is removed only after Chrome confirms closure, preventing failed closes from bypassing the cap or leaking stale frame ownership. Tabs belonging to commands currently running and sessions with in-progress downloads are protected. If every tab is protected, creation fails with `TAB_LIMIT` instead of exceeding the cap. Crawl creation uses the same registry and a bounded semaphore.
+Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Each tab stores an immutable creation time and a `time.monotonic()` last-activity timestamp. Every page operation refreshes activity; when a new tab needs capacity, the least-recently-used inactive tab is closed first. Registry and download-routing state is removed only after Chrome confirms closure, preventing failed closes from bypassing the cap or leaking stale frame ownership. A CDP target quarantined after a preflight timeout remains in the registry until Chrome confirms it has disappeared or normal LRU eviction closes it. Tabs belonging to commands currently running and sessions with in-progress downloads are protected. If every tab is protected, creation fails with `TAB_LIMIT` instead of exceeding the cap. Crawl creation uses the same registry and a bounded semaphore.
 
 ### 9. Parallel Multi-Tab Scraping (`crawl`)
 * **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
@@ -485,7 +490,7 @@ The test strategy is layered so fast state-machine checks run on every change, w
 | Layer | Main files | What it verifies | Default behavior |
 |---|---|---|---|
 | Pure logic | `tests/test_browser_logic.py`, `tests/test_popup_logic.py` | Parsing, snapshots, repeated-command guards, open streaks, LRU ordering, protected targets, download isolation | Always runs |
-| Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, popup opener recovery, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
+| Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, hung-preflight isolation, durable popup quarantine, target-bound close races, nested popup opener recovery, active-target cleanup, download-route preservation, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
 | Installer | `tests/test_install.py` | Extension deployment and conflicting-package cleanup | Always runs in a temporary directory |
 | Real browser | `tests/test_worker_integration.py`, `tests/test_daemon_integration.py` | Headful Chrome navigation, popups, downloads, multi-session isolation, cancellation, daemon persistence | Opt-in with `RUN_BROWSER_INTEGRATION=1` |
 | Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival, eight-part CoolPC selection, same-origin iframe report generation | Run before deployment of lifecycle or semantic-action changes |
@@ -499,7 +504,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **160 tests**: 108 fast tests run by default and 52 real-browser tests are skipped unless explicitly enabled.
+The current suite contains **190 tests**: 134 fast tests run by default and 56 real-browser tests are skipped unless explicitly enabled.
 
 ### Real Headful Chrome / Xvfb Suite
 

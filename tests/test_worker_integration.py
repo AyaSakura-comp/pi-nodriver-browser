@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import http.server
 import json
@@ -9,7 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = '__PI_NODRIVER__'
@@ -594,6 +595,616 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         victims = await worker.ensure_tab_capacity(required=1, protected_session_id='session-new')
 
         self.assertEqual([victim.target_id for victim in victims], ['tab-0'])
+
+    async def test_hung_vision_preflight_quarantines_only_the_poisoned_session(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        poisoned = FakePage(worker.browser, 'tab-poisoned')
+        healthy = FakePage(worker.browser, 'tab-healthy')
+        worker.browser.tabs.extend([poisoned, healthy])
+        worker.pages['session-a'] = poisoned
+        worker.pages['session-b'] = healthy
+        worker.register_tab(poisoned, 'session-a')
+        worker.register_tab(healthy, 'session-b')
+
+        async def vision_context(page):
+            if page is poisoned:
+                await asyncio.Event().wait()
+            return VisionFallbackContext('tab-healthy', healthy.url, 'loader-healthy')
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            result = await asyncio.wait_for(
+                worker.execute('close', session_id='session-a'),
+                timeout=0.1,
+            )
+
+        self.assertEqual(result['text'], 'Current Pi session tab closed')
+        self.assertNotIn('session-a', worker.pages)
+        self.assertIs(worker.pages['session-b'], healthy)
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-poisoned', 'tab-healthy'},
+        )
+
+    async def test_cancellation_resistant_preflight_returns_at_the_deadline_and_consumes_failure(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        poisoned = FakePage(worker.browser, 'tab-poisoned')
+        worker.browser.tabs.append(poisoned)
+        worker.pages['session-a'] = poisoned
+        worker.register_tab(poisoned, 'session-a')
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def resistant_context(_page):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+                raise RuntimeError('late detached preflight failure')
+            finally:
+                finished.set()
+
+        worker.vision_fallback_context = resistant_context
+        loop = asyncio.get_running_loop()
+        loop_errors = []
+        previous_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        release_handle = loop.call_later(0.25, release.set)
+        try:
+            with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+                started = loop.time()
+                result = await worker.execute('close', session_id='session-a')
+                elapsed = loop.time() - started
+
+            self.assertEqual(result['text'], 'Current Pi session tab closed')
+            self.assertLess(elapsed, 0.1)
+            await asyncio.wait_for(cancellation_seen.wait(), timeout=0.1)
+            await asyncio.wait_for(finished.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+            self.assertEqual(loop_errors, [])
+            self.assertEqual(worker.detached_preflight_tasks, set())
+        finally:
+            release.set()
+            release_handle.cancel()
+            if not finished.is_set():
+                await asyncio.wait_for(finished.wait(), timeout=0.5)
+            loop.set_exception_handler(previous_exception_handler)
+
+    async def test_hung_preflight_releases_active_target_accounting(self):
+        from worker import BrowserWorker, execute_request
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        poisoned = FakePage(worker.browser, 'tab-poisoned')
+        worker.browser.tabs.append(poisoned)
+        worker.pages['session-a'] = poisoned
+        worker.register_tab(poisoned, 'session-a')
+
+        async def hung_context(_page):
+            await asyncio.Event().wait()
+
+        worker.vision_fallback_context = hung_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            response = await asyncio.wait_for(
+                execute_request(worker, {
+                    'id': 1,
+                    'sessionId': 'session-a',
+                    'command': 'close',
+                }),
+                timeout=0.1,
+            )
+
+        self.assertTrue(response['ok'])
+        self.assertEqual(worker.active_target_counts, {})
+        self.assertNotIn('session-a', worker.session_action_targets)
+
+    async def test_hung_popup_preflight_restores_the_live_opener(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        poisoned_popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, poisoned_popup])
+        worker.pages['session-a'] = poisoned_popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(poisoned_popup, 'session-a', 'popup')
+
+        async def vision_context(page):
+            if page is poisoned_popup:
+                await asyncio.Event().wait()
+            return VisionFallbackContext('tab-opener', opener.url, 'loader-opener')
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            result = await asyncio.wait_for(
+                worker.execute('get url', session_id='session-a'),
+                timeout=0.1,
+            )
+
+        self.assertEqual(result['text'], opener.url)
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertNotIn('session-a', worker.popup_openers)
+        self.assertIn('session-a', worker.popup_just_closed)
+
+        follow_up = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertIn('Popup is already closed', follow_up['text'])
+        self.assertEqual(follow_up['url'], opener.url)
+        self.assertNotIn('session-a', worker.popup_just_closed)
+
+    def nested_hung_popup_worker(self, *, hang_child=True):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        root = FakePage(worker.browser, 'tab-root')
+        parent_popup = FakePage(worker.browser, 'tab-parent-popup')
+        child_popup = FakePage(worker.browser, 'tab-child-popup')
+        worker.browser.tabs.extend([root, parent_popup, child_popup])
+        worker.pages['session-a'] = child_popup
+        worker.popup_openers['session-a'] = [root, parent_popup]
+        worker.register_tab(root, 'session-a', 'page')
+        worker.register_tab(parent_popup, 'session-a', 'popup')
+        worker.register_tab(child_popup, 'session-a', 'popup')
+
+        async def vision_context(page):
+            if hang_child and page is child_popup:
+                await asyncio.Event().wait()
+            return VisionFallbackContext(
+                page.target.target_id,
+                page.url,
+                f'loader-{page.target.target_id}',
+            )
+
+        worker.vision_fallback_context = vision_context
+        return worker, root, parent_popup, child_popup
+
+    async def close_reconcile_race(self, preflight_error=None):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker, execute_request
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, popup])
+        worker.pages['session-a'] = popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(popup, 'session-a', 'popup')
+        preflight_started = asyncio.Event()
+        release_preflight = asyncio.Event()
+
+        async def vision_context(page):
+            if page is popup:
+                preflight_started.set()
+                await release_preflight.wait()
+                if preflight_error is not None:
+                    raise preflight_error
+            return VisionFallbackContext(
+                page.target.target_id,
+                page.url,
+                f'loader-{page.target.target_id}',
+            )
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.2'}):
+            close_task = asyncio.create_task(execute_request(worker, {
+                'id': 1,
+                'sessionId': 'session-a',
+                'command': 'close',
+            }))
+            await asyncio.wait_for(preflight_started.wait(), timeout=0.1)
+            popup.closed = True
+            worker.browser.tabs.remove(popup)
+            await worker.reconcile_tabs()
+            release_preflight.set()
+            response = await asyncio.wait_for(close_task, timeout=0.2)
+
+        return worker, opener, response
+
+    async def test_nested_wait_popup_close_reports_quarantined_child_as_closed(self):
+        worker, root, parent_popup, _child_popup = self.nested_hung_popup_worker()
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            result = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertIn('Popup is already closed', result['text'])
+        self.assertEqual(result['url'], parent_popup.url)
+        self.assertIs(worker.pages['session-a'], parent_popup)
+        self.assertEqual(worker.popup_openers['session-a'], [root])
+        self.assertNotIn('session-a', worker.popup_just_closed)
+
+    async def test_nested_close_then_wait_reports_quarantined_child_as_closed(self):
+        worker, root, parent_popup, _child_popup = self.nested_hung_popup_worker()
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            closed = await worker.execute('close', session_id='session-a')
+        follow_up = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertEqual(closed['text'], 'Current Pi session tab closed')
+        self.assertIn('Popup is already closed', follow_up['text'])
+        self.assertEqual(follow_up['url'], parent_popup.url)
+        self.assertIs(worker.pages['session-a'], parent_popup)
+        self.assertEqual(worker.popup_openers['session-a'], [root])
+        self.assertNotIn('session-a', worker.popup_just_closed)
+
+    async def test_normal_single_popup_close_then_wait_is_idempotent(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, popup])
+        worker.pages['session-a'] = popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(popup, 'session-a', 'popup')
+
+        async def vision_context(page):
+            return VisionFallbackContext(
+                page.target.target_id,
+                page.url,
+                f'loader-{page.target.target_id}',
+            )
+
+        worker.vision_fallback_context = vision_context
+
+        closed = await worker.execute('close', session_id='session-a')
+        follow_up = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertEqual(closed['text'], 'Current Pi session tab closed')
+        self.assertIn('Popup is already closed', follow_up['text'])
+        self.assertEqual(follow_up['url'], opener.url)
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertFalse(opener.closed)
+
+    async def test_normal_nested_popup_close_then_wait_preserves_older_opener(self):
+        worker, root, parent_popup, child_popup = self.nested_hung_popup_worker(
+            hang_child=False
+        )
+
+        closed = await worker.execute('close', session_id='session-a')
+        follow_up = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertEqual(closed['text'], 'Current Pi session tab closed')
+        self.assertIn('Popup is already closed', follow_up['text'])
+        self.assertEqual(follow_up['url'], parent_popup.url)
+        self.assertTrue(child_popup.closed)
+        self.assertFalse(parent_popup.closed)
+        self.assertIs(worker.pages['session-a'], parent_popup)
+        self.assertEqual(worker.popup_openers['session-a'], [root])
+
+    async def test_close_stays_bound_when_preflight_succeeds_after_reconcile(self):
+        worker, opener, response = await self.close_reconcile_race()
+
+        self.assertTrue(response['ok'])
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertFalse(opener.closed)
+        self.assertIn('session-a', worker.popup_just_closed)
+
+    async def test_close_stays_bound_when_preflight_times_out_internally_after_reconcile(self):
+        worker, opener, response = await self.close_reconcile_race(
+            asyncio.TimeoutError('nested context timeout')
+        )
+
+        self.assertTrue(response['ok'])
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertFalse(opener.closed)
+        self.assertIn('session-a', worker.popup_just_closed)
+
+    async def test_popup_close_quarantines_the_poisoned_popup_without_closing_opener(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        poisoned_popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, poisoned_popup])
+        worker.pages['session-a'] = poisoned_popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(poisoned_popup, 'session-a', 'popup')
+
+        async def vision_context(page):
+            if page is poisoned_popup:
+                await asyncio.Event().wait()
+            return VisionFallbackContext('tab-opener', opener.url, 'loader-opener')
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            result = await worker.execute('close', session_id='session-a')
+
+        self.assertEqual(result['text'], 'Current Pi session tab closed')
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertFalse(opener.closed)
+        self.assertFalse(poisoned_popup.closed)
+        self.assertEqual(worker.browser.tabs, [opener, poisoned_popup])
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-opener', 'tab-popup'},
+        )
+        self.assertIn('session-a', worker.popup_just_closed)
+
+    async def test_popup_close_deadline_does_not_close_opener_restored_by_reconcile(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker, execute_request
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        poisoned_popup = FakePage(worker.browser, 'tab-popup')
+        worker.browser.tabs.extend([opener, poisoned_popup])
+        worker.pages['session-a'] = poisoned_popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(poisoned_popup, 'session-a', 'popup')
+        preflight_started = asyncio.Event()
+
+        async def vision_context(page):
+            if page is poisoned_popup:
+                preflight_started.set()
+                await asyncio.Event().wait()
+            return VisionFallbackContext('tab-opener', opener.url, 'loader-opener')
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.05'}):
+            close_task = asyncio.create_task(execute_request(worker, {
+                'id': 1,
+                'sessionId': 'session-a',
+                'command': 'close',
+            }))
+            await asyncio.wait_for(preflight_started.wait(), timeout=0.1)
+            poisoned_popup.closed = True
+            worker.browser.tabs.remove(poisoned_popup)
+            await worker.reconcile_tabs()
+            response = await asyncio.wait_for(close_task, timeout=0.2)
+
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['text'], 'Current Pi session tab closed')
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertIn(opener, worker.browser.tabs)
+        self.assertFalse(opener.closed)
+        self.assertNotIn('tab-popup', {
+            record.target_id for record in worker.tab_registry.records()
+        })
+        self.assertEqual(worker.active_target_counts, {})
+        self.assertNotIn('session-a', worker.session_action_targets)
+        self.assertIn('session-a', worker.popup_just_closed)
+
+        follow_up = await worker.execute('wait-popup-close 10', session_id='session-a')
+
+        self.assertIn('Popup is already closed', follow_up['text'])
+        self.assertEqual(follow_up['url'], opener.url)
+        self.assertNotIn('session-a', worker.popup_just_closed)
+        self.assertFalse(opener.closed)
+
+    async def test_wait_popup_does_not_readmit_a_live_quarantined_popup(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        opener = FakePage(worker.browser, 'tab-opener')
+        poisoned_popup = FakePage(worker.browser, 'tab-popup')
+        poisoned_popup.target.opener_id = opener.target.target_id
+        worker.browser.tabs.extend([opener, poisoned_popup])
+        worker.pages['session-a'] = poisoned_popup
+        worker.popup_openers['session-a'] = [opener]
+        worker.register_tab(opener, 'session-a', 'page')
+        worker.register_tab(poisoned_popup, 'session-a', 'popup')
+        worker.configure_download_session = AsyncMock()
+        poisoned_popup.bring_to_front = AsyncMock()
+
+        async def vision_context(page):
+            if page is poisoned_popup:
+                await asyncio.Event().wait()
+            return VisionFallbackContext('tab-opener', opener.url, 'loader-opener')
+
+        worker.vision_fallback_context = vision_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            recovered = await worker.execute('get url', session_id='session-a')
+            self.assertIn('tab-popup', worker.quarantined_target_ids)
+            with self.assertRaisesRegex(TimeoutError, 'timed out waiting 10ms'):
+                await worker.execute('wait-popup 10', session_id='session-a')
+            self.assertIn('tab-popup', worker.quarantined_target_ids)
+
+        self.assertEqual(recovered['text'], opener.url)
+        self.assertIs(worker.pages['session-a'], opener)
+        self.assertFalse(poisoned_popup.closed)
+        self.assertEqual(worker.detached_preflight_tasks, set())
+
+        poisoned_popup.closed = True
+        worker.browser.tabs.remove(poisoned_popup)
+        await worker.reconcile_tabs()
+
+        self.assertNotIn('tab-popup', worker.quarantined_target_ids)
+
+    async def test_quarantined_live_target_remains_tracked_for_lru(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        poisoned = FakePage(worker.browser, 'tab-poisoned')
+        worker.browser.tabs.append(poisoned)
+        worker.pages['session-a'] = poisoned
+        worker.register_tab(poisoned, 'session-a')
+
+        async def hung_context(_page):
+            await asyncio.Event().wait()
+
+        worker.vision_fallback_context = hung_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            await asyncio.wait_for(
+                worker.execute('close', session_id='session-a'),
+                timeout=0.1,
+            )
+        await worker.reconcile_tabs()
+
+        records = worker.tab_registry.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].target_id, 'tab-poisoned')
+        self.assertEqual(records[0].session_id, 'session-a')
+        self.assertEqual(records[0].kind, 'page')
+
+    async def test_quarantine_preserves_download_routes_for_a_live_target(self):
+        from browser_logic import TabLimitError
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.max_tabs = 1
+        worker.tab_registry.max_tabs = 1
+        worker.browser = FakeBrowser()
+        poisoned = FakePage(worker.browser, 'tab-poisoned')
+        worker.browser.tabs.append(poisoned)
+        worker.pages['session-a'] = poisoned
+        worker.register_tab(poisoned, 'session-a')
+        worker.download_target_sessions['tab-poisoned'] = 'session-a'
+        worker.download_frame_sessions['frame-a'] = 'session-a'
+        worker.download_frame_targets['frame-a'] = 'tab-poisoned'
+        worker.downloads['download-a'] = {
+            'sessionId': 'session-a',
+            'state': 'inProgress',
+        }
+
+        async def hung_context(_page):
+            await asyncio.Event().wait()
+
+        worker.vision_fallback_context = hung_context
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': '0.01'}):
+            await asyncio.wait_for(
+                worker.execute('close', session_id='session-a'),
+                timeout=0.1,
+            )
+
+        self.assertEqual(worker.download_target_sessions['tab-poisoned'], 'session-a')
+        self.assertEqual(worker.download_frame_sessions['frame-a'], 'session-a')
+        self.assertEqual(worker.download_frame_targets['frame-a'], 'tab-poisoned')
+        with self.assertRaisesRegex(TabLimitError, 'TAB_LIMIT'):
+            await worker.ensure_tab_capacity(required=1)
+        self.assertFalse(poisoned.closed)
+
+    async def test_non_timeout_preflight_failure_preserves_the_current_page(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        page = FakePage(worker.browser, 'tab-current')
+        worker.browser.tabs.append(page)
+        worker.pages['session-a'] = page
+        worker.register_tab(page, 'session-a')
+
+        async def failed_context(_page):
+            raise RuntimeError('transient CDP error')
+
+        worker.vision_fallback_context = failed_context
+
+        result = await worker.execute('get url', session_id='session-a')
+
+        self.assertEqual(result['text'], page.url)
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-current'},
+        )
+
+    async def test_task_raised_asyncio_timeout_does_not_quarantine_current_page(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        page = FakePage(worker.browser, 'tab-current')
+        worker.browser.tabs.append(page)
+        worker.pages['session-a'] = page
+        worker.register_tab(page, 'session-a')
+
+        async def timed_out_context(_page):
+            raise asyncio.TimeoutError('vision context operation timed out')
+
+        worker.vision_fallback_context = timed_out_context
+
+        result = await worker.execute('get url', session_id='session-a')
+
+        self.assertEqual(result['text'], page.url)
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertFalse(page.closed)
+        self.assertEqual(
+            {record.target_id for record in worker.tab_registry.records()},
+            {'tab-current'},
+        )
+
+    async def test_invalid_preflight_timeout_does_not_start_page_less_open(self):
+        from worker import BrowserWorker, execute_request
+
+        worker = BrowserWorker()
+        worker.ensure_browser = AsyncMock()
+        worker.begin_session_action = Mock(wraps=worker.begin_session_action)
+
+        with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': 'invalid'}):
+            response = await execute_request(worker, {
+                'id': 1,
+                'sessionId': 'session-a',
+                'command': 'open https://example.test/',
+            })
+
+        self.assertFalse(response['ok'])
+        self.assertIn(
+            'PI_NODRIVER_PREFLIGHT_TIMEOUT must be a positive finite number',
+            response['error'],
+        )
+        worker.begin_session_action.assert_not_called()
+        worker.ensure_browser.assert_not_awaited()
+        self.assertEqual(worker.open_action_guard._counts, {})
+        self.assertEqual(worker.repeated_commands, {})
+        self.assertEqual(worker.session_action_targets, {})
+        self.assertEqual(worker.pages, {})
+
+    async def test_invalid_preflight_timeout_does_not_mutate_page_state(self):
+        from worker import BrowserWorker
+
+        for value in ('invalid', '0', '-1', 'nan', 'inf'):
+            with self.subTest(value=value):
+                worker = BrowserWorker()
+                worker.browser = FakeBrowser()
+                page = FakePage(worker.browser, f'tab-{value}')
+                worker.browser.tabs.append(page)
+                worker.pages['session-a'] = page
+                worker.register_tab(page, 'session-a')
+
+                with patch.dict(os.environ, {'PI_NODRIVER_PREFLIGHT_TIMEOUT': value}):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        'PI_NODRIVER_PREFLIGHT_TIMEOUT must be a positive finite number',
+                    ):
+                        await worker.execute('get url', session_id='session-a')
+
+                self.assertIs(worker.pages['session-a'], page)
+                self.assertFalse(page.closed)
 
 
 class DropdownOutputUnitTests(unittest.TestCase):
