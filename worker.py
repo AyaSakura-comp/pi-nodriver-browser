@@ -2,6 +2,9 @@
 import asyncio
 import fcntl
 import hashlib
+import http.client
+import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -9,11 +12,13 @@ import os
 import re
 import secrets
 import signal
+import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
-import urllib.request
+import zlib
 from pathlib import Path
 
 import nodriver as uc
@@ -24,7 +29,7 @@ from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, V
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
-    'download', 'download-info', 'download-latest', 'downloads', 'fill',
+    'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'mobile', 'open', 'press', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
     'vision-click', 'vision-mark', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
@@ -44,6 +49,32 @@ class SemanticClickTargetError(ValueError):
 
 class _PreflightDeadlineExpired(Exception):
     pass
+
+
+class _ImageFetchCancelled(Exception):
+    pass
+
+
+IMAGE_FORMATS = {
+    'PNG': ('image/png', '.png'),
+    'JPEG': ('image/jpeg', '.jpg'),
+    'GIF': ('image/gif', '.gif'),
+    'WEBP': ('image/webp', '.webp'),
+}
+IMAGE_READ_CHUNK_BYTES = 64 * 1024
+IMAGE_MAX_REDIRECTS = 3
+IMAGE_FILENAME_STEM_MAX_BYTES = 96
+IMAGE_STATUS_LINE_MAX_BYTES = 8 * 1024
+IMAGE_HEADER_LINE_MAX_BYTES = 8 * 1024
+IMAGE_MAX_HEADER_BYTES = 64 * 1024
+IMAGE_MAX_HEADERS = 100
+IMAGE_CHUNK_LINE_MAX_BYTES = 1024
+IMAGE_WRITE_CLEANUP_TIMEOUT = 1.0
+IMAGE_NAT64_WELL_KNOWN = ipaddress.ip_network('64:ff9b::/96')
+IMAGE_NAT64_LOCAL_USE = ipaddress.ip_network('64:ff9b:1::/48')
+IMAGE_IPV6_SITE_LOCAL = ipaddress.ip_network('fec0::/10')
+IMAGE_IPV4_COMPATIBLE = ipaddress.ip_network('::/96')
+IMAGE_IPV4_TRANSLATABLE = ipaddress.ip_network('::ffff:0:0:0/96')
 
 
 # Commands that observe the page without changing it. Repeating one of these
@@ -1164,9 +1195,16 @@ class BrowserWorker:
                             port = self.launched_browser.config.port
                         else:
                             port = parse_devtools_active_port(active_port_file.read_text())
-                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=0.2) as response:
+                        connection = http.client.HTTPConnection(
+                            '127.0.0.1', port, timeout=0.2
+                        )
+                        try:
+                            connection.request('GET', '/json/version')
+                            response = connection.getresponse()
                             if not json.load(response).get('webSocketDebuggerUrl'):
                                 continue
+                        finally:
+                            connection.close()
                         self.browser = await uc.start(host='127.0.0.1', port=port)
                         break
                     except Exception:
@@ -1208,6 +1246,700 @@ class BrowserWorker:
         if path != root and path.resolve().parent != root.resolve():
             raise ValueError('session download directory escaped the configured root')
         return path
+
+    @staticmethod
+    def positive_image_integer(name, default):
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} must be a positive integer') from None
+        if value < 1:
+            raise ValueError(f'{name} must be a positive integer')
+        return value
+
+    @staticmethod
+    def image_fetch_timeout_seconds():
+        name = 'PI_NODRIVER_IMAGE_FETCH_TIMEOUT'
+        try:
+            value = float(os.environ.get(name, '15'))
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} must be a positive finite number') from None
+        if not 0 < value < float('inf'):
+            raise ValueError(f'{name} must be a positive finite number')
+        return value
+
+    @staticmethod
+    def parse_image_url(url):
+        if any(ord(character) < 32 or ord(character) == 127 for character in url):
+            raise ValueError('invalid fetch-image URL: control characters are not allowed')
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(f'invalid fetch-image URL: {error}') from None
+        scheme = parsed.scheme.lower()
+        if scheme not in {'http', 'https'} or not parsed.netloc or not parsed.hostname:
+            raise ValueError('fetch-image requires an http or https image URL')
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError('fetch-image URL credentials are not allowed')
+        try:
+            hostname = parsed.hostname.encode('idna').decode('ascii')
+        except UnicodeError as error:
+            raise ValueError('invalid fetch-image URL hostname') from error
+        if port == 0:
+            raise ValueError('fetch-image URL port zero is not allowed')
+        effective_port = port if port is not None else (443 if scheme == 'https' else 80)
+        return parsed, hostname, effective_port
+
+    @staticmethod
+    def image_address_is_global_unicast(address):
+        if not address.is_global or address.is_multicast:
+            return False
+        if address.version == 4:
+            return True
+        if (
+            address.is_reserved
+            or address in IMAGE_IPV6_SITE_LOCAL
+            or address in IMAGE_IPV4_COMPATIBLE
+            or address in IMAGE_IPV4_TRANSLATABLE
+        ):
+            return False
+
+        embedded = []
+        if address.ipv4_mapped is not None:
+            embedded.append(address.ipv4_mapped)
+        if address.sixtofour is not None:
+            embedded.append(address.sixtofour)
+        if address.teredo is not None:
+            embedded.extend(address.teredo)
+        if address in IMAGE_NAT64_WELL_KNOWN:
+            embedded.append(ipaddress.IPv4Address(int(address) & 0xffffffff))
+        if address in IMAGE_NAT64_LOCAL_USE:
+            return False
+        return all(item.is_global and not item.is_multicast for item in embedded)
+
+    async def resolve_image_addresses(self, hostname, port):
+        loop = asyncio.get_running_loop()
+        try:
+            address_info = await loop.getaddrinfo(
+                hostname,
+                port,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except asyncio.CancelledError:
+            raise
+        except OSError as error:
+            raise ValueError(
+                f'fetch-image URL host could not be resolved: {hostname}'
+            ) from error
+        if not address_info:
+            raise ValueError(f'fetch-image URL host could not be resolved: {hostname}')
+
+        allow_private = os.environ.get('PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS') == '1'
+        addresses = []
+        seen = set()
+        for family, socktype, _proto, _canonical_name, sockaddr in address_info:
+            if family not in {socket.AF_INET, socket.AF_INET6} or socktype != socket.SOCK_STREAM:
+                raise ValueError('fetch-image URL resolved to an unsupported address family')
+            address_text = str(sockaddr[0])
+            address_without_scope = address_text.split('%', 1)[0]
+            try:
+                address = ipaddress.ip_address(address_without_scope)
+            except ValueError as error:
+                raise ValueError(
+                    f'fetch-image URL resolved to an invalid address: {address_text}'
+                ) from error
+            if (family == socket.AF_INET) != (address.version == 4):
+                raise ValueError(
+                    f'fetch-image URL resolved to an invalid address: {address_text}'
+                )
+            if not allow_private and not self.image_address_is_global_unicast(address):
+                raise ValueError(
+                    f'fetch-image URL resolves to non-global address or unsafe embedded target: {address}'
+                )
+            key = (family, address_text)
+            if key not in seen:
+                seen.add(key)
+                addresses.append(key)
+        if not addresses:
+            raise ValueError(f'fetch-image URL host could not be resolved: {hostname}')
+        return addresses
+
+    @staticmethod
+    def image_request_target(parsed):
+        path = urllib.parse.quote(
+            parsed.path or '/', safe="/%:@!$&'()*+,;=-._~"
+        )
+        if not parsed.query:
+            return path
+        query = urllib.parse.quote(
+            parsed.query, safe="/%?:@!$&'()*+,;=-._~"
+        )
+        return f'{path}?{query}'
+
+    @staticmethod
+    def image_host_header(hostname, port, scheme):
+        display_hostname = f'[{hostname}]' if ':' in hostname else hostname
+        default_port = 443 if scheme == 'https' else 80
+        return (
+            display_hostname if port == default_port
+            else f'{display_hostname}:{port}'
+        )
+
+    async def open_validated_image_connection(
+        self, parsed, hostname, port, addresses
+    ):
+        last_error = None
+        for family, numeric_host in addresses:
+            options = {
+                'family': family,
+                'proto': socket.IPPROTO_TCP,
+                'flags': socket.AI_NUMERICHOST,
+                'limit': IMAGE_HEADER_LINE_MAX_BYTES + 1,
+            }
+            if parsed.scheme.lower() == 'https':
+                options.update(ssl=True, server_hostname=hostname)
+            try:
+                return await asyncio.open_connection(numeric_host, port, **options)
+            except asyncio.CancelledError:
+                raise
+            except OSError as error:
+                last_error = error
+        detail = str(last_error) if last_error is not None else 'no usable address'
+        raise ValueError(f'image fetch connection failed: {detail}') from last_error
+
+    @staticmethod
+    def close_image_writer(writer):
+        if writer is not None:
+            writer.close()
+
+    @staticmethod
+    async def read_bounded_image_line(reader, limit, description):
+        try:
+            line = await reader.readuntil(b'\n')
+        except asyncio.LimitOverrunError as error:
+            raise ValueError(f'image response {description} exceeds the byte limit') from error
+        except asyncio.IncompleteReadError as error:
+            raise ValueError(f'malformed image response {description}') from error
+        except ValueError as error:
+            raise ValueError(f'image response {description} exceeds the byte limit') from error
+        if len(line) > limit:
+            raise ValueError(f'image response {description} exceeds the byte limit')
+        if not line.endswith(b'\r\n'):
+            raise ValueError(f'malformed image response {description}')
+        return line
+
+    async def read_image_headers(self, reader, total_bytes, header_count):
+        headers = {}
+        while True:
+            line = await self.read_bounded_image_line(
+                reader, IMAGE_HEADER_LINE_MAX_BYTES, 'header line'
+            )
+            total_bytes += len(line)
+            if total_bytes > IMAGE_MAX_HEADER_BYTES:
+                raise ValueError('image response headers exceed the total byte limit')
+            if line == b'\r\n':
+                return headers, total_bytes, header_count
+            header_count += 1
+            if header_count > IMAGE_MAX_HEADERS:
+                raise ValueError('image response has too many headers')
+            if line[:1] in {b' ', b'\t'}:
+                raise ValueError('malformed image response header')
+            name, separator, raw_value = line[:-2].partition(b':')
+            if not separator or not re.fullmatch(
+                rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name
+            ):
+                raise ValueError('malformed image response header')
+            value = raw_value.strip(b' \t')
+            if any(byte < 32 and byte != 9 or byte == 127 for byte in value):
+                raise ValueError('malformed image response header')
+            headers.setdefault(name.decode('ascii').lower(), []).append(
+                value.decode('latin-1')
+            )
+
+    async def read_image_response_head(self, reader):
+        total_bytes = 0
+        header_count = 0
+        for interim_count in range(6):
+            status_line = await self.read_bounded_image_line(
+                reader, IMAGE_STATUS_LINE_MAX_BYTES, 'status line'
+            )
+            total_bytes += len(status_line)
+            if total_bytes > IMAGE_MAX_HEADER_BYTES:
+                raise ValueError('image response headers exceed the total byte limit')
+            match = re.fullmatch(
+                rb'HTTP/(1\.[01]) ([0-9]{3})(?:[ \t][^\r\n]*)?\r\n',
+                status_line,
+            )
+            if match is None:
+                raise ValueError('malformed image response status line')
+            version = match.group(1).decode('ascii')
+            status = int(match.group(2))
+            headers, total_bytes, header_count = await self.read_image_headers(
+                reader, total_bytes, header_count
+            )
+            if not 100 <= status < 200:
+                return version, status, headers
+            if status == 101:
+                raise ValueError('image fetch does not support protocol upgrades')
+        raise ValueError('image response has too many interim responses')
+
+    @staticmethod
+    def image_response_framing(headers):
+        content_encoding_values = headers.get('content-encoding', [])
+        content_encodings = [
+            token.strip().lower()
+            for value in content_encoding_values
+            for token in value.split(',')
+        ]
+        if any(encoding != 'identity' for encoding in content_encodings):
+            raise ValueError('unsupported Content-Encoding in image response')
+
+        raw_lengths = [
+            token.strip()
+            for value in headers.get('content-length', [])
+            for token in value.split(',')
+        ]
+        lengths = []
+        for raw_length in raw_lengths:
+            if not re.fullmatch(r'[0-9]+', raw_length):
+                raise ValueError('malformed Content-Length in image response')
+            try:
+                lengths.append(int(raw_length))
+            except ValueError as error:
+                raise ValueError('malformed Content-Length in image response') from error
+        if len(set(lengths)) > 1:
+            raise ValueError('conflicting Content-Length headers in image response')
+        content_length = lengths[0] if lengths else None
+
+        transfer_codings = [
+            token.strip().lower()
+            for value in headers.get('transfer-encoding', [])
+            for token in value.split(',')
+        ]
+        if transfer_codings and content_length is not None:
+            raise ValueError('conflicting response framing for image fetch')
+        if transfer_codings and transfer_codings != ['chunked']:
+            raise ValueError('unsupported Transfer-Encoding in image response')
+        return content_length, bool(transfer_codings)
+
+    @staticmethod
+    async def read_exact_image_bytes(reader, count, malformed_message):
+        try:
+            return await reader.readexactly(count)
+        except asyncio.IncompleteReadError as error:
+            raise ValueError(malformed_message) from error
+
+    async def read_chunked_image_body(self, reader, max_bytes):
+        data = bytearray()
+        total_bytes = 0
+        trailer_count = 0
+        while True:
+            line = await self.read_bounded_image_line(
+                reader, IMAGE_CHUNK_LINE_MAX_BYTES, 'chunk-size line'
+            )
+            raw_size, *extensions = line[:-2].split(b';')
+            if not re.fullmatch(rb'[0-9A-Fa-f]+', raw_size):
+                raise ValueError('malformed chunked response for image fetch')
+            extension_pattern = re.compile(
+                rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+                rb"(?:=(?:[!#$%&'*+.^_`|~0-9A-Za-z-]+|\"(?:[^\"\\\r\n]|\\.)*\"))?"
+            )
+            if any(not extension_pattern.fullmatch(extension) for extension in extensions):
+                raise ValueError('malformed chunked response for image fetch')
+            chunk_size = int(raw_size, 16)
+            if chunk_size == 0:
+                trailers, _total, trailer_count = await self.read_image_headers(
+                    reader, 0, trailer_count
+                )
+                if {'content-length', 'transfer-encoding', 'content-encoding'} & trailers.keys():
+                    raise ValueError('malformed chunked response for image fetch')
+                return bytes(data)
+            if chunk_size > max_bytes - total_bytes:
+                raise ValueError(f'image exceeds the {max_bytes} byte limit')
+            remaining = chunk_size
+            while remaining:
+                chunk = await self.read_exact_image_bytes(
+                    reader,
+                    min(IMAGE_READ_CHUNK_BYTES, remaining),
+                    'malformed chunked response for image fetch',
+                )
+                data.extend(chunk)
+                total_bytes += len(chunk)
+                remaining -= len(chunk)
+            terminator = await self.read_exact_image_bytes(
+                reader, 2, 'malformed chunked response for image fetch'
+            )
+            if terminator != b'\r\n':
+                raise ValueError('malformed chunked response for image fetch')
+
+    async def read_image_body(self, reader, headers, max_bytes):
+        content_length, chunked = self.image_response_framing(headers)
+        if content_length is not None and content_length > max_bytes:
+            raise ValueError(f'image exceeds the {max_bytes} byte limit')
+        if chunked:
+            return await self.read_chunked_image_body(reader, max_bytes)
+
+        data = bytearray()
+        if content_length is not None:
+            remaining = content_length
+            while remaining:
+                chunk = await self.read_exact_image_bytes(
+                    reader,
+                    min(IMAGE_READ_CHUNK_BYTES, remaining),
+                    'image response ended before its Content-Length',
+                )
+                data.extend(chunk)
+                remaining -= len(chunk)
+            return bytes(data)
+
+        while True:
+            chunk = await reader.read(
+                min(IMAGE_READ_CHUNK_BYTES, max_bytes + 1 - len(data))
+            )
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ValueError(f'image exceeds the {max_bytes} byte limit')
+
+    @staticmethod
+    def bounded_image_stem(final_url):
+        source_name = Path(
+            urllib.parse.unquote(urllib.parse.urlsplit(final_url).path)
+        ).stem
+        stem = re.sub(r'[^\w.-]+', '-', source_name, flags=re.UNICODE).strip('.-') or 'image'
+        stem = stem.encode('utf-8')[:IMAGE_FILENAME_STEM_MAX_BYTES].decode(
+            'utf-8', errors='ignore'
+        ).strip('.-')
+        return stem or 'image'
+
+    @staticmethod
+    def check_image_fetch_cancelled(cancel_event):
+        if cancel_event.is_set():
+            raise _ImageFetchCancelled()
+
+    async def fetch_image_bytes(self, target_url, max_bytes):
+        current_url = target_url
+        redirect_statuses = {301, 302, 303, 307, 308}
+        for redirect_count in range(IMAGE_MAX_REDIRECTS + 1):
+            try:
+                parsed, hostname, port = self.parse_image_url(current_url)
+                addresses = await self.resolve_image_addresses(hostname, port)
+            except ValueError as error:
+                if redirect_count:
+                    raise ValueError(f'fetch-image redirect rejected: {error}') from error
+                raise
+
+            writer = None
+            try:
+                reader, writer = await self.open_validated_image_connection(
+                    parsed, hostname, port, addresses
+                )
+                request_target = self.image_request_target(parsed)
+                host_header = self.image_host_header(
+                    hostname, port, parsed.scheme.lower()
+                )
+                request = (
+                    f'GET {request_target} HTTP/1.1\r\n'
+                    f'Host: {host_header}\r\n'
+                    'Accept: image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8,*/*;q=0.1\r\n'
+                    'Accept-Encoding: identity\r\n'
+                    'User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) '
+                    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 '
+                    'Mobile/15E148 Safari/604.1\r\n'
+                    'Connection: close\r\n\r\n'
+                ).encode('ascii')
+                writer.write(request)
+                await writer.drain()
+                _version, status, headers = await self.read_image_response_head(reader)
+
+                if status in redirect_statuses:
+                    locations = headers.get('location', [])
+                    if len(locations) != 1 or not locations[0]:
+                        raise ValueError(
+                            'fetch-image redirect is missing or has an ambiguous Location header'
+                        )
+                    if redirect_count >= IMAGE_MAX_REDIRECTS:
+                        raise ValueError(
+                            f'fetch-image exceeded the {IMAGE_MAX_REDIRECTS} redirect limit'
+                        )
+                    current_url = urllib.parse.urljoin(current_url, locations[0])
+                    continue
+
+                if status < 200 or status >= 300:
+                    raise ValueError(f'image fetch failed with HTTP status {status}')
+                data = await self.read_image_body(reader, headers, max_bytes)
+                return data, current_url
+            finally:
+                self.close_image_writer(writer)
+
+        raise ValueError(f'fetch-image exceeded the {IMAGE_MAX_REDIRECTS} redirect limit')
+
+    @staticmethod
+    def validate_image_container(data, image_format):
+        if image_format == 'PNG':
+            if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                raise ValueError('downloaded content is not a valid image')
+            offset = 8
+            chunk_index = 0
+            saw_idat = False
+            while offset < len(data):
+                if len(data) - offset < 12:
+                    raise ValueError('downloaded content is not a valid image')
+                length = int.from_bytes(data[offset:offset + 4], 'big')
+                chunk_type = data[offset + 4:offset + 8]
+                chunk_end = offset + 12 + length
+                if (
+                    not re.fullmatch(rb'[A-Za-z]{4}', chunk_type)
+                    or chunk_end > len(data)
+                ):
+                    raise ValueError('downloaded content is not a valid image')
+                payload = data[offset + 8:offset + 8 + length]
+                expected_crc = int.from_bytes(
+                    data[offset + 8 + length:chunk_end], 'big'
+                )
+                if zlib.crc32(chunk_type + payload) & 0xffffffff != expected_crc:
+                    raise ValueError('downloaded content is not a valid image')
+                if chunk_index == 0 and (chunk_type != b'IHDR' or length != 13):
+                    raise ValueError('downloaded content is not a valid image')
+                if chunk_type == b'IDAT':
+                    saw_idat = True
+                if chunk_type == b'IEND':
+                    if length != 0 or not saw_idat or chunk_end != len(data):
+                        raise ValueError('downloaded content is not a valid image')
+                    return
+                offset = chunk_end
+                chunk_index += 1
+            raise ValueError('downloaded content is not a valid image')
+        if image_format == 'JPEG':
+            if not data.startswith(b'\xff\xd8') or not data.endswith(b'\xff\xd9'):
+                raise ValueError('downloaded content is not a valid image')
+            return
+        if image_format == 'GIF':
+            if data[:6] not in {b'GIF87a', b'GIF89a'} or not data.endswith(b'\x3b'):
+                raise ValueError('downloaded content is not a valid image')
+            return
+        if image_format == 'WEBP':
+            if (
+                len(data) < 12
+                or data[:4] != b'RIFF'
+                or data[8:12] != b'WEBP'
+                or int.from_bytes(data[4:8], 'little') + 8 != len(data)
+            ):
+                raise ValueError('downloaded content is not a valid image')
+            return
+        raise ValueError(f'unsupported image format: {image_format or "unknown"}')
+
+    def inspect_and_load_image(self, data, limits):
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = (image.format or '').upper()
+                if image_format not in IMAGE_FORMATS:
+                    raise ValueError(
+                        f'unsupported image format: {image_format or "unknown"}'
+                    )
+                self.validate_image_container(data, image_format)
+
+                frame_sizes = []
+                canonical_frames = []
+                frame_durations = []
+                animation_loop = image.info.get('loop', 0)
+                cumulative_pixels = 0
+                for frame_index in range(limits['max_frames'] + 1):
+                    try:
+                        image.seek(frame_index)
+                    except EOFError:
+                        break
+                    if frame_index == limits['max_frames']:
+                        raise ValueError(
+                            f'image has more than {limits["max_frames"]} frame(s)'
+                        )
+                    width, height = image.size
+                    if width < 1 or height < 1:
+                        raise ValueError('downloaded content is not a valid image')
+                    if width > limits['max_width']:
+                        raise ValueError(
+                            f'image width {width} exceeds the {limits["max_width"]} pixel limit'
+                        )
+                    if height > limits['max_height']:
+                        raise ValueError(
+                            f'image height {height} exceeds the {limits["max_height"]} pixel limit'
+                        )
+                    cumulative_pixels += width * height
+                    if cumulative_pixels > limits['max_total_pixels']:
+                        raise ValueError(
+                            'image cumulative frame pixels '
+                            f'{cumulative_pixels} exceed the {limits["max_total_pixels"]} pixel limit'
+                        )
+                    frame_sizes.append((width, height))
+
+                if not frame_sizes:
+                    raise ValueError('downloaded content is not a valid image')
+                for frame_index in range(len(frame_sizes)):
+                    image.seek(frame_index)
+                    image.load()
+                    canonical_frames.append(image.copy())
+                    frame_durations.append(image.info.get('duration', 0))
+
+                canonical = io.BytesIO()
+                if image_format == 'JPEG':
+                    image.seek(0)
+                    canonical = io.BytesIO()
+                    image.convert('RGB').save(canonical, format='JPEG', quality=95)
+                else:
+                    save_options = {}
+                    if len(canonical_frames) > 1:
+                        save_options.update(
+                            save_all=True,
+                            append_images=canonical_frames[1:],
+                            duration=frame_durations,
+                            loop=animation_loop,
+                        )
+                    if image_format == 'WEBP':
+                        save_options['lossless'] = True
+                    canonical_frames[0].save(
+                        canonical,
+                        format=image_format,
+                        **save_options,
+                    )
+                normalized_data = canonical.getvalue()
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError('downloaded content is not a valid image') from error
+
+        mime_type, suffix = IMAGE_FORMATS[image_format]
+        width, height = frame_sizes[0]
+        return mime_type, suffix, width, height, normalized_data
+
+    @staticmethod
+    def allocate_fetched_image(destination_dir, stem, suffix):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, 'O_CLOEXEC'):
+            flags |= os.O_CLOEXEC
+        candidates = (
+            f'{stem}{suffix}' if counter == 0 else f'{stem} ({counter}){suffix}'
+            for counter in range(10000)
+        )
+        for name in candidates:
+            destination = destination_dir / name
+            try:
+                fd = os.open(destination, flags, 0o600)
+                file_stat = os.fstat(fd)
+                return destination, fd, (file_stat.st_dev, file_stat.st_ino)
+            except FileExistsError:
+                continue
+        raise ValueError('could not allocate a collision-safe image filename')
+
+    @staticmethod
+    def unlink_owned_fetched_image(destination, identity):
+        try:
+            current = destination.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == identity:
+            destination.unlink(missing_ok=True)
+
+    def write_fetched_image(self, fd, destination, data, cancel_event):
+        with os.fdopen(fd, 'wb') as output:
+            for offset in range(0, len(data), IMAGE_READ_CHUNK_BYTES):
+                self.check_image_fetch_cancelled(cancel_event)
+                output.write(data[offset:offset + IMAGE_READ_CHUNK_BYTES])
+        self.check_image_fetch_cancelled(cancel_event)
+        return destination
+
+    @staticmethod
+    def consume_background_image_task(task):
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def decode_fetched_image(self, data, limits):
+        task = asyncio.create_task(asyncio.to_thread(
+            self.inspect_and_load_image, data, limits
+        ))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(self.consume_background_image_task)
+            raise
+
+    async def save_fetched_image(self, destination_dir, stem, suffix, data):
+        destination, fd, identity = self.allocate_fetched_image(
+            destination_dir, stem, suffix
+        )
+        cancel_event = threading.Event()
+        try:
+            task = asyncio.create_task(asyncio.to_thread(
+                self.write_fetched_image,
+                fd,
+                destination,
+                data,
+                cancel_event,
+            ))
+        except BaseException:
+            os.close(fd)
+            self.unlink_owned_fetched_image(destination, identity)
+            raise
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=IMAGE_WRITE_CLEANUP_TIMEOUT
+                )
+            except BaseException:
+                pass
+            self.unlink_owned_fetched_image(destination, identity)
+            if not task.done():
+                task.add_done_callback(self.consume_background_image_task)
+            raise
+        except BaseException:
+            self.unlink_owned_fetched_image(destination, identity)
+            raise
+
+    async def run_fetch_image(self, target_url, session_id):
+        limits = {
+            'max_frames': self.positive_image_integer(
+                'PI_NODRIVER_IMAGE_MAX_FRAMES', 100
+            ),
+            'max_width': self.positive_image_integer(
+                'PI_NODRIVER_IMAGE_MAX_WIDTH', 8192
+            ),
+            'max_height': self.positive_image_integer(
+                'PI_NODRIVER_IMAGE_MAX_HEIGHT', 8192
+            ),
+            'max_total_pixels': self.positive_image_integer(
+                'PI_NODRIVER_IMAGE_MAX_TOTAL_PIXELS', 40_000_000
+            ),
+        }
+        max_bytes = self.positive_image_integer(
+            'PI_NODRIVER_IMAGE_MAX_BYTES', 20 * 1024 * 1024
+        )
+        timeout = self.image_fetch_timeout_seconds()
+        try:
+            data, final_url = await asyncio.wait_for(
+                self.fetch_image_bytes(target_url, max_bytes), timeout=timeout
+            )
+        except asyncio.TimeoutError as error:
+            raise ValueError('image fetch deadline exceeded') from error
+
+        mime_type, suffix, width, height, normalized_data = await self.decode_fetched_image(
+            data, limits
+        )
+        if len(normalized_data) > max_bytes:
+            raise ValueError(f'normalized image exceeds the {max_bytes} byte limit')
+        destination_dir = self.session_download_dir(session_id)
+        stem = self.bounded_image_stem(final_url)
+        destination = await self.save_fetched_image(
+            destination_dir, stem, suffix, normalized_data
+        )
+        return destination, mime_type, width, height, final_url
 
     async def configure_download_session(self, session_id, page=None):
         download_dir = self.session_download_dir(session_id)
@@ -1968,6 +2700,10 @@ class BrowserWorker:
         action = parts[0].lower()
         if action not in SUPPORTED_ACTIONS:
             raise ValueError(f'unsupported browser command: {action}')
+        if action == 'fetch-image':
+            result = await self._execute(command, session_id)
+            self.open_action_guard.clear(session_id)
+            return result
         preflight_timeout = self.preflight_timeout_seconds()
         self.track_open_action(session_id, action)
         semantic_click = is_semantic_click_attempt(parts)
@@ -2067,6 +2803,27 @@ class BrowserWorker:
             self.popup_just_switched.discard(session_id)
         if action != 'wait-popup-close':
             self.popup_just_closed.discard(session_id)
+
+        if action == 'fetch-image':
+            if len(parts) != 2:
+                raise ValueError('usage: fetch-image <http(s)://image-url>')
+            path, mime_type, width, height, final_url = await self.run_fetch_image(
+                parts[1], session_id
+            )
+            return {
+                'text': (
+                    f'Image fetched\nType: {mime_type}\nDimensions: {width}x{height}\n'
+                    f'Path: {path}\n'
+                    f'To send this image to the user, include exactly: [[image: {path}]]'
+                ),
+                'action': action,
+                'imagePath': str(path),
+                'mimeType': mime_type,
+                'width': width,
+                'height': height,
+                'size': path.stat().st_size,
+                'url': final_url,
+            }
 
         if action == 'wait-download':
             if len(parts) > 2:
@@ -3198,11 +3955,14 @@ class BrowserWorker:
 async def execute_request(worker, request):
     session_id = str(request.get('sessionId') or 'default')
     command_timeout = float(os.environ.get('PI_NODRIVER_COMMAND_TIMEOUT', '75'))
+    command = str(request.get('command') or '').strip()
+    action = command.split(maxsplit=1)[0].lower() if command else ''
     action_started = False
     try:
-        worker.preflight_timeout_seconds()
-        worker.begin_session_action(session_id)
-        action_started = True
+        if action != 'fetch-image':
+            worker.preflight_timeout_seconds()
+            worker.begin_session_action(session_id)
+            action_started = True
         result = await asyncio.wait_for(
             worker.execute(request.get('command', ''), session_id=session_id),
             timeout=command_timeout,

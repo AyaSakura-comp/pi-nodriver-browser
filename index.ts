@@ -50,6 +50,7 @@ Commands:
   wait-download [ms] - Wait for the active or most recent download
   downloads [limit] - List recent files and in-progress download percentages
   download-latest - Return metadata and the absolute path of the newest completed file
+  fetch-image <url> - Fetch and validate a direct HTTP(S) image URL, then return it inline with a sendable local path
   upload <@ref> <file1> [file2]... - Upload local file(s) into file input or button/dropzone wrapper
   fill <@ref> <text> - Clear and type
   type <@ref> <text> - Type without clearing
@@ -74,6 +75,8 @@ type WorkerResponse = {
   text?: string;
   action?: string;
   screenshotPath?: string;
+  imagePath?: string;
+  mimeType?: string;
   error?: string;
   [key: string]: unknown;
 };
@@ -290,6 +293,22 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      if (response.imagePath) {
+        const image = readFileSync(response.imagePath);
+        const mimeType = response.mimeType || "image/png";
+        const marker = `[[image: ${response.imagePath}]]`;
+        const returnText = text.includes(marker)
+          ? text
+          : `${text}\n(To send this image to user, include '${marker}' in your reply)`;
+        return {
+          content: [
+            { type: "text" as const, text: returnText },
+            { type: "image" as const, data: image.toString("base64"), mimeType },
+          ],
+          details: response,
+        };
+      }
+
       const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
       let output = truncation.content;
       if (truncation.truncated) {
@@ -298,6 +317,46 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text" as const, text: output }],
         details: { ...response, truncated: truncation.truncated },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "fetch_image",
+    label: "Fetch Image",
+    description: "Fetch and validate one direct HTTP/HTTPS image URL discovered by web_search, crawl, or browser. Returns the image inline plus a local path that can be sent to PiWeb or Discord.",
+    promptSnippet: "Fetch a direct image URL found by search, crawl, or browser and return the image inline",
+    promptGuidelines: [
+      "Use fetch_image after web_search, crawl, or browser when the user asks to see or receive a discovered image.",
+      "Pass fetch_image a direct HTTP/HTTPS image URL, not an article, gallery, search-results, or HTML page URL.",
+      "After fetch_image succeeds, include the exact '[[image: <path>]]' marker it returns in the final reply so PiWeb or Discord actually receives the image.",
+    ],
+    parameters: Type.Object({
+      url: Type.String({ description: "Direct HTTP/HTTPS image URL discovered by web_search, crawl, or browser" }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const command = `fetch-image ${JSON.stringify(params.url)}`;
+      const run = async () => worker.request(command, sessionId, signal);
+      const responsePromise = queue.then(run, run);
+      queue = responsePromise.catch(() => undefined);
+      const response = await responsePromise;
+      if (!response.imagePath) {
+        throw new Error("Browser worker did not return a fetched image path");
+      }
+      const image = readFileSync(response.imagePath);
+      const mimeType = response.mimeType || "image/png";
+      const marker = `[[image: ${response.imagePath}]]`;
+      const responseText = response.text || "Image fetched";
+      const text = responseText.includes(marker)
+        ? responseText
+        : `${responseText}\nSend it to the user with exactly: ${marker}`;
+      return {
+        content: [
+          { type: "text" as const, text },
+          { type: "image" as const, data: image.toString("base64"), mimeType },
+        ],
+        details: response,
       };
     },
   });
@@ -332,7 +391,10 @@ export default function (pi: ExtensionAPI) {
       const matched = rawText.match(/https?:\/\/[^\s"'\]\[\<\>]+/g);
       const urlList = matched ? Array.from(new Set(matched.map((u) => u.replace(/[.,;)]+$/, "")))) : [];
       if (urlList.length === 0) {
-        return { content: [{ type: "text" as const, text: "Error: No valid URLs provided to crawl." }] };
+        return {
+          content: [{ type: "text" as const, text: "Error: No valid URLs provided to crawl." }],
+          details: { error: "No valid URLs provided to crawl" },
+        };
       }
       const command = `crawl ${JSON.stringify(urlList)}`;
       const run = async () => worker.request(command, sessionId, signal);

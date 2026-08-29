@@ -1,14 +1,17 @@
 import asyncio
 import functools
 import http.server
+import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1273,6 +1276,785 @@ class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
             await worker.execute('not-a-command', session_id='session-a')
         with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
             worker.track_open_action('session-a', 'open')
+
+
+class FetchImageUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from PIL import Image
+        from worker import BrowserWorker
+
+        image_bytes = io.BytesIO()
+        Image.new('RGB', (3, 2), '#336699').save(image_bytes, format='PNG')
+        self.png_bytes = image_bytes.getvalue()
+        ihdr_length = int.from_bytes(self.png_bytes[8:12], 'big')
+        ihdr_end = 8 + 12 + ihdr_length
+        ihdr_chunk = self.png_bytes[8:ihdr_end]
+        self.duplicate_ihdr_png_bytes = (
+            self.png_bytes[:ihdr_end] + ihdr_chunk + self.png_bytes[ihdr_end:]
+        )
+
+        webp_bytes = io.BytesIO()
+        Image.new('RGB', (3, 2), '#336699').save(webp_bytes, format='WEBP')
+        self.webp_bytes = webp_bytes.getvalue()
+        webp_chunk_length = int.from_bytes(self.webp_bytes[16:20], 'little')
+        webp_chunk_end = 20 + webp_chunk_length + (webp_chunk_length % 2)
+        webp_chunk = self.webp_bytes[12:webp_chunk_end]
+        duplicated_webp = (
+            self.webp_bytes[:webp_chunk_end]
+            + webp_chunk
+            + self.webp_bytes[webp_chunk_end:]
+        )
+        self.duplicate_webp_bytes = (
+            duplicated_webp[:4]
+            + (len(duplicated_webp) - 8).to_bytes(4, 'little')
+            + duplicated_webp[8:]
+        )
+
+        jpeg_bytes = io.BytesIO()
+        Image.new('RGB', (20, 20), '#993333').save(jpeg_bytes, format='JPEG')
+        self.jpeg_bytes = jpeg_bytes.getvalue()
+        self.truncated_jpeg_bytes = self.jpeg_bytes[:-2]
+        self.terminator_restored_jpeg_bytes = self.jpeg_bytes[:-10] + b'\xff\xd9'
+
+        gif_bytes = io.BytesIO()
+        Image.new('RGB', (3, 2), '#112233').save(
+            gif_bytes,
+            format='GIF',
+            save_all=True,
+            append_images=[Image.new('RGB', (3, 2), '#ddeeff')],
+            duration=50,
+            loop=0,
+        )
+        self.animated_gif_bytes = gif_bytes.getvalue()
+        self.terminator_restored_gif_bytes = self.animated_gif_bytes[:-2] + b'\x3b'
+        self.requests = []
+        self.slow_header_started = threading.Event()
+        payloads = {
+            '/sample.png': self.png_bytes,
+            '/large.png': self.png_bytes,
+            '/truncated.jpg': self.truncated_jpeg_bytes,
+            '/truncated.png': self.png_bytes[:-12],
+            '/truncated.gif': self.animated_gif_bytes[:-1],
+            '/restored.jpg': self.terminator_restored_jpeg_bytes,
+            '/restored.gif': self.terminator_restored_gif_bytes,
+            '/duplicate-ihdr.png': self.duplicate_ihdr_png_bytes,
+            '/duplicate-vp8.webp': self.duplicate_webp_bytes,
+            '/animated.gif': self.animated_gif_bytes,
+        }
+        requests = self.requests
+        slow_header_started = self.slow_header_started
+
+        class ImageHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def send_raw(handler_self, chunks, delay=0):
+                handler_self.close_connection = True
+                for chunk in chunks:
+                    try:
+                        handler_self.connection.sendall(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    if delay:
+                        time.sleep(delay)
+
+            def do_GET(handler_self):
+                path = urllib.parse.urlsplit(handler_self.path).path
+                requests.append(path)
+                if path in {'/slow-status.png', '/slow-header.png'}:
+                    if path == '/slow-status.png':
+                        prefix = b'HTTP/1.1 '
+                    else:
+                        prefix = b'HTTP/1.1 200 OK\r\nX-Slow: '
+                    slow_header_started.set()
+                    handler_self.send_raw(
+                        [prefix, *(b'x' for _ in range(40))], 0.015
+                    )
+                    return
+                if path == '/redirect-file':
+                    handler_self.send_response(302)
+                    handler_self.send_header('Location', 'file:///tmp/private.png')
+                    handler_self.send_header('Content-Length', '0')
+                    handler_self.end_headers()
+                    return
+                if path == '/redirect-private':
+                    handler_self.send_response(302)
+                    handler_self.send_header(
+                        'Location',
+                        f'http://127.0.0.1:{handler_self.server.server_port}/sample.png',
+                    )
+                    handler_self.send_header('Content-Length', '0')
+                    handler_self.end_headers()
+                    return
+                if path == '/redirect-ok':
+                    handler_self.send_response(302)
+                    handler_self.send_header('Location', '/sample.png')
+                    handler_self.send_header('Content-Length', '0')
+                    handler_self.end_headers()
+                    return
+                if path.startswith('/redirect-loop/'):
+                    redirect_index = int(path.rsplit('/', 1)[1])
+                    handler_self.send_response(302)
+                    handler_self.send_header('Location', f'/redirect-loop/{redirect_index + 1}')
+                    handler_self.send_header('Content-Length', '0')
+                    handler_self.end_headers()
+                    return
+                if path == '/chunked.png':
+                    handler_self.send_response(200)
+                    handler_self.send_header('Transfer-Encoding', 'chunked')
+                    handler_self.send_header('Connection', 'close')
+                    handler_self.end_headers()
+                    midpoint = len(self.png_bytes) // 2
+                    for chunk in (self.png_bytes[:midpoint], self.png_bytes[midpoint:]):
+                        handler_self.wfile.write(f'{len(chunk):X}\r\n'.encode() + chunk + b'\r\n')
+                    handler_self.wfile.write(b'0\r\n\r\n')
+                    handler_self.wfile.flush()
+                    handler_self.close_connection = True
+                    return
+                if path == '/eof.png':
+                    handler_self.send_response(200)
+                    handler_self.send_header('Connection', 'close')
+                    handler_self.end_headers()
+                    handler_self.wfile.write(self.png_bytes)
+                    handler_self.wfile.flush()
+                    handler_self.close_connection = True
+                    return
+                if path == '/conflicting-length.png':
+                    response = (
+                        b'HTTP/1.1 200 OK\r\nContent-Length: '
+                        + str(len(self.png_bytes)).encode()
+                        + b'\r\nContent-Length: '
+                        + str(len(self.png_bytes) + 1).encode()
+                        + b'\r\nConnection: close\r\n\r\n'
+                        + self.png_bytes
+                    )
+                    handler_self.send_raw([response])
+                    return
+                if path == '/malformed-length.png':
+                    response = (
+                        b'HTTP/1.1 200 OK\r\nContent-Length: bananas\r\n'
+                        b'Connection: close\r\n\r\n' + self.png_bytes
+                    )
+                    handler_self.send_raw([response])
+                    return
+                if path == '/conflicting-framing.png':
+                    response = (
+                        b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: '
+                        + str(len(self.png_bytes)).encode()
+                        + b'\r\nConnection: close\r\n\r\n'
+                        + f'{len(self.png_bytes):X}\r\n'.encode()
+                        + self.png_bytes
+                        + b'\r\n0\r\n\r\n'
+                    )
+                    handler_self.send_raw([response])
+                    return
+                if path == '/bad-chunk.png':
+                    response = (
+                        b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n'
+                        b'Connection: close\r\n\r\nZZ\r\n' + self.png_bytes + b'\r\n0\r\n\r\n'
+                    )
+                    handler_self.send_raw([response])
+                    return
+                if path == '/encoded.png':
+                    response = (
+                        b'HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: '
+                        + str(len(self.png_bytes)).encode()
+                        + b'\r\nConnection: close\r\n\r\n'
+                        + self.png_bytes
+                    )
+                    handler_self.send_raw([response])
+                    return
+                if path == '/not-image':
+                    body = b'<html>not an image</html>'
+                    content_type = 'text/html'
+                else:
+                    body = payloads.get(path, self.png_bytes)
+                    content_type = 'application/octet-stream'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', content_type)
+                handler_self.send_header('Content-Length', str(len(body)))
+                handler_self.send_header('Connection', 'close')
+                handler_self.end_headers()
+                if path == '/deadline.png':
+                    handler_self.wfile.write(body[:1])
+                    handler_self.wfile.flush()
+                    time.sleep(0.15)
+                    body = body[1:]
+                elif path == '/slow-drip.png':
+                    for byte in body:
+                        try:
+                            handler_self.wfile.write(bytes((byte,)))
+                            handler_self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                        time.sleep(0.02)
+                    return
+                try:
+                    handler_self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                handler_self.close_connection = True
+
+            def log_message(self, _format, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), ImageHandler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {
+            'PI_NODRIVER_DOWNLOAD_DIR': str(Path(self.temp_dir.name) / 'downloads'),
+            'PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS': '0',
+        })
+        self.env.start()
+        self.worker = BrowserWorker()
+
+    async def asyncTearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
+        self.env.stop()
+        self.temp_dir.cleanup()
+
+    def local_url(self, path='/sample.png', host='127.0.0.1'):
+        return f'http://{host}:{self.server.server_port}{path}'
+
+    def allow_private_images(self, **extra):
+        return patch.dict(os.environ, {
+            'PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS': '1',
+            **{key: str(value) for key, value in extra.items()},
+        })
+
+    async def test_blocks_private_image_url_by_default_before_request(self):
+        with self.assertRaisesRegex(ValueError, 'non-global address'):
+            await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-a'
+            )
+
+        self.assertEqual(self.requests, [])
+
+    async def test_blocks_nat64_private_targets_and_multicast(self):
+        loop = asyncio.get_running_loop()
+        blocked = (
+            '64:ff9b::7f00:1',
+            '64:ff9b::a9fe:a9fe',
+            'ff02::1',
+            'fec0::1',
+            '::7f00:1',
+            '::ffff:0:7f00:1',
+        )
+        for address in blocked:
+            async def mapped_getaddrinfo(_host, port, **_kwargs):
+                return [
+                    (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (address, port, 0, 0))
+                ]
+
+            with self.subTest(address=address):
+                with patch.object(loop, 'getaddrinfo', new=mapped_getaddrinfo):
+                    with self.assertRaisesRegex(ValueError, 'non-global|global unicast|embedded'):
+                        await self.worker.resolve_image_addresses('image.test', 80)
+
+    async def test_localhost_fixture_requires_explicit_private_url_opt_in(self):
+        url = self.local_url(host='localhost')
+        with self.assertRaisesRegex(ValueError, 'non-global address'):
+            await self.worker.execute(f'fetch-image {url}', session_id='session-a')
+
+        with self.allow_private_images():
+            result = await self.worker.execute(f'fetch-image {url}', session_id='session-a')
+
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+
+    async def test_rejects_url_credentials_before_request(self):
+        url = f'http://user:secret@127.0.0.1:{self.server.server_port}/sample.png'
+        with self.allow_private_images():
+            with self.assertRaisesRegex(ValueError, 'credentials'):
+                await self.worker.execute(f'fetch-image {url}', session_id='session-a')
+
+        self.assertEqual(self.requests, [])
+
+    async def test_rejects_non_http_redirect_without_following_it(self):
+        with self.allow_private_images():
+            with self.assertRaisesRegex(ValueError, 'redirect.*http'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/redirect-file")}',
+                    session_id='session-a',
+                )
+
+        self.assertEqual(self.requests, ['/redirect-file'])
+
+    async def test_rejects_private_redirect_before_following_it(self):
+        loop = asyncio.get_running_loop()
+        real_open_connection = asyncio.open_connection
+
+        async def mapped_getaddrinfo(host, port, **_kwargs):
+            address = '93.184.216.34' if host == 'public.test' else '127.0.0.1'
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (address, port))
+            ]
+
+        async def route_public_fixture(_host, port, **kwargs):
+            return await real_open_connection('127.0.0.1', port, **kwargs)
+
+        public_url = f'http://public.test:{self.server.server_port}/redirect-private'
+        with patch.object(loop, 'getaddrinfo', new=mapped_getaddrinfo):
+            with patch('worker.asyncio.open_connection', new=route_public_fixture):
+                with self.assertRaisesRegex(ValueError, 'non-global address'):
+                    await self.worker.execute(
+                        f'fetch-image {public_url}', session_id='session-a'
+                    )
+
+        self.assertEqual(self.requests, ['/redirect-private'])
+
+    async def test_fetches_image_without_open_browser_page_and_returns_sendable_path(self):
+        with self.allow_private_images():
+            result = await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-a'
+            )
+
+        image_path = Path(result['imagePath'])
+        self.assertTrue(image_path.is_file())
+        self.assertEqual(image_path.read_bytes(), self.png_bytes)
+        self.assertEqual(result['mimeType'], 'image/png')
+        self.assertEqual(result['width'], 3)
+        self.assertEqual(result['height'], 2)
+        self.assertIn(f'[[image: {image_path}]]', result['text'])
+
+    async def test_rejects_non_image_content_without_saving_a_file(self):
+        with self.allow_private_images():
+            with self.assertRaisesRegex(ValueError, 'not a valid image'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/not-image")}',
+                    session_id='session-a',
+                )
+
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_enforces_configured_byte_limit_before_saving(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_MAX_BYTES=10):
+            with self.assertRaisesRegex(ValueError, 'exceeds the 10 byte limit'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/large.png")}',
+                    session_id='session-a',
+                )
+
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_enforces_total_fetch_deadline_while_reading(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=0.05):
+            with self.assertRaisesRegex(ValueError, 'fetch deadline'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/deadline.png")}',
+                    session_id='session-a',
+                )
+
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_total_deadline_stops_slow_status_and_headers_promptly(self):
+        for path in ('/slow-status.png', '/slow-header.png'):
+            with self.subTest(path=path):
+                started = time.monotonic()
+                with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=0.05):
+                    with self.assertRaisesRegex(ValueError, 'fetch deadline'):
+                        await self.worker.execute(
+                            f'fetch-image {self.local_url(path)}',
+                            session_id='session-a',
+                        )
+                elapsed = time.monotonic() - started
+
+                self.assertLess(elapsed, 0.3)
+                self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_total_deadline_stops_a_slow_drip_body_promptly(self):
+        started = time.monotonic()
+        with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=0.05):
+            with self.assertRaisesRegex(ValueError, 'fetch deadline'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/slow-drip.png")}',
+                    session_id='session-a',
+                )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_content_length_chunked_and_eof_bodies_succeed(self):
+        for path in ('/sample.png', '/chunked.png', '/eof.png'):
+            with self.subTest(path=path):
+                with self.allow_private_images():
+                    result = await self.worker.execute(
+                        f'fetch-image {self.local_url(path)}', session_id='session-a'
+                    )
+                self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+
+    async def test_rejects_malformed_or_conflicting_response_framing(self):
+        cases = {
+            '/conflicting-length.png': 'conflicting Content-Length',
+            '/malformed-length.png': 'malformed Content-Length',
+            '/conflicting-framing.png': 'conflicting response framing',
+            '/bad-chunk.png': 'malformed chunked response',
+        }
+        for path, message in cases.items():
+            with self.subTest(path=path):
+                with self.allow_private_images():
+                    with self.assertRaisesRegex(ValueError, message):
+                        await self.worker.execute(
+                            f'fetch-image {self.local_url(path)}', session_id='session-a'
+                        )
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_rejects_unsupported_content_encoding(self):
+        with self.allow_private_images():
+            with self.assertRaisesRegex(ValueError, 'unsupported Content-Encoding'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/encoded.png")}', session_id='session-a'
+                )
+
+    async def test_manual_redirect_success_and_limit(self):
+        with self.allow_private_images():
+            result = await self.worker.execute(
+                f'fetch-image {self.local_url("/redirect-ok")}', session_id='session-a'
+            )
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+        self.assertTrue(result['url'].endswith('/sample.png'))
+
+        self.requests.clear()
+        with self.allow_private_images():
+            with self.assertRaisesRegex(ValueError, 'exceeded the 3 redirect limit'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/redirect-loop/0")}',
+                    session_id='session-a',
+                )
+        self.assertEqual(
+            self.requests,
+            ['/redirect-loop/0', '/redirect-loop/1', '/redirect-loop/2', '/redirect-loop/3'],
+        )
+
+    async def test_dns_is_used_once_and_environment_proxies_are_ignored(self):
+        loop = asyncio.get_running_loop()
+        dns_calls = []
+
+        async def mapped_getaddrinfo(host, port, **kwargs):
+            dns_calls.append((host, port, kwargs))
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', port))
+            ]
+
+        proxy_env = {
+            'http_proxy': 'http://127.0.0.1:1',
+            'HTTP_PROXY': 'http://127.0.0.1:1',
+            'https_proxy': 'http://127.0.0.1:1',
+            'HTTPS_PROXY': 'http://127.0.0.1:1',
+            'all_proxy': 'http://127.0.0.1:1',
+            'ALL_PROXY': 'http://127.0.0.1:1',
+            'no_proxy': '',
+            'NO_PROXY': '',
+        }
+        with patch.object(loop, 'getaddrinfo', new=mapped_getaddrinfo):
+            with self.allow_private_images(**proxy_env):
+                result = await self.worker.execute(
+                    f'fetch-image http://image.test:{self.server.server_port}/sample.png',
+                    session_id='session-a',
+                )
+
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+        self.assertEqual([(host, port) for host, port, _ in dns_calls], [
+            ('image.test', self.server.server_port)
+        ])
+
+    async def test_connection_uses_only_validated_numeric_address(self):
+        loop = asyncio.get_running_loop()
+        real_open_connection = asyncio.open_connection
+        connect_calls = []
+
+        async def mapped_getaddrinfo(host, port, **kwargs):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', port))
+            ]
+
+        async def open_connection_spy(host, port, **kwargs):
+            connect_calls.append((host, port, kwargs))
+            return await real_open_connection(host, port, **kwargs)
+
+        with patch.object(loop, 'getaddrinfo', new=mapped_getaddrinfo):
+            with patch('worker.asyncio.open_connection', new=open_connection_spy):
+                with self.allow_private_images():
+                    result = await self.worker.execute(
+                        f'fetch-image http://pin.test:{self.server.server_port}/sample.png',
+                        session_id='session-a',
+                    )
+
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+        self.assertTrue(connect_calls)
+        for host, port, kwargs in connect_calls:
+            self.assertEqual(host, '127.0.0.1')
+            self.assertEqual(port, self.server.server_port)
+            self.assertEqual(kwargs['family'], socket.AF_INET)
+            self.assertEqual(kwargs['flags'], socket.AI_NUMERICHOST)
+
+    async def test_async_dns_delay_obeys_absolute_deadline_promptly(self):
+        loop = asyncio.get_running_loop()
+        resolver_started = asyncio.Event()
+
+        async def delayed_getaddrinfo(_host, _port, **_kwargs):
+            resolver_started.set()
+            await asyncio.sleep(10)
+            return []
+
+        started = time.monotonic()
+        with patch.object(loop, 'getaddrinfo', new=delayed_getaddrinfo):
+            with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=0.05):
+                with self.assertRaisesRegex(ValueError, 'fetch deadline'):
+                    await self.worker.execute(
+                        'fetch-image http://slow-dns.test/sample.png', session_id='session-a'
+                    )
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(resolver_started.is_set())
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_cancellation_during_async_dns_is_prompt(self):
+        loop = asyncio.get_running_loop()
+        resolver_started = asyncio.Event()
+
+        async def delayed_getaddrinfo(_host, _port, **_kwargs):
+            resolver_started.set()
+            await asyncio.sleep(10)
+            return []
+
+        with patch.object(loop, 'getaddrinfo', new=delayed_getaddrinfo):
+            with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=5):
+                task = asyncio.create_task(self.worker.execute(
+                    'fetch-image http://cancel-dns.test/sample.png', session_id='session-a'
+                ))
+                await asyncio.wait_for(resolver_started.wait(), timeout=0.2)
+                started = time.monotonic()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_rejects_excessive_image_width_before_saving(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_MAX_WIDTH=2):
+            with self.assertRaisesRegex(ValueError, 'width.*2'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url()}', session_id='session-a'
+                )
+
+    async def test_rejects_excessive_cumulative_frame_pixels_before_saving(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_MAX_TOTAL_PIXELS=11):
+            with self.assertRaisesRegex(ValueError, 'cumulative frame pixels.*11'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/animated.gif")}',
+                    session_id='session-a',
+                )
+
+    async def test_rejects_excessive_frame_count_before_saving(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_MAX_FRAMES=1):
+            with self.assertRaisesRegex(ValueError, 'more than 1 frame'):
+                await self.worker.execute(
+                    f'fetch-image {self.local_url("/animated.gif")}',
+                    session_id='session-a',
+                )
+
+    async def test_rejects_truncated_image_containers_before_saving(self):
+        for path in ('/truncated.jpg', '/truncated.png', '/truncated.gif'):
+            with self.subTest(path=path):
+                with self.allow_private_images():
+                    with self.assertRaisesRegex(ValueError, 'not a valid image'):
+                        await self.worker.execute(
+                            f'fetch-image {self.local_url(path)}',
+                            session_id='session-a',
+                        )
+
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_canonicalizes_terminator_restored_jpeg_and_gif(self):
+        from PIL import Image
+
+        malformed = {
+            '/restored.jpg': self.terminator_restored_jpeg_bytes,
+            '/restored.gif': self.terminator_restored_gif_bytes,
+            '/duplicate-ihdr.png': self.duplicate_ihdr_png_bytes,
+            '/duplicate-vp8.webp': self.duplicate_webp_bytes,
+        }
+        for path, original_bytes in malformed.items():
+            with self.subTest(path=path):
+                with self.allow_private_images():
+                    result = await self.worker.execute(
+                        f'fetch-image {self.local_url(path)}', session_id='session-a'
+                    )
+                output = Path(result['imagePath']).read_bytes()
+                self.assertNotEqual(output, original_bytes)
+                with Image.open(io.BytesIO(output)) as image:
+                    for frame_index in range(getattr(image, 'n_frames', 1)):
+                        image.seek(frame_index)
+                        image.load()
+
+    async def test_existing_filename_is_not_overwritten(self):
+        destination_dir = self.worker.session_download_dir('session-a')
+        existing = destination_dir / 'sample.png'
+        existing.write_bytes(b'keep me')
+
+        with self.allow_private_images():
+            result = await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-a'
+            )
+
+        self.assertEqual(existing.read_bytes(), b'keep me')
+        self.assertNotEqual(Path(result['imagePath']), existing)
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+
+    async def test_concurrent_fetches_use_exclusive_collision_safe_names(self):
+        destination_dir = self.worker.session_download_dir('session-a')
+        first_candidate = destination_dir / 'sample.png'
+        original_exists = Path.exists
+
+        def force_current_exists_write_race(path):
+            if path == first_candidate:
+                return False
+            return original_exists(path)
+
+        with patch.object(Path, 'exists', force_current_exists_write_race):
+            with self.allow_private_images():
+                results = await asyncio.gather(*(
+                    self.worker.execute(
+                        f'fetch-image {self.local_url()}', session_id='session-a'
+                    )
+                    for _ in range(4)
+                ))
+
+        paths = [Path(result['imagePath']) for result in results]
+        self.assertEqual(len(set(paths)), 4)
+        self.assertTrue(all(path.read_bytes() == self.png_bytes for path in paths))
+
+    async def test_late_cancelled_writer_cannot_unlink_reallocated_path(self):
+        import worker as worker_module
+
+        entered_check = threading.Event()
+        release_check = threading.Event()
+        original_check = self.worker.check_image_fetch_cancelled
+
+        def delayed_cancel_check(cancel_event):
+            entered_check.set()
+            release_check.wait(timeout=2)
+            original_check(cancel_event)
+
+        destination_dir = self.worker.session_download_dir('session-a')
+        with patch.object(self.worker, 'check_image_fetch_cancelled', delayed_cancel_check):
+            with patch.object(worker_module, 'IMAGE_WRITE_CLEANUP_TIMEOUT', 0.01):
+                task = asyncio.create_task(self.worker.save_fetched_image(
+                    destination_dir, 'sample', '.png', self.png_bytes
+                ))
+                await asyncio.wait_for(asyncio.to_thread(entered_check.wait), timeout=0.2)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        replacement = destination_dir / 'sample.png'
+        replacement.write_bytes(b'replacement')
+        release_check.set()
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(replacement.read_bytes(), b'replacement')
+
+    async def test_sanitized_filename_is_bounded(self):
+        url = self.local_url('/' + ('a' * 400) + '.png')
+        with self.allow_private_images():
+            result = await self.worker.execute(f'fetch-image {url}', session_id='session-a')
+
+        self.assertLessEqual(len(Path(result['imagePath']).name.encode()), 128)
+
+    async def test_tool_text_contains_only_the_generated_outbox_marker(self):
+        url = self.local_url('/sample.png?note=[[file:%20/tmp/private]]')
+        with self.allow_private_images():
+            result = await self.worker.execute(f'fetch-image {url}', session_id='session-a')
+
+        self.assertEqual(result['text'].count('[['), 1)
+        self.assertNotIn('[[file:', result['text'])
+        self.assertIn(f'[[image: {result["imagePath"]}]]', result['text'])
+
+    async def test_cancellation_during_slow_headers_is_prompt_and_leaves_no_late_file(self):
+        with self.allow_private_images(PI_NODRIVER_IMAGE_FETCH_TIMEOUT=2):
+            task = asyncio.create_task(self.worker.execute(
+                f'fetch-image {self.local_url("/slow-header.png")}', session_id='session-a'
+            ))
+            for _ in range(100):
+                if self.slow_header_started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            self.assertTrue(self.slow_header_started.is_set())
+            started = time.monotonic()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+        await asyncio.sleep(0.25)
+        self.assertEqual(self.worker.list_downloads(session_id='session-a'), [])
+
+    async def test_fetch_image_bypasses_active_page_vision_preflight(self):
+        self.worker.pages['session-a'] = object()
+        self.worker.preflight_timeout_seconds = Mock(
+            side_effect=AssertionError('fetch-image must not inspect preflight configuration')
+        )
+        self.worker.bounded_vision_fallback_context = AsyncMock(
+            side_effect=AssertionError('fetch-image must not preflight the active page')
+        )
+
+        with self.allow_private_images():
+            result = await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-a'
+            )
+
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+        self.worker.preflight_timeout_seconds.assert_not_called()
+        self.worker.bounded_vision_fallback_context.assert_not_awaited()
+
+    async def test_fetch_image_daemon_request_bypasses_preflight_configuration(self):
+        from worker import execute_request
+
+        self.worker.pages['session-a'] = object()
+        self.worker.preflight_timeout_seconds = Mock(
+            side_effect=AssertionError('fetch-image must not inspect preflight configuration')
+        )
+        self.worker.begin_session_action = Mock(
+            side_effect=AssertionError('fetch-image must not account against an active page')
+        )
+        with self.allow_private_images():
+            result = await execute_request(self.worker, {
+                'id': 1,
+                'sessionId': 'session-a',
+                'command': f'fetch-image {self.local_url()}',
+            })
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(Path(result['imagePath']).read_bytes(), self.png_bytes)
+        self.worker.preflight_timeout_seconds.assert_not_called()
+
+    async def test_keeps_fetched_images_isolated_by_pi_session(self):
+        with self.allow_private_images():
+            first = await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-a'
+            )
+            second = await self.worker.execute(
+                f'fetch-image {self.local_url()}', session_id='session-b'
+            )
+
+        first_path = Path(first['imagePath'])
+        second_path = Path(second['imagePath'])
+        self.assertNotEqual(first_path.parent, second_path.parent)
+        self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+
+    async def test_rejects_non_http_image_urls_and_port_zero(self):
+        with self.assertRaisesRegex(ValueError, 'http or https'):
+            await self.worker.execute('fetch-image file:///tmp/private.png', session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'port zero'):
+            await self.worker.execute('fetch-image http://example.com:0/image.png', session_id='session-a')
 
 
 @unittest.skipUnless(os.environ.get('RUN_BROWSER_INTEGRATION') == '1', 'browser integration test')
