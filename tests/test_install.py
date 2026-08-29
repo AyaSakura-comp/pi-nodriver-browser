@@ -61,6 +61,28 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
 
+    def test_installs_parallel_image_delivery_and_incidental_crawl_image_guidance(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+
+        self.assertIn('name: "fetch_images"', extension_source)
+        self.assertIn('Promise.allSettled', extension_source)
+        self.assertGreaterEqual(extension_source.count('throw new Error("fetch_images cancelled")'), 2)
+        self.assertIn('Type.Array(Type.String', extension_source)
+        self.assertIn('MAX_BATCH_IMAGE_BYTES', extension_source)
+        self.assertIn('attachmentBytes', extension_source)
+        batch_tool = extension_source.split('name: "fetch_images"', 1)[1].split('name: "crawl"', 1)[0]
+        self.assertNotIn('type: "image"', batch_tool)
+        self.assertIn('without injecting image bytes into the next model turn', batch_tool)
+        self.assertIn('concrete products, people, places, animals, or events', extension_source)
+        self.assertIn('even when the user did not explicitly ask for images', extension_source)
+        self.assertIn('Do not finalize a concrete-subject answer', extension_source)
+        self.assertIn('clean page text plus ranked image candidates', extension_source)
+        self.assertIn('get text|images|url|title', extension_source)
+        self.assertIn("extract_image_candidate_result(tab)", worker_source)
+        self.assertIn("'imageCandidates': image_candidates", worker_source)
+        self.assertIn("'imageCount':", worker_source)
+
     def test_fetch_image_metadata_does_not_force_implicit_visual_intent(self):
         extension_source = (ROOT / 'index.ts').read_text()
         self.assertIn(

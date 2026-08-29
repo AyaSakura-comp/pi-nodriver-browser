@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createConnection, type Socket } from "node:net";
@@ -13,6 +13,7 @@ const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PYTHON = join(ROOT, ".venv", "bin", "python");
 const WORKER = join(ROOT, "worker.py");
 const MARKER = "__PI_NODRIVER__";
+const MAX_BATCH_IMAGE_BYTES = 40 * 1024 * 1024;
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 
 const DESCRIPTION = `Autonomous live browser automation (permanently fixed in iPhone Mobile Mode 390x844).
@@ -21,7 +22,8 @@ ROUTING GUIDELINES:
 - WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.
 Guidelines:
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use 'fill-submit <@ref> <text>' to fill and submit forms in 1 atomic step.
-- Goal-Driven: Stop and report immediately once the required info (price, stock, specs) is found in search results or current view. Do not over-explore sub-pages.
+- Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
+- Incidental Image Completion: Do not finalize a concrete-subject answer as text-only when get text/crawl returned relevant representative or content candidates. Call fetch_images with 1–3 non-duplicate direct URLs even when the user did not mention images; skip only irrelevant, logo/icon/ad/tracking, or low-confidence assets.
 - One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops. A full overview is visual-only: run 'snapshot -i' before interacting.
 - Semantic-First Iframes: Controls inside same-origin iframes receive normal @refs plus frame labels. Use fill/select/click @ref, click-text, or click-css; never guess viewport coordinates for ordinary iframe controls.
 - Searchable Dropdowns: Native <select> controls show their label, selected value, option count, and option type. Do not click them open or infer their contents from the first option. Use find-option "fuzzy keywords", then copy a returned complete 'Select exactly' command; its index and fingerprint prevent stale-option mistakes.
@@ -34,7 +36,7 @@ Guidelines:
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
 Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto-returns results DOM) → report answer.
 Commands:
-  crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean extracted markdown
+  crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean page text plus ranked image candidates
   open <url> - Navigate to URL (automatically returns interactive elements snapshot with @refs)
   fill-submit <@ref> <text> - Clear, type, and submit form / press Enter in 1 atomic step (returns updated results snapshot)
   snapshot -i - List interactive elements in the current viewport with compact @refs
@@ -58,7 +60,7 @@ Commands:
   select <@ref> <query|--index=N --fingerprint=HASH> - Fuzzy-select a confident option, or safely choose the exact candidate returned by find-option
   press <key> - Press Enter, Tab, Space, Backspace, or text
   scroll <down|up|top|bottom|left|right> [px] - Smart scroll page or nested container (returns position & 100% boundary feedback)
-  get text|url|title [@ref] - Get information
+  get text|images|url|title [@ref] - Get page text with image candidates, image candidates only, URL, or title
   wait-popup [ms] - Wait for an OAuth/login popup and switch to it
   wait-popup-close [ms] - Wait for the active popup to close and return to its opener
   switch opener - Return to the popup's opener without closing the popup
@@ -255,7 +257,9 @@ export default function (pi: ExtensionAPI) {
       "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
       "Never issue more than 2 consecutive browser open actions. The 3rd and later opens are blocked by OPEN_LOOP_GUARD until a non-open browser action runs; use the current page or batch URLs with crawl instead.",
       "Browser enforces a global 20-tab LRU limit. Inactive least-recently-used tabs may be evicted automatically; tabs currently executing commands or downloading are protected.",
-      "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text on page in 1 step, or 'screenshot --full' to view the entire layout.",
+      "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text and ranked image candidates from the page in 1 step, or 'screenshot --full' to view the entire layout.",
+      "After opening the selected page for a concrete product, person, place, animal, or event, use 'get text' once; when its image candidates are genuinely useful, call fetch_images with 1–3 non-duplicate candidates and include the returned markers even when the user did not explicitly ask for images.",
+      "Do not finalize a concrete-subject answer as text-only after get text or crawl returned relevant representative/content image candidates; fetching those candidates is part of answer completion, not extra browsing.",
       "For e-commerce pages with specs or options (e.g. degrees, sizes, colors), select the spec first (e.g. click @ref for '400度' or '請選擇商品規格'), then click @ref to add to cart. Spec selection drawers are in-page modals; run snapshot -i after opening, and do NOT use wait-popup.",
       "A LOOP_GUARD or SCROLL_LOOP_GUARD error means the browser is not making progress: stop scrolling, and use 'get text', 'screenshot --full', or answer with your own knowledge.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
@@ -362,16 +366,91 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "fetch_images",
+    label: "Fetch Images in Parallel",
+    description: "Securely fetch and validate up to four direct HTTP/HTTPS image URLs in parallel. Returns exact PiWeb/Discord delivery markers without injecting image bytes into the next model turn.",
+    promptSnippet: "Fetch several selected direct image URLs in parallel and return their delivery markers",
+    promptGuidelines: [
+      "Use fetch_images for 1–3 useful, non-duplicate candidates returned by crawl or browser; use at most four.",
+      "For concrete products, people, places, animals, or events, include useful images even when the user did not explicitly ask for images, unless the images are irrelevant, low-confidence, logos, icons, ads, or tracking assets.",
+      "Pass only direct HTTP/HTTPS image URLs. Do not pass article, gallery, search-results, blob, data, or HTML page URLs.",
+      "After fetch_images succeeds, include each exact '[[image: <path>]]' marker it returns in the final reply.",
+    ],
+    parameters: Type.Object({
+      urls: Type.Array(Type.String({ description: "Direct HTTP/HTTPS image URL selected from crawl or browser candidates" }), {
+        minItems: 1,
+        maxItems: 4,
+        description: "One to four unique direct image URLs to fetch concurrently",
+      }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const urls = Array.from(new Set((params.urls || []).map((url) => String(url).trim()).filter(Boolean))).slice(0, 4);
+      if (urls.length === 0) {
+        throw new Error("fetch_images requires at least one direct image URL");
+      }
+      if (signal?.aborted) {
+        throw new Error("fetch_images cancelled");
+      }
+      const settled = await Promise.allSettled(
+        urls.map((url) => worker.request(`fetch-image ${JSON.stringify(url)}`, sessionId, signal)),
+      );
+      const successes = settled
+        .filter((result): result is PromiseFulfilledResult<WorkerResponse> => result.status === "fulfilled")
+        .map((result) => result.value)
+        .filter((response) => Boolean(response.imagePath));
+      const failedCount = settled.length - successes.length;
+      if (signal?.aborted) {
+        throw new Error("fetch_images cancelled");
+      }
+      if (successes.length === 0) {
+        throw new Error(`All ${urls.length} parallel image fetches failed`);
+      }
+
+      let attachmentBytes = 0;
+      const deliverable: Array<{ response: WorkerResponse; size: number }> = [];
+      for (const response of successes) {
+        const size = statSync(String(response.imagePath)).size;
+        if (attachmentBytes + size > MAX_BATCH_IMAGE_BYTES) continue;
+        attachmentBytes += size;
+        deliverable.push({ response, size });
+      }
+      if (deliverable.length === 0) {
+        throw new Error("Parallel image results exceed the aggregate attachment byte limit");
+      }
+      const omittedForBudget = successes.length - deliverable.length;
+      const markers = deliverable.map(({ response }) => `[[image: ${response.imagePath}]]`);
+      const text = [
+        `Fetched ${deliverable.length}/${urls.length} images in parallel${failedCount ? `; ${failedCount} failed validation or download` : ""}${omittedForBudget ? `; ${omittedForBudget} omitted by the aggregate attachment limit` : ""}.`,
+        "Include each successful image in the final reply with exactly these markers:",
+        ...markers,
+      ].join("\n");
+      return {
+        content: [{ type: "text" as const, text }],
+        details: {
+          successCount: deliverable.length,
+          failedCount,
+          omittedForBudget,
+          totalCount: urls.length,
+          attachmentBytes,
+          results: deliverable.map(({ response }) => response),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "crawl",
     label: "Parallel Browser Crawl",
-    description: "Crawl one or multiple web pages in parallel using local headful Chromium with fast-path DOM ready. Replaces Firecrawl with zero rate-limit and faster multi-tab speed.",
-    promptSnippet: "Crawl one or multiple web URLs in parallel to extract full clean page text",
+    description: "Crawl one or multiple web pages in parallel using local headful Chromium with fast-path DOM ready. Returns clean page text plus ranked image candidates without downloading image bytes.",
+    promptSnippet: "Crawl one or multiple web URLs in parallel to extract clean page text plus ranked image candidates",
     promptGuidelines: [
       "Use crawl when you need the full content of one or multiple web pages.",
       "Reach for it right after web_search whenever the snippets are too thin to answer from: crawl the promising result URLs rather than guessing at what the pages say.",
       "Always pass every URL you want in a SINGLE call. Splitting them costs one agent round-trip per URL, which dwarfs the fetch itself — measured on this setup, four real pages came back in about 1.5s in one call, so the fetching was never the bottleneck.",
       "Do not pre-filter down to a single 'best' URL out of caution. Crawling several and comparing is cheap here, and a failed page is reported per-URL without affecting the others.",
-      "Crawl executes JavaScript, bypasses anti-bot barriers, and extracts clean readable text from all pages simultaneously.",
+      "Crawl executes JavaScript, bypasses anti-bot barriers, and extracts clean readable text plus ranked image candidates from all pages simultaneously.",
+      "When the answer concerns concrete products, people, places, animals, or events and crawl returns relevant candidates, call fetch_images for 1–3 useful non-duplicate images even when the user did not explicitly ask for images; skip logos, icons, ads, tracking assets, and low-confidence candidates.",
     ],
     parameters: Type.Object({
       urls: Type.Array(Type.String({ description: "URL to crawl" }), {

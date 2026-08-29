@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Product image fixture</title>
+  <meta property="og:image" content="/images/product-hero.jpg">
+  <meta property="og:image:url" content="/images/product-hero.jpg">
+  <meta property="og:image:secure_url" content="/images/product-hero-secure.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="800">
+  <meta property="og:image:alt" content="DGX fixture hero">
+  <meta property="og:image" content="/images/product-secondary.jpg">
+  <meta property="og:image:secure_url" content="javascript:invalid-secure-image">
+  <meta property="og:image:width" content="2400">
+  <meta property="og:image:height" content="1600">
+  <meta property="og:image:alt" content="DGX secondary view">
+  <meta name="twitter:image" content="/images/twitter-only.jpg">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    "name": "DGX Fixture",
+    "image": [
+      "/images/product-main.jpg",
+      {"@type": "ImageObject", "contentUrl": "/images/product-detail.jpg", "width": 900, "height": 700},
+      {"@type": "ImageObject", "contentUrl": "/images/tracking-banner.jpg", "width": 2000, "height": 1000}
+    ],
+    "logo": "/images/brand-logo.jpg"
+  }
+  </script>
+</head>
+<body>
+  <main>
+    <h1>DGX Fixture</h1>
+    <p>Product specifications and availability.</p>
+    <picture>
+      <source srcset="/images/product-main-1600.jpg 1600w, /images/product-main-800.jpg 800w">
+      <img src="/images/product-main.jpg" width="1000" height="750" alt="DGX front view">
+    </picture>
+    <figure>
+      <img data-src="/images/product-side.jpg" width="900" height="700" alt="DGX side view">
+      <figcaption>Side ports and cooling vents</figcaption>
+    </figure>
+    <img src="/images/tiny.svg" data-src="/images/product-back.jpg"
+         width="850" height="650" alt="DGX rear ports">
+    <img src="/images/opaque-loading-resource" data-src="/images/product-top.jpg"
+         width="820" height="620" alt="DGX top view">
+  </main>
+  <footer>
+    <img src="/images/tracking-pixel.gif" width="1" height="1" alt="tracking pixel">
+    <img src="/images/brand-logo.jpg" width="32" height="32" alt="brand logo">
+  </footer>
+</body>
+</html>
