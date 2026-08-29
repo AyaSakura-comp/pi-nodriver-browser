@@ -324,10 +324,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "fetch_image",
     label: "Fetch Image",
-    description: "Fetch and validate one direct HTTP/HTTPS image URL discovered by web_search, crawl, or browser. Returns the image inline plus a local path that can be sent to PiWeb or Discord.",
-    promptSnippet: "Fetch a direct image URL found by search, crawl, or browser and return the image inline",
+    description: "Fetch and validate one direct HTTP/HTTPS image URL discovered through web_search, crawl, or browser for explicit or implicit visual-delivery requests. Returns the image inline with a PiWeb/Discord path.",
+    promptSnippet: "Fetch and deliver an actual image from a discovered direct image URL for visual-appearance requests",
     promptGuidelines: [
       "Use fetch_image after web_search, crawl, or browser when the user asks to see or receive a discovered image.",
+      "Treat visual-appearance questions such as 「X 長怎樣？」 or 'what does X look like?', and explicit image/photo requests for a visually depictable real-world subject such as 'show me a leopard cat', as image-delivery intent: search for a suitable direct image URL, call fetch_image, and do not answer with text alone unless no deliverable image can be found.",
       "Pass fetch_image a direct HTTP/HTTPS image URL, not an article, gallery, search-results, or HTML page URL.",
       "After fetch_image succeeds, include the exact '[[image: <path>]]' marker it returns in the final reply so PiWeb or Discord actually receives the image.",
     ],

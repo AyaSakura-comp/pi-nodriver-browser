@@ -61,6 +61,16 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
 
+    def test_visual_appearance_questions_trigger_image_discovery_and_delivery(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        self.assertIn('Treat visual-appearance questions', extension_source)
+        self.assertIn('「X 長怎樣？」', extension_source)
+        self.assertIn('what does X look like?', extension_source)
+        self.assertIn('search for a suitable direct image URL', extension_source)
+        self.assertIn('visually depictable real-world subject', extension_source)
+        self.assertIn('do not answer with text alone', extension_source)
+        self.assertNotIn("requests such as 'show me X' or '給我看 X'", extension_source)
+
 
 if __name__ == '__main__':
     unittest.main()
