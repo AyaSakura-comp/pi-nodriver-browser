@@ -3828,13 +3828,14 @@ class BrowserWorker:
         except Exception:
             return False
 
-    async def xvfb_mouse_long_press(self, page, x, y, duration_ms=1000):
+    async def xvfb_mouse_long_press(self, page, x, y, duration_ms=1000, capture_midway=True):
         toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
         screen_x = int(round(float(x)))
         screen_y = int(round(float(y))) + toolbar_height
         jitter_enabled = os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER', '1') == '1'
         max_jitter = float(os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER_PX', '2.0'))
         display = os.environ.get('DISPLAY')
+        midway_path = None
         if display:
             try:
                 p1 = await asyncio.create_subprocess_exec(
@@ -3848,14 +3849,25 @@ class BrowserWorker:
                 )
                 await p2.wait()
                 total_seconds = max(0.05, duration_ms / 1000.0)
-                if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
-                    loop = asyncio.get_running_loop()
-                    end_time = loop.time() + total_seconds
-                    curr_dx, curr_dy = 0.0, 0.0
-                    while loop.time() < end_time:
-                        remaining = end_time - loop.time()
-                        if remaining <= 0.03:
-                            break
+                midway_target_sec = total_seconds * 0.5
+                loop = asyncio.get_running_loop()
+                start_time = loop.time()
+                end_time = start_time + total_seconds
+                midway_captured = False
+                curr_dx, curr_dy = 0.0, 0.0
+                while loop.time() < end_time:
+                    now = loop.time()
+                    elapsed = now - start_time
+                    remaining = end_time - now
+                    if capture_midway and not midway_captured and elapsed >= midway_target_sec:
+                        try:
+                            midway_path = await self.save_viewport_screenshot(page, 'pi-nodriver-longpress-midway-')
+                        except Exception:
+                            pass
+                        midway_captured = True
+                    if remaining <= 0.03:
+                        break
+                    if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
                         step_delay = min(max(0.04, random.uniform(0.05, 0.09)), remaining)
                         curr_dx = max(-max_jitter, min(max_jitter, curr_dx + random.uniform(-0.8, 0.8)))
                         curr_dy = max(-max_jitter, min(max_jitter, curr_dy + random.uniform(-0.8, 0.8)))
@@ -3867,40 +3879,58 @@ class BrowserWorker:
                         )
                         await pm.wait()
                         await asyncio.sleep(step_delay)
-                else:
-                    await asyncio.sleep(total_seconds)
+                    else:
+                        await asyncio.sleep(min(0.05, remaining))
+                if capture_midway and not midway_captured:
+                    try:
+                        midway_path = await self.save_viewport_screenshot(page, 'pi-nodriver-longpress-midway-')
+                    except Exception:
+                        pass
                 p3 = await asyncio.create_subprocess_exec(
                     'xdotool', 'mouseup', '1',
                     env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
                 )
                 await p3.wait()
-                return True
+                return midway_path or True
             except Exception:
                 pass
         return False
 
-    async def native_long_press(self, page, x, y, duration_ms=1000):
+    async def native_long_press(self, page, x, y, duration_ms=1000, capture_midway=True):
         await page.bring_to_front()
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
-            if await self.xvfb_mouse_long_press(page, x, y, duration_ms):
+            res = await self.xvfb_mouse_long_press(page, x, y, duration_ms, capture_midway=capture_midway)
+            if res:
                 await page.sleep(0.2)
-                return True
+                return res if isinstance(res, (str, Path)) else None
         try:
             jitter_enabled = os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER', '1') == '1'
             max_jitter = float(os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER_PX', '2.0'))
             fx, fy = float(x), float(y)
+            midway_path = None
             await page.send(uc.cdp.input_.dispatch_mouse_event(
                 type_='mousePressed', x=fx, y=fy, button=uc.cdp.input_.MouseButton.LEFT, click_count=1
             ))
             total_seconds = max(0.05, duration_ms / 1000.0)
-            if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
-                loop = asyncio.get_running_loop()
-                end_time = loop.time() + total_seconds
-                curr_dx, curr_dy = 0.0, 0.0
-                while loop.time() < end_time:
-                    remaining = end_time - loop.time()
-                    if remaining <= 0.03:
-                        break
+            midway_target_sec = total_seconds * 0.5
+            loop = asyncio.get_running_loop()
+            start_time = loop.time()
+            end_time = start_time + total_seconds
+            midway_captured = False
+            curr_dx, curr_dy = 0.0, 0.0
+            while loop.time() < end_time:
+                now = loop.time()
+                elapsed = now - start_time
+                remaining = end_time - now
+                if capture_midway and not midway_captured and elapsed >= midway_target_sec:
+                    try:
+                        midway_path = await self.save_viewport_screenshot(page, 'pi-nodriver-longpress-midway-')
+                    except Exception:
+                        pass
+                    midway_captured = True
+                if remaining <= 0.03:
+                    break
+                if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
                     step_delay = min(max(0.04, random.uniform(0.05, 0.09)), remaining)
                     curr_dx = max(-max_jitter, min(max_jitter, curr_dx + random.uniform(-0.8, 0.8)))
                     curr_dy = max(-max_jitter, min(max_jitter, curr_dy + random.uniform(-0.8, 0.8)))
@@ -3908,15 +3938,20 @@ class BrowserWorker:
                         type_='mouseMoved', x=fx + curr_dx, y=fy + curr_dy, buttons=1
                     ))
                     await asyncio.sleep(step_delay)
-            else:
-                await asyncio.sleep(total_seconds)
+                else:
+                    await asyncio.sleep(min(0.05, remaining))
+            if capture_midway and not midway_captured:
+                try:
+                    midway_path = await self.save_viewport_screenshot(page, 'pi-nodriver-longpress-midway-')
+                except Exception:
+                    pass
             await page.send(uc.cdp.input_.dispatch_mouse_event(
                 type_='mouseReleased', x=fx, y=fy, button=uc.cdp.input_.MouseButton.LEFT, click_count=1
             ))
             await page.sleep(0.2)
-            return True
+            return midway_path
         except Exception:
-            return False
+            return None
 
     async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
@@ -4949,14 +4984,16 @@ class BrowserWorker:
             except Exception:
                 self.vision_guard.invalidate(session_id)
                 raise
-            self.vision_guard.invalidate(session_id)
-            await self.native_long_press(page, marker.click_x, marker.click_y, duration_ms=duration_ms)
+            midway_path = await self.native_long_press(
+                page, marker.click_x, marker.click_y, duration_ms=duration_ms, capture_midway=True
+            )
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
-            return {
+            midway_info = f'\n📸 Captured live midway snapshot while held down at 50% ({int(duration_ms*0.5)}ms).' if midway_path else ''
+            resp = {
                 'text': (
                     f'Vision-confirmed long press executed at ({marker.x:g}, {marker.y:g}) '
-                    f'for {duration_ms}ms (isTrusted: true).\n'
+                    f'for {duration_ms}ms (isTrusted: true).{midway_info}\n'
                     f'URL: {page.url}'
                 ),
                 'action': action,
@@ -4965,6 +5002,10 @@ class BrowserWorker:
                 'y': marker.y,
                 'durationMs': duration_ms,
             }
+            if midway_path:
+                resp['screenshotPath'] = str(midway_path)
+                resp['midwayScreenshotPath'] = str(midway_path)
+            return resp
 
         if action == 'click':
             page = await self.require_page(session_id)
@@ -5002,16 +5043,23 @@ class BrowserWorker:
             self.vision_guard.invalidate(session_id)
             previous = page
             await self.configure_download_session(session_id, page)
-            await self.native_long_press(page, target['x'], target['y'], duration_ms=duration_ms)
+            midway_path = await self.native_long_press(
+                page, target['x'], target['y'], duration_ms=duration_ms, capture_midway=True
+            )
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
-            return {
-                'text': f'Long pressed {ref} ({target.get("tag", "element")}: {target.get("text", "")[:120]}) for {duration_ms}ms (isTrusted: true)\nURL: {page.url}',
+            midway_info = f'\n📸 Captured live midway snapshot while held down at 50% ({int(duration_ms*0.5)}ms).' if midway_path else ''
+            resp = {
+                'text': f'Long pressed {ref} ({target.get("tag", "element")}: {target.get("text", "")[:120]}) for {duration_ms}ms (isTrusted: true).{midway_info}\nURL: {page.url}',
                 'action': action,
                 'url': page.url,
                 'ref': ref,
                 'durationMs': duration_ms,
             }
+            if midway_path:
+                resp['screenshotPath'] = str(midway_path)
+                resp['midwayScreenshotPath'] = str(midway_path)
+            return resp
 
         if action in ('click-text', 'click-css'):
             if len(parts) < 2:
