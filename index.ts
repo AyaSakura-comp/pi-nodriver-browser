@@ -212,7 +212,7 @@ class NodriverWorker {
     return this.connecting;
   }
 
-  async request(command: string, sessionId: string, signal?: AbortSignal): Promise<WorkerResponse> {
+  private async sendRequest(command: string, sessionId: string, signal?: AbortSignal): Promise<WorkerResponse> {
     const socket = await this.connection();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -247,6 +247,25 @@ class NodriverWorker {
         if (error) finishWithError(error, false);
       });
     });
+  }
+
+  async request(command: string, sessionId: string, signal?: AbortSignal, retryCount = 1): Promise<WorkerResponse> {
+    try {
+      return await this.sendRequest(command, sessionId, signal);
+    } catch (error) {
+      if (
+        retryCount > 0 &&
+        error instanceof Error &&
+        (error.message.includes("closed") ||
+          error.message.includes("reset") ||
+          error.message.includes("did not start") ||
+          error.message.includes("connecting"))
+      ) {
+        this.disconnect();
+        return await this.request(command, sessionId, signal, retryCount - 1);
+      }
+      throw error;
+    }
   }
 
   disconnect() {
@@ -290,6 +309,7 @@ export default function (pi: ExtensionAPI) {
       "For downloads, inspect with download-info and prefer a literal command such as `download @e16` over clicking and guessing; use downloads to check progress.",
       "To deliver a screenshot or downloaded file to the user on PiWeb / Discord, you MUST emit '[[image: <path>]]' or '[[file: <path>]]' in your reply prose. Do NOT use markdown '![alt](/tmp/...)' and do NOT rely on 'read'.",
       "Browser close affects only the current Pi session tab; browser shutdown stops the shared daemon for every session.",
+      "If the browser daemon is down or restarting, simply re-run your browser command (e.g. `open <url>`); the extension auto-spawns and recovers the browser daemon automatically without any external service commands or skills.",
     ],
     parameters: Type.Object({
       command: Type.String({ description: "Nodriver browser command, without a prefix" }),
