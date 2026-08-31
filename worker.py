@@ -2208,6 +2208,11 @@ class BrowserWorker:
                         prefs = json.loads(prefs_file.read_text())
                     except Exception:
                         pass
+                p_prof = prefs.setdefault('profile', {})
+                p_prof['exit_type'] = 'Normal'
+                p_prof['exited_cleanly'] = True
+                prefs['exit_type'] = 'Normal'
+                prefs['exited_cleanly'] = True
                 prefs.setdefault('translate', {})['enabled'] = False
                 prefs['translate_blocked_languages'] = ['en', 'zh-TW', 'zh-CN', 'zh', 'ja']
                 prefs_file.write_text(json.dumps(prefs))
@@ -2221,6 +2226,8 @@ class BrowserWorker:
                     '--window-position=0,0',
                     f'--window-size={window_size}',
                     '--disable-features=Translate',
+                    '--disable-session-crashed-bubble',
+                    '--hide-crash-restore-bubble',
                     '--no-first-run',
                     '--no-default-browser-check',
                 ]
