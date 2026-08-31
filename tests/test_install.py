@@ -40,7 +40,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('ctx.sessionManager.getSessionId()', extension_source)
             self.assertIn('sessionId', extension_source)
             self.assertIn('PI_NODRIVER_SCREEN', extension_source)
-            self.assertIn('450x1000x24', extension_source)
+            self.assertIn('500x1000x24', extension_source)
             self.assertIn('if (response.screenshotPath)', extension_source)
             self.assertIn('name: "fetch_image"', extension_source)
             self.assertIn('fetch-image ${JSON.stringify(params.url)}', extension_source)
@@ -52,7 +52,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('shutdown', extension_source)
             worker_source = (extension / 'worker.py').read_text()
             self.assertIn('PI_NODRIVER_WINDOW_SIZE', worker_source)
-            self.assertIn('450,1000', worker_source)
+            self.assertIn('500,1000', worker_source)
             self.assertIn('--start-maximized', worker_source)
             self.assertIn('--window-position=0,0', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]

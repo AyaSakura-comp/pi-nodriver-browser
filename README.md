@@ -52,7 +52,7 @@ flowchart TB
     end
 
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
-        ENGINE -->|"Interactive Mode (iPhone / 450x1000)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Interactive Mode (iPhone / 500x1000)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
         TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
         TABS_POOL --> CHROME
@@ -445,7 +445,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (450x1000 / iPhone) |
+| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (500x1000 / iPhone) |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
@@ -474,8 +474,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Variable | Default | Description |
 |---|---|---|
-| `PI_NODRIVER_SCREEN` | `450x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + iPhone viewport). |
-| `PI_NODRIVER_WINDOW_SIZE` | `450,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
+| `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + iPhone viewport without clipping). |
+| `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `0` | Set `1` to enable prototype X11 native hardware mouse click forwarding (via `xdotool`) and Xvfb screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). |
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |

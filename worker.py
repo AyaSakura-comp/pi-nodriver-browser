@@ -2200,7 +2200,7 @@ class BrowserWorker:
             profile.mkdir(parents=True, exist_ok=True)
             try:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
-                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '450,1000')
+                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '500,1000')
                 b_args = [
                     '--start-maximized',
                     '--window-position=0,0',

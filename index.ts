@@ -168,7 +168,7 @@ class NodriverWorker {
       this.attach(socket);
       return socket;
     } catch {
-      const screen = process.env.PI_NODRIVER_SCREEN || "450x1000x24";
+      const screen = process.env.PI_NODRIVER_SCREEN || "500x1000x24";
       child = spawn(
         "xvfb-run",
         ["-a", "-s", `-screen 0 ${screen}`, PYTHON, WORKER, "--server", SOCKET],
