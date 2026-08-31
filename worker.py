@@ -4688,14 +4688,21 @@ class BrowserWorker:
             }
 
         if action == 'vision-drag':
-            if len(parts) not in (2, 3):
-                raise ValueError('usage: vision-drag <preview-token> [duration_ms]')
-            token = parts[1]
-            duration_ms = int(parts[2]) if len(parts) == 3 else 500
+            token = None
+            duration_ms = 500
+            if len(parts) == 2:
+                if parts[1].isdigit():
+                    duration_ms = int(parts[1])
+                else:
+                    token = parts[1]
+            elif len(parts) >= 3:
+                token = parts[1]
+                duration_ms = int(parts[2])
             page = await self.require_page(session_id)
             marker = self.vision_guard.current_marker(session_id, token)
+            token = marker.token
             if not marker.is_drag:
-                raise ValueError('token is for a single click, not a drag. Use vision-click.')
+                raise ValueError('active marker is for a single click, not a drag. Use vision-click.')
 
             current = None
             try:
@@ -4745,9 +4752,10 @@ class BrowserWorker:
             }
 
         if action == 'vision-click':
-            token = parse_vision_click(parts)
+            token = parts[1] if len(parts) >= 2 and not parts[1].isdigit() else None
             page = await self.require_page(session_id)
             marker = self.vision_guard.current_marker(session_id, token)
+            token = marker.token
             previous = page
             await self.configure_download_session(session_id, page)
 

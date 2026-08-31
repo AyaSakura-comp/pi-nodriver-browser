@@ -759,9 +759,9 @@ class VisionCorrectnessGuard:
         self._screenshots[session_id] = (page, self.clock())
         return marker
 
-    def current_marker(self, session_id: str, token: str) -> VisionMarker:
+    def current_marker(self, session_id: str, token: str | None = None) -> VisionMarker:
         marker = self._markers.get(session_id)
-        if marker is None or marker.token != token:
+        if marker is None or (token and token != 'latest' and marker.token != token):
             raise ValueError(
                 'VISION_CONFIRMATION_REQUIRED: token does not match the current marked preview; '
                 'inspect the latest marked screenshot'
