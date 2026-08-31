@@ -15,6 +15,7 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
+- [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
 
 ## 🏛️ System & Software Architecture (SW Architecture)
 
@@ -237,6 +238,13 @@ Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Ea
 * **Text + Image Sidecar**: Each tab returns clean `document.body.innerText` plus bounded, ranked `imageCandidates`; the candidate evaluation reuses the rendered page and does not issue image downloads.
 * **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
 * **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
+
+### 10. Multi-Directional Parallel Google Search (`google_search`)
+* **Multi-Directional Queries**: Dispatches up to **4 directional queries in parallel** (e.g. official docs, troubleshooting, benchmark comparisons) in a single turn via `google-search <json>`.
+* **Zero External API Cost & Ultra-Low Latency**: Directly leverages persistent Chromium inside Xvfb with hardware stealth, achieving **~0.82s median latency**.
+* **Clean DOM Card Extraction**: Evaluates `GOOGLE_RESULTS_JS` directly on the rendered Google SERP to extract un-redirected URLs, `h3` titles, and clean snippets (`[data-sncf="1"], .VwiC3b`).
+* **Stealth & Anti-Bot Protection**: Backed by `stealth.js` (WebGL RTX 4070 spoofing, bot flag removal) with automated interception of `unusual traffic` / `verify you are human` challenges.
+* **Balanced Diversity Re-ranking**: Uses `select_diverse_search_results` to interleave multi-direction results and deliver a balanced Top 10 to the agent context.
 
 ---
 
