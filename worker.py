@@ -24,7 +24,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -4856,15 +4856,21 @@ class BrowserWorker:
 
         if action in ('vision-long-press', 'vision-longpress'):
             token = None
-            duration_ms = 1000
+            duration_str = None
             if len(parts) == 2:
-                if parts[1].isdigit():
-                    duration_ms = int(parts[1])
+                # Could be a token or a duration like "2s", "1500", "2"
+                if parts[1].startswith(('0', '1', '2', '3', '4', '5', '6', '7', '8', '9')) or parts[1].endswith(('s', 'ms')):
+                    try:
+                        parse_duration_ms(parts[1])
+                        duration_str = parts[1]
+                    except Exception:
+                        token = parts[1]
                 else:
                     token = parts[1]
             elif len(parts) >= 3:
                 token = parts[1]
-                duration_ms = int(parts[2])
+                duration_str = parts[2]
+            duration_ms = parse_duration_ms(duration_str, default_ms=1000)
             page = await self.require_page(session_id)
             marker = self.vision_guard.current_marker(session_id, token)
             token = marker.token

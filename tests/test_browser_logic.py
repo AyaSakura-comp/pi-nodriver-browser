@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 
 class GoogleSearchLogicTests(unittest.TestCase):
@@ -433,16 +433,39 @@ class VisionCorrectnessGuardTests(unittest.TestCase):
         ref, duration = parse_long_press(['long-press', '@e1'])
         self.assertEqual(ref, '@e1')
         self.assertEqual(duration, 1000)
+        
+        # Test unit formats
         ref, duration = parse_long_press(['long-press', '@e5', '1500'])
-        self.assertEqual(ref, '@e5')
-        self.assertEqual(duration, 1500)
+        self.assertEqual((ref, duration), ('@e5', 1500))
+        ref, duration = parse_long_press(['long-press', '@e5', '1500ms'])
+        self.assertEqual((ref, duration), ('@e5', 1500))
+        ref, duration = parse_long_press(['long-press', '@e5', '2s'])
+        self.assertEqual((ref, duration), ('@e5', 2000))
+        ref, duration = parse_long_press(['long-press', '@e5', '1.5s'])
+        self.assertEqual((ref, duration), ('@e5', 1500))
+        ref, duration = parse_long_press(['long-press', '@e5', '2']) # <= 30 seconds auto-detection
+        self.assertEqual((ref, duration), ('@e5', 2000))
+        ref, duration = parse_long_press(['long-press', '@e5', '3.5'])
+        self.assertEqual((ref, duration), ('@e5', 3500))
+
+        # Test environment variables
+        with patch.dict(os.environ, {'PI_NODRIVER_DEFAULT_LONG_PRESS_MS': '2.5s'}):
+            self.assertEqual(parse_duration_ms(), 2500)
+            ref, duration = parse_long_press(['long-press', '@e1'])
+            self.assertEqual(duration, 2500)
+
+        with patch.dict(os.environ, {'PI_NODRIVER_FORCE_LONG_PRESS_MS': '3s'}):
+            self.assertEqual(parse_duration_ms('1s'), 3000)
+            ref, duration = parse_long_press(['long-press', '@e1', '500ms'])
+            self.assertEqual(duration, 3000)
+
         with self.assertRaisesRegex(ValueError, 'usage'):
             parse_long_press(['long-press'])
         with self.assertRaisesRegex(ValueError, 'usage'):
             parse_long_press(['long-press', 'invalid-ref'])
-        with self.assertRaisesRegex(ValueError, 'positive integer'):
+        with self.assertRaisesRegex(ValueError, 'invalid duration'):
             parse_long_press(['long-press', '@e1', '-500'])
-        with self.assertRaisesRegex(ValueError, 'positive integer'):
+        with self.assertRaisesRegex(ValueError, 'invalid duration'):
             parse_long_press(['long-press', '@e1', 'abc'])
 
     def test_rejects_non_finite_preview_ttl(self):

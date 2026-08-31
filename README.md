@@ -501,6 +501,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
+| `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
+| `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
 | `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix domain socket path for daemon IPC. |

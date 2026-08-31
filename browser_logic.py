@@ -610,17 +610,52 @@ def parse_vision_mark_drag(parts: list[str]) -> tuple[float, float, float, float
     return x1, y1, x2, y2
 
 
+def parse_duration_ms(val: str | None = None, default_ms: int = 1000) -> int:
+    forced = os.environ.get('PI_NODRIVER_FORCE_LONG_PRESS_MS') or os.environ.get('PI_NODRIVER_FORCE_LONG_PRESS_DURATION')
+    if forced:
+        return _parse_duration_value(forced, default_ms)
+    if not val:
+        default_env = os.environ.get('PI_NODRIVER_DEFAULT_LONG_PRESS_MS') or os.environ.get('PI_NODRIVER_DEFAULT_LONG_PRESS_DURATION')
+        if default_env:
+            return _parse_duration_value(default_env, default_ms)
+        return default_ms
+    return _parse_duration_value(val, default_ms)
+
+
+def _parse_duration_value(val: str, fallback_ms: int = 1000) -> int:
+    s = str(val).strip().lower()
+    if s.endswith('ms'):
+        try:
+            num = float(s[:-2])
+            if num <= 0 or not math.isfinite(num):
+                raise ValueError()
+            return int(round(num))
+        except ValueError as err:
+            raise ValueError(f'duration_ms must be positive: {val}') from err
+    if s.endswith('s'):
+        try:
+            num = float(s[:-1])
+            if num <= 0 or not math.isfinite(num):
+                raise ValueError()
+            return int(round(num * 1000))
+        except ValueError as err:
+            raise ValueError(f'duration_seconds must be positive: {val}') from err
+    try:
+        num = float(s)
+        if num <= 0 or not math.isfinite(num):
+            raise ValueError()
+        if num < 50:
+            return int(round(num * 1000))
+        return int(round(num))
+    except ValueError as err:
+        raise ValueError(f'invalid duration "{val}": specify seconds (e.g. 2s, 1.5) or milliseconds (e.g. 1500ms, 2000)') from err
+
+
 def parse_long_press(parts: list[str]) -> tuple[str, int]:
     if len(parts) not in (2, 3) or not parts[1].startswith('@'):
-        raise ValueError('usage: long-press @ref [duration_ms]')
-    duration_ms = 1000
-    if len(parts) == 3:
-        try:
-            duration_ms = int(parts[2])
-            if duration_ms <= 0:
-                raise ValueError()
-        except ValueError as err:
-            raise ValueError('duration_ms must be a positive integer in milliseconds') from err
+        raise ValueError('usage: long-press @ref [duration]')
+    duration_str = parts[2] if len(parts) == 3 else None
+    duration_ms = parse_duration_ms(duration_str, default_ms=1000)
     return parts[1], duration_ms
 
 
