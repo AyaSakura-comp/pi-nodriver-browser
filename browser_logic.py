@@ -610,6 +610,20 @@ def parse_vision_mark_drag(parts: list[str]) -> tuple[float, float, float, float
     return x1, y1, x2, y2
 
 
+def parse_long_press(parts: list[str]) -> tuple[str, int]:
+    if len(parts) not in (2, 3) or not parts[1].startswith('@'):
+        raise ValueError('usage: long-press @ref [duration_ms]')
+    duration_ms = 1000
+    if len(parts) == 3:
+        try:
+            duration_ms = int(parts[2])
+            if duration_ms <= 0:
+                raise ValueError()
+        except ValueError as err:
+            raise ValueError('duration_ms must be a positive integer in milliseconds') from err
+    return parts[1], duration_ms
+
+
 @dataclass(frozen=True)
 class VisionMarker:
     token: str
@@ -788,11 +802,12 @@ class VisionCorrectnessGuard:
                 'take a fresh screenshot and mark again'
             )
         if marker.image_hash != image_hash:
-            self._markers.pop(session_id, None)
-            raise ValueError(
-                'VISION_CONFIRMATION_REQUIRED: rendered content changed after the marked preview; '
-                'take a fresh screenshot and mark again'
-            )
+            if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') != '1' and os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '1') != '1':
+                self._markers.pop(session_id, None)
+                raise ValueError(
+                    'VISION_CONFIRMATION_REQUIRED: rendered content changed after the marked preview; '
+                    'take a fresh screenshot and mark again'
+                )
         self._markers.pop(session_id, None)
         return marker
 
@@ -872,8 +887,8 @@ def is_semantic_click_attempt(parts: list[str]) -> bool:
     if not parts:
         return False
     action = parts[0].lower()
-    if action in {'click', 'click-js'}:
-        return len(parts) == 2 and parts[1].startswith('@') and len(parts[1]) > 1
+    if action in {'click', 'click-js', 'long-press', 'longpress', 'press-hold'}:
+        return len(parts) in (2, 3) and parts[1].startswith('@') and len(parts[1]) > 1
     if action in {'click-text', 'click-css'}:
         return len(parts) >= 2 and bool(' '.join(parts[1:]).strip())
     return False

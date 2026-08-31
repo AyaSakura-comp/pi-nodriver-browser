@@ -54,10 +54,12 @@ Commands:
   snapshot -i - List interactive elements and form-control state in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
   click @e16 - Click the literal snapshot ref @e16, including custom controls and open Shadow DOM
+  long-press @e16 [duration_ms] - Long press the literal snapshot ref for duration_ms (default 1000ms, sends trusted X11 mousedown -> hold -> mouseup)
   vision-mark <x> <y> - Draw a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; requires a fresh screenshot
   vision-click <preview-token> - Click the latest marked point only after inspecting the attached marked screenshot
   vision-mark-drag <start_x> <start_y> <end_x> <end_y> - Draw a visual drag trajectory (Green start circle -> Blue arrow -> Red end target) on screenshot for inspection and calibration without executing drag
-  vision-drag <preview-token> [duration_ms] - Execute smooth hardware drag on Xvfb along the confirmed trajectory (isTrusted: true)
+  vision-drag [preview-token] [duration_ms] - Execute smooth hardware drag on Xvfb along the confirmed trajectory (isTrusted: true)
+  vision-long-press [preview-token] [duration_ms] - Execute hardware long press at marked point for duration_ms (default 1000ms, isTrusted: true)
   click-text <text> - Click exact short text or a safe exact/prefix visible label match
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js @e16 - Dispatch a deferred DOM click for the literal snapshot ref when a site's native mouse handler poisons CDP

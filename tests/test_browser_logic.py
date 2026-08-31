@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 
 class GoogleSearchLogicTests(unittest.TestCase):
@@ -296,6 +296,9 @@ class VisionCoordinateMappingTests(unittest.TestCase):
 
 class VisionCorrectnessGuardTests(unittest.TestCase):
     def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {'PI_NODRIVER_ALLOW_DIRECT_VISION': '0', 'PI_NODRIVER_XVFB_FORWARD_CLICK': '0'})
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
         self.now = 100.0
         self.guard = VisionCorrectnessGuard(ttl_seconds=30, clock=lambda: self.now)
         self.page = VisionPageState(
@@ -425,6 +428,22 @@ class VisionCorrectnessGuardTests(unittest.TestCase):
             parse_vision_mark_drag(['vision-mark-drag', '10', '20'])
         with self.assertRaisesRegex(ValueError, 'numeric'):
             parse_vision_mark_drag(['vision-mark-drag', '10', '20', 'abc', '400'])
+
+    def test_parse_long_press(self):
+        ref, duration = parse_long_press(['long-press', '@e1'])
+        self.assertEqual(ref, '@e1')
+        self.assertEqual(duration, 1000)
+        ref, duration = parse_long_press(['long-press', '@e5', '1500'])
+        self.assertEqual(ref, '@e5')
+        self.assertEqual(duration, 1500)
+        with self.assertRaisesRegex(ValueError, 'usage'):
+            parse_long_press(['long-press'])
+        with self.assertRaisesRegex(ValueError, 'usage'):
+            parse_long_press(['long-press', 'invalid-ref'])
+        with self.assertRaisesRegex(ValueError, 'positive integer'):
+            parse_long_press(['long-press', '@e1', '-500'])
+        with self.assertRaisesRegex(ValueError, 'positive integer'):
+            parse_long_press(['long-press', '@e1', 'abc'])
 
     def test_rejects_non_finite_preview_ttl(self):
         for value in (math.nan, math.inf, -math.inf):

@@ -24,15 +24,15 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
-    'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'mobile', 'open', 'press', 'screenshot',
+    'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'open', 'press', 'press-hold', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
-    'vision-click', 'vision-drag', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
+    'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
 
@@ -3827,6 +3827,53 @@ class BrowserWorker:
         except Exception:
             return False
 
+    async def xvfb_mouse_long_press(self, page, x, y, duration_ms=1000):
+        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+        screen_x = int(round(float(x)))
+        screen_y = int(round(float(y))) + toolbar_height
+        display = os.environ.get('DISPLAY')
+        if display:
+            try:
+                p1 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mousemove', '--sync', str(screen_x), str(screen_y),
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p1.wait()
+                p2 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mousedown', '1',
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p2.wait()
+                await asyncio.sleep(max(0.05, duration_ms / 1000.0))
+                p3 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mouseup', '1',
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p3.wait()
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def native_long_press(self, page, x, y, duration_ms=1000):
+        await page.bring_to_front()
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
+            if await self.xvfb_mouse_long_press(page, x, y, duration_ms):
+                await page.sleep(0.2)
+                return True
+        try:
+            await page.send(uc.cdp.input_.dispatch_mouse_event(
+                type_='mousePressed', x=float(x), y=float(y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+            ))
+            await asyncio.sleep(max(0.05, duration_ms / 1000.0))
+            await page.send(uc.cdp.input_.dispatch_mouse_event(
+                type_='mouseReleased', x=float(x), y=float(y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+            ))
+            await page.sleep(0.2)
+            return True
+        except Exception:
+            return False
+
     async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if await self.xvfb_mouse_click(page, x, y):
@@ -4807,6 +4854,68 @@ class BrowserWorker:
                 'clickY': marker.click_y,
             }
 
+        if action in ('vision-long-press', 'vision-longpress'):
+            token = None
+            duration_ms = 1000
+            if len(parts) == 2:
+                if parts[1].isdigit():
+                    duration_ms = int(parts[1])
+                else:
+                    token = parts[1]
+            elif len(parts) >= 3:
+                token = parts[1]
+                duration_ms = int(parts[2])
+            page = await self.require_page(session_id)
+            marker = self.vision_guard.current_marker(session_id, token)
+            token = marker.token
+            previous = page
+            await self.configure_download_session(session_id, page)
+
+            async def verify_preview_immediately_before_long_press():
+                current = None
+                try:
+                    before_state = await self.vision_page_state(page)
+                    current = await self.save_viewport_screenshot(
+                        page, 'pi-nodriver-vision-verify-'
+                    )
+                    current_state = await self.vision_page_state(page)
+                    if before_state != current_state:
+                        raise ValueError(
+                            'VISION_CONFIRMATION_REQUIRED: page changed during final visual verification; '
+                            'take a fresh screenshot and mark again'
+                        )
+                    self.vision_guard.consume_marker(
+                        session_id,
+                        current_state,
+                        token,
+                        self.screenshot_hash(current),
+                    )
+                finally:
+                    if current is not None:
+                        current.unlink(missing_ok=True)
+
+            try:
+                await verify_preview_immediately_before_long_press()
+            except Exception:
+                self.vision_guard.invalidate(session_id)
+                raise
+            self.vision_guard.invalidate(session_id)
+            await self.native_long_press(page, marker.click_x, marker.click_y, duration_ms=duration_ms)
+            page = await self.track_clicked_page(session_id, previous, page)
+            self.pages[session_id] = page
+            return {
+                'text': (
+                    f'Vision-confirmed long press executed at ({marker.x:g}, {marker.y:g}) '
+                    f'for {duration_ms}ms (isTrusted: true).\n'
+                    f'URL: {page.url}'
+                ),
+                'action': action,
+                'url': page.url,
+                'x': marker.x,
+                'y': marker.y,
+                'durationMs': duration_ms,
+            }
+
         if action == 'click':
             page = await self.require_page(session_id)
             if len(parts) == 3:
@@ -4834,6 +4943,25 @@ class BrowserWorker:
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             return {'text': f'Clicked {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
+
+        if action in ('long-press', 'longpress', 'press-hold'):
+            page = await self.require_page(session_id)
+            ref, duration_ms = parse_long_press(parts)
+            target = await self.resolve_click_target(page, 'ref', ref.removeprefix('@'), session_id)
+            self.semantic_target_resolved(session_id)
+            self.vision_guard.invalidate(session_id)
+            previous = page
+            await self.configure_download_session(session_id, page)
+            await self.native_long_press(page, target['x'], target['y'], duration_ms=duration_ms)
+            page = await self.track_clicked_page(session_id, previous, page)
+            self.pages[session_id] = page
+            return {
+                'text': f'Long pressed {ref} ({target.get("tag", "element")}: {target.get("text", "")[:120]}) for {duration_ms}ms (isTrusted: true)\nURL: {page.url}',
+                'action': action,
+                'url': page.url,
+                'ref': ref,
+                'durationMs': duration_ms,
+            }
 
         if action in ('click-text', 'click-css'):
             if len(parts) < 2:
