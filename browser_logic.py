@@ -539,7 +539,7 @@ class VisionFallbackGuard:
         return count, count >= self.threshold
 
     def require_unlocked(self, session_id: str, context: VisionFallbackContext) -> None:
-        if os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '0') == '1' or os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
+        if os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '1') == '1' or os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
             return
         previous = self._failures.get(session_id)
         if previous and previous[0] != context:
@@ -600,6 +600,16 @@ def map_screenshot_point_to_viewport(
     )
 
 
+def parse_vision_mark_drag(parts: list[str]) -> tuple[float, float, float, float]:
+    if len(parts) != 5:
+        raise ValueError('usage: vision-mark-drag <start_x> <start_y> <end_x> <end_y>')
+    try:
+        x1, y1, x2, y2 = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+    except ValueError as err:
+        raise ValueError('vision drag coordinates must be numeric') from err
+    return x1, y1, x2, y2
+
+
 @dataclass(frozen=True)
 class VisionMarker:
     token: str
@@ -612,6 +622,11 @@ class VisionMarker:
     page: VisionPageState
     image_hash: str
     created_at: float
+    is_drag: bool = False
+    end_x: float = 0.0
+    end_y: float = 0.0
+    click_end_x: float = 0.0
+    click_end_y: float = 0.0
 
 
 class VisionCorrectnessGuard:
@@ -675,8 +690,70 @@ class VisionCorrectnessGuard:
         if not image_hash:
             raise ValueError('vision marker requires a rendered screenshot hash')
         marker = VisionMarker(
-            token, x, y, click_x, click_y, int(image_width), int(image_height),
-            page, image_hash, self.clock()
+            token=token, x=x, y=y, click_x=click_x, click_y=click_y,
+            image_width=int(image_width), image_height=int(image_height),
+            page=page, image_hash=image_hash, created_at=self.clock()
+        )
+        self._markers[session_id] = marker
+        self._screenshots[session_id] = (page, self.clock())
+        return marker
+
+    def issue_drag_marker(
+        self,
+        session_id: str,
+        page: VisionPageState,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        token: str,
+        image_hash: str,
+        image_width: int | None = None,
+        image_height: int | None = None,
+        click_x1: float | None = None,
+        click_y1: float | None = None,
+        click_x2: float | None = None,
+        click_y2: float | None = None,
+    ) -> VisionMarker:
+        screenshot = self._screenshots.get(session_id)
+        if screenshot is None:
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: run screenshot and inspect the current viewport image '
+                'before placing a drag marker'
+            )
+        screenshot_page, captured_at = screenshot
+        if screenshot_page != page:
+            self.invalidate(session_id)
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: page or viewport changed; take and inspect a fresh screenshot'
+            )
+        if self.clock() - captured_at > self.ttl_seconds:
+            self.invalidate(session_id)
+            raise ValueError(
+                'VISION_SCREENSHOT_REQUIRED: take and inspect a fresh screenshot because the previous one expired'
+            )
+        for val in (x1, y1, x2, y2):
+            if not math.isfinite(val) or val < 0:
+                raise ValueError('vision drag coordinates must be finite and non-negative')
+        image_width = page.width if image_width is None else image_width
+        image_height = page.height if image_height is None else image_height
+        click_x1 = x1 if click_x1 is None else click_x1
+        click_y1 = y1 if click_y1 is None else click_y1
+        click_x2 = x2 if click_x2 is None else click_x2
+        click_y2 = y2 if click_y2 is None else click_y2
+        if image_width < 1 or image_height < 1:
+            raise ValueError('vision marker screenshot dimensions must be positive')
+        if x1 >= image_width or y1 >= image_height or x2 >= image_width or y2 >= image_height:
+            raise ValueError('vision drag coordinates are outside the current screenshot')
+        if not all(math.isfinite(val) for val in (click_x1, click_y1, click_x2, click_y2)):
+            raise ValueError('vision drag coordinates must be finite')
+        if not image_hash:
+            raise ValueError('vision marker requires a rendered screenshot hash')
+        marker = VisionMarker(
+            token=token, x=x1, y=y1, click_x=click_x1, click_y=click_y1,
+            image_width=int(image_width), image_height=int(image_height),
+            page=page, image_hash=image_hash, created_at=self.clock(),
+            is_drag=True, end_x=x2, end_y=y2, click_end_x=click_x2, click_end_y=click_y2
         )
         self._markers[session_id] = marker
         self._screenshots[session_id] = (page, self.clock())

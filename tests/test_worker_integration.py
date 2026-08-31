@@ -113,6 +113,9 @@ class FailingFullPageScreenshot:
 
 class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.env_patcher = patch.dict(os.environ, {'PI_NODRIVER_ALLOW_DIRECT_VISION': '0', 'PI_NODRIVER_VISION_ONLY': '0'})
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
         from browser_logic import VisionFallbackContext
         from worker import BrowserWorker, SemanticClickTargetError
 

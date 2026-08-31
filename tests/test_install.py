@@ -48,6 +48,8 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('[[image: ${response.imagePath}]]', extension_source)
             self.assertIn('vision-mark <x> <y>', extension_source)
             self.assertIn('vision-click <preview-token>', extension_source)
+            self.assertIn('vision-mark-drag <start_x>', extension_source)
+            self.assertIn('vision-drag <preview-token>', extension_source)
             self.assertIn('close', extension_source)
             self.assertIn('shutdown', extension_source)
             worker_source = (extension / 'worker.py').read_text()

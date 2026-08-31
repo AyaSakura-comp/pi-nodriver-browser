@@ -24,7 +24,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -32,7 +32,7 @@ SUPPORTED_ACTIONS = {
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'mobile', 'open', 'press', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
-    'vision-click', 'vision-mark', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
+    'vision-click', 'vision-drag', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
 
@@ -3430,6 +3430,42 @@ class BrowserWorker:
         image.save(output, format='PNG')
         return output
 
+    @staticmethod
+    def annotate_vision_drag_screenshot(clean_path, x1, y1, x2, y2):
+        import math
+        clean_path = Path(clean_path)
+        output = clean_path.with_name('marked-drag-screenshot.png')
+        with Image.open(clean_path) as source:
+            image = source.convert('RGB')
+        draw = ImageDraw.Draw(image)
+        scale = max(1.0, min(image.width / 390, image.height / 844))
+        r = round(16 * scale)
+
+        # Start point (Green)
+        draw.ellipse((x1 - r, y1 - r, x1 + r, y1 + r), outline='#ffffff', width=round(6 * scale))
+        draw.ellipse((x1 - r, y1 - r, x1 + r, y1 + r), outline='#10b981', width=round(4 * scale))
+        draw.ellipse((x1 - 4, y1 - 4, x1 + 4, y1 + 4), fill='#10b981')
+
+        # End point (Red)
+        draw.ellipse((x2 - r, y2 - r, x2 + r, y2 + r), outline='#ffffff', width=round(6 * scale))
+        draw.ellipse((x2 - r, y2 - r, x2 + r, y2 + r), outline='#ef4444', width=round(4 * scale))
+        draw.ellipse((x2 - 4, y2 - 4, x2 + 4, y2 + 4), fill='#ef4444')
+
+        # Drag Path Line (Blue)
+        draw.line((x1, y1, x2, y2), fill='#ffffff', width=round(7 * scale))
+        draw.line((x1, y1, x2, y2), fill='#38bdf8', width=round(5 * scale))
+
+        # Arrowhead at end point
+        angle = math.atan2(y2 - y1, x2 - x1)
+        arrow_len = round(22 * scale)
+        arrow_angle = math.pi / 6
+        p1 = (x2 - arrow_len * math.cos(angle - arrow_angle), y2 - arrow_len * math.sin(angle - arrow_angle))
+        p2 = (x2 - arrow_len * math.cos(angle + arrow_angle), y2 - arrow_len * math.sin(angle + arrow_angle))
+        draw.polygon([(x2, y2), p1, p2], fill='#38bdf8')
+
+        image.save(output, format='PNG')
+        return output
+
     async def element(self, session_id, ref):
         page = await self.require_page(session_id)
         normalized = ref.removeprefix('@')
@@ -3721,6 +3757,75 @@ class BrowserWorker:
             except Exception:
                 pass
         return False
+
+    async def xvfb_mouse_drag(self, page, start_x, start_y, end_x, end_y, duration_ms=500):
+        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+        sx1 = int(round(float(start_x)))
+        sy1 = int(round(float(start_y))) + toolbar_height
+        sx2 = int(round(float(end_x)))
+        sy2 = int(round(float(end_y))) + toolbar_height
+        display = os.environ.get('DISPLAY')
+        if display:
+            try:
+                p1 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mousemove', '--sync', str(sx1), str(sy1),
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p1.wait()
+                p2 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mousedown', '1',
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p2.wait()
+                steps = 20
+                delay = max(0.01, (duration_ms / 1000.0) / steps)
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    cx = int(round(sx1 + (sx2 - sx1) * t))
+                    cy = int(round(sy1 + (sy2 - sy1) * t))
+                    pm = await asyncio.create_subprocess_exec(
+                        'xdotool', 'mousemove', '--sync', str(cx), str(cy),
+                        env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await pm.wait()
+                    await asyncio.sleep(delay)
+                p3 = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mouseup', '1',
+                    env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await p3.wait()
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def native_drag(self, page, start_x, start_y, end_x, end_y, duration_ms=500):
+        await page.bring_to_front()
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
+            if await self.xvfb_mouse_drag(page, start_x, start_y, end_x, end_y, duration_ms):
+                await page.sleep(0.2)
+                return True
+        try:
+            await page.send(uc.cdp.input_.dispatch_mouse_event(
+                type_='mousePressed', x=float(start_x), y=float(start_y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+            ))
+            steps = 20
+            delay = max(0.01, (duration_ms / 1000.0) / steps)
+            for i in range(1, steps + 1):
+                t = i / steps
+                cx = float(start_x + (end_x - start_x) * t)
+                cy = float(start_y + (end_y - start_y) * t)
+                await page.send(uc.cdp.input_.dispatch_mouse_event(
+                    type_='mouseMoved', x=cx, y=cy, buttons=1
+                ))
+                await asyncio.sleep(delay)
+            await page.send(uc.cdp.input_.dispatch_mouse_event(
+                type_='mouseReleased', x=float(end_x), y=float(end_y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+            ))
+            await page.sleep(0.2)
+            return True
+        except Exception:
+            return False
 
     async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
@@ -4509,6 +4614,134 @@ class BrowserWorker:
                 'y': y,
                 'previewToken': token,
                 'screenshotPath': str(output),
+            }
+
+        if action == 'vision-mark-drag':
+            x1, y1, x2, y2 = parse_vision_mark_drag(parts)
+            page = await self.require_page(session_id)
+            self.vision_fallback_guard.require_unlocked(
+                session_id, await self.vision_fallback_context(page)
+            )
+            clean = None
+            output = None
+            try:
+                before_state = await self.vision_page_state(page)
+                clean = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-mark-drag-')
+                page_state = await self.vision_page_state(page)
+                if before_state != page_state:
+                    raise ValueError(
+                        'VISION_SCREENSHOT_REQUIRED: page changed while the marked drag preview was captured; '
+                        'take and inspect a fresh screenshot'
+                    )
+                image_hash = self.screenshot_hash(clean)
+                with Image.open(clean) as screenshot_image:
+                    image_width, image_height = screenshot_image.size
+                click_x1, click_y1 = map_screenshot_point_to_viewport(
+                    page_state, image_width, image_height, x1, y1
+                )
+                click_x2, click_y2 = map_screenshot_point_to_viewport(
+                    page_state, image_width, image_height, x2, y2
+                )
+                output = self.annotate_vision_drag_screenshot(clean, x1, y1, x2, y2)
+                token = secrets.token_hex(12)
+                self.vision_guard.issue_drag_marker(
+                    session_id,
+                    page_state,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    token,
+                    image_hash,
+                    image_width=image_width,
+                    image_height=image_height,
+                    click_x1=click_x1,
+                    click_y1=click_y1,
+                    click_x2=click_x2,
+                    click_y2=click_y2,
+                )
+            except Exception:
+                self.vision_guard.invalidate(session_id)
+                if output is not None:
+                    output.unlink(missing_ok=True)
+                raise
+            finally:
+                if clean is not None:
+                    clean.unlink(missing_ok=True)
+            self.touch_tab(page)
+            return {
+                'text': (
+                    f'VISION DRAG PREVIEW — NO DRAG PERFORMED\n'
+                    f'Drag trajectory {token} starts at ({x1:g}, {y1:g}) [Green] and ends at ({x2:g}, {y2:g}) [Red].\n'
+                    'Inspect the attached marked drag preview now. If the trajectory is wrong, run '
+                    '`vision-mark-drag <start_x> <start_y> <end_x> <end_y>` again. Only if correct, run exactly:\n'
+                    f'vision-drag {token}'
+                ),
+                'action': action,
+                'url': page.url,
+                'x1': x1,
+                'y1': y1,
+                'x2': x2,
+                'y2': y2,
+                'previewToken': token,
+                'screenshotPath': str(output),
+            }
+
+        if action == 'vision-drag':
+            if len(parts) not in (2, 3):
+                raise ValueError('usage: vision-drag <preview-token> [duration_ms]')
+            token = parts[1]
+            duration_ms = int(parts[2]) if len(parts) == 3 else 500
+            page = await self.require_page(session_id)
+            marker = self.vision_guard.current_marker(session_id, token)
+            if not marker.is_drag:
+                raise ValueError('token is for a single click, not a drag. Use vision-click.')
+
+            current = None
+            try:
+                before_state = await self.vision_page_state(page)
+                current = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-verify-drag-')
+                current_state = await self.vision_page_state(page)
+                if before_state != current_state:
+                    raise ValueError(
+                        'VISION_CONFIRMATION_REQUIRED: page changed during final visual verification; '
+                        'take a fresh screenshot and mark drag again'
+                    )
+                self.vision_guard.consume_marker(
+                    session_id,
+                    current_state,
+                    token,
+                    self.screenshot_hash(current),
+                )
+            except Exception:
+                self.vision_guard.invalidate(session_id)
+                raise
+            finally:
+                if current is not None:
+                    current.unlink(missing_ok=True)
+            self.vision_guard.invalidate(session_id)
+
+            await self.native_drag(
+                page,
+                marker.click_x,
+                marker.click_y,
+                marker.click_end_x,
+                marker.click_end_y,
+                duration_ms=duration_ms,
+            )
+            return {
+                'text': (
+                    f'Vision-confirmed hardware drag executed from ({marker.x:g}, {marker.y:g}) '
+                    f'to ({marker.end_x:g}, {marker.end_y:g}) over {duration_ms}ms (isTrusted: true).\n'
+                    f'URL: {page.url}'
+                ),
+                'action': action,
+                'url': page.url,
+                'startX': marker.x,
+                'startY': marker.y,
+                'endX': marker.end_x,
+                'endY': marker.end_y,
+                'durationMs': duration_ms,
             }
 
         if action == 'vision-click':

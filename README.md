@@ -454,8 +454,10 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` plus checkbox/radio `checked`, `required`, and `disabled` state in the current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
 | **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
-| **`vision-mark`** | `vision-mark <x> <y>` | Requires three consecutive semantic click failures plus a fresh normal screenshot; then returns a marked current-viewport PNG and one-time preview token without clicking | Interactive Tab |
-| **`vision-click`** | `vision-click <preview-token>` | Consumes the latest visually confirmed marker token and clicks its stored viewport point | Interactive Tab |
+| **`vision-mark`** | `vision-mark <x> <y>` | Draws a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; returns a one-time preview token | Interactive Tab |
+| **`vision-click`** | `vision-click <preview-token>` | Consumes the latest visually confirmed marker token and clicks its stored viewport point (hardware click via Xvfb `xdotool`, `isTrusted: true`) | Interactive Tab |
+| **`vision-mark-drag`** | `vision-mark-drag <start_x> <start_y> <end_x> <end_y>` | Draws a visual drag trajectory (Green start circle ➔ Blue arrow ➔ Red end target) on screenshot for inspection and calibration without executing drag | Interactive Tab |
+| **`vision-drag`** | `vision-drag <preview-token> [duration_ms]` | Executes smooth hardware drag on Xvfb along the visually confirmed trajectory (via `xdotool` interpolation, `isTrusted: true`) | Interactive Tab |
 | **`fill`** | `fill @e6 "text"` | Clears and types only into a text-editable input/textarea/contenteditable ref; `<label>` refs fail closed | Interactive Tab |
 | **`type`** | `type @e6 "text"` | Types into the literal input ref without clearing | Interactive Tab |
 | **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |

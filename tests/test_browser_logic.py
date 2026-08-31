@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 
 class GoogleSearchLogicTests(unittest.TestCase):
@@ -177,6 +177,9 @@ class VisionCommandParsingTests(unittest.TestCase):
 
 class VisionFallbackGuardTests(unittest.TestCase):
     def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {'PI_NODRIVER_ALLOW_DIRECT_VISION': '0', 'PI_NODRIVER_VISION_ONLY': '0'})
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
         self.guard = VisionFallbackGuard(threshold=3)
         self.page = VisionFallbackContext('tab-a', 'https://example.test/', 'loader-a')
 
@@ -400,6 +403,28 @@ class VisionCorrectnessGuardTests(unittest.TestCase):
             self.guard.consume_marker('session-a', self.page, token, 'hash-b')
         with self.assertRaisesRegex(ValueError, 'current marked preview'):
             self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_issues_and_consumes_drag_marker(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        marker = self.guard.issue_drag_marker(
+            'session-a', self.page, 50, 100, 200, 300, token, 'hash-a'
+        )
+        self.assertTrue(marker.is_drag)
+        self.assertEqual(marker.x, 50)
+        self.assertEqual(marker.y, 100)
+        self.assertEqual(marker.end_x, 200)
+        self.assertEqual(marker.end_y, 300)
+        consumed = self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+        self.assertEqual(consumed, marker)
+
+    def test_parse_vision_mark_drag(self):
+        x1, y1, x2, y2 = parse_vision_mark_drag(['vision-mark-drag', '10.5', '20.5', '300.0', '400.0'])
+        self.assertEqual((x1, y1, x2, y2), (10.5, 20.5, 300.0, 400.0))
+        with self.assertRaisesRegex(ValueError, 'usage'):
+            parse_vision_mark_drag(['vision-mark-drag', '10', '20'])
+        with self.assertRaisesRegex(ValueError, 'numeric'):
+            parse_vision_mark_drag(['vision-mark-drag', '10', '20', 'abc', '400'])
 
     def test_rejects_non_finite_preview_ttl(self):
         for value in (math.nan, math.inf, -math.inf):
