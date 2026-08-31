@@ -2199,12 +2199,28 @@ class BrowserWorker:
             profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
             try:
+                default_dir = profile / 'Default'
+                default_dir.mkdir(parents=True, exist_ok=True)
+                prefs_file = default_dir / 'Preferences'
+                prefs = {}
+                if prefs_file.is_file():
+                    try:
+                        prefs = json.loads(prefs_file.read_text())
+                    except Exception:
+                        pass
+                prefs.setdefault('translate', {})['enabled'] = False
+                prefs['translate_blocked_languages'] = ['en', 'zh-TW', 'zh-CN', 'zh', 'ja']
+                prefs_file.write_text(json.dumps(prefs))
+            except Exception:
+                pass
+            try:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
                 window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '500,1000')
                 b_args = [
                     '--start-maximized',
                     '--window-position=0,0',
                     f'--window-size={window_size}',
+                    '--disable-features=Translate',
                     '--no-first-run',
                     '--no-default-browser-check',
                 ]
