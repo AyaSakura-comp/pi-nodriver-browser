@@ -462,10 +462,10 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` plus checkbox/radio `checked`, `required`, and `disabled` state in the current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
 | **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
-| **`long-press`** | `long-press @e16 [duration_ms]` | Long presses the literal snapshot ref for `duration_ms` (default `1000`ms, via Xvfb `mousedown` ➔ hold ➔ `mouseup`, `isTrusted: true`) | Interactive Tab |
+| **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
 | **`vision-mark`** | `vision-mark <x> <y>` | Draws a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; returns a one-time preview token | Interactive Tab |
 | **`vision-click`** | `vision-click [preview-token]` | Consumes the visually confirmed marker token and clicks its stored viewport point (hardware click via Xvfb `xdotool`, `isTrusted: true`) | Interactive Tab |
-| **`vision-long-press`** | `vision-long-press [preview-token] [duration_ms]` | Consumes the visually confirmed marker token and long presses at its stored viewport point for `duration_ms` (default `1000`ms, `isTrusted: true`) | Interactive Tab |
+| **`vision-long-press`** | `vision-long-press [preview-token] [duration]` | **Vision Long Press**: Executes hardware long press at visually confirmed point for `duration` (e.g. `2s`, `1500ms`, `1.5`, default `1000ms`) with micro-drift and live midway snapshot (`isTrusted: true`). | Interactive Tab |
 | **`vision-mark-drag`** | `vision-mark-drag <start_x> <start_y> <end_x> <end_y>` | Draws a visual drag trajectory (Green start circle ➔ Blue arrow ➔ Red end target) on screenshot for inspection and calibration without executing drag | Interactive Tab |
 | **`vision-drag`** | `vision-drag [preview-token] [duration_ms]` | Executes smooth hardware drag on Xvfb along the visually confirmed trajectory (via `xdotool` interpolation, `isTrusted: true`) | Interactive Tab |
 | **`fill`** | `fill @e6 "text"` | Clears and types only into a text-editable input/textarea/contenteditable ref; `<label>` refs fail closed | Interactive Tab |
@@ -478,7 +478,20 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`screenshot`** | `screenshot [--full]` | **Default**: Captures current Xvfb window (`500x1000` with Chrome UI, 1:1 coordinates for visual check & `vision-mark`).<br>**`--full`**: Captures entire scrollable long page via CDP specifically to assist non-vision DOM browser clicks (`@ref`, `click-text`). | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
-| **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome | Global Daemon Scope |
+| **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome cleanly; subsequent commands auto-spawn a fresh daemon | Global Daemon Scope |
+
+---
+
+### 🕹️ Advanced Touch & Long-Press Mechanics
+
+1. **Flexible Duration Formats**:
+   - Supports seconds (`2s`, `1.5s`, `3.5`), milliseconds (`1500ms`, `2500`), or numeric inputs (values `< 50` are automatically interpreted as seconds, while `>= 50` are milliseconds).
+2. **Human Kinematic Micro-Jitter Drift ($\pm 2$px)**:
+   - During continuous mouse press (`mousedown` active state), the cursor performs natural micro-movements within a $\pm 2$px radius every 50–90ms. This prevents anti-bot heuristics (Cloudflare Turnstile, DataDome) from detecting robotic static holds without leaving the target button area.
+3. **Live Midway Snapshot Capture (50% Checkpoint)**:
+   - Captures an instant non-intrusive X11 snapshot exactly halfway through the hold duration while `mousedown` remains active. The screenshot is automatically attached to the tool response (`screenshotPath`), enabling the Agent to visually verify charging bars, hold-to-reveal modals, or radial menus.
+4. **Daemon Self-Healing & Transparent Reconnection**:
+   - The TypeScript client automatically supervises the daemon process. If the daemon is terminated, crashes, or connection drops, the client automatically transparently restarts a clean daemon and retries the command without surfacing connection errors to the model.
 
 ---
 
