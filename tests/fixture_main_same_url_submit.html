@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body>
+  <form action="">
+    <label for="same-url-main">Main same URL submit</label>
+    <input id="same-url-main" placeholder="Main same URL submit">
+    <button type="submit">Submit same URL</button>
+  </form>
+  <div id="reload-state"></div>
+  <script>
+    const count = Number(sessionStorage.getItem('mainSameUrlReloads') || 0) + 1;
+    sessionStorage.setItem('mainSameUrlReloads', String(count));
+    const state = document.querySelector('#reload-state');
+    state.textContent = `Main reload ${count}`;
+    document.querySelector('#same-url-main').setAttribute('aria-label', `Main reload ${count}`);
+  </script>
+</body>
+</html>

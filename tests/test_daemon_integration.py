@@ -297,7 +297,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         finally:
             idle_client.close()
 
-    def test_stale_ref_guard_requires_a_fresh_snapshot_before_ref_clicks_resume(self):
+    def test_stale_ref_recovery_returns_authoritative_refs_that_work_immediately(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()
         overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
         self.command(f'open {fixture_url}')
@@ -305,21 +305,19 @@ class DaemonIntegrationTests(unittest.TestCase):
         stale_ref = '@e999'
 
         recovery = self.command_raw(f'click {stale_ref}', request_id=4)
-        guarded_failure = self.command_raw(f'click {stale_ref}', request_id=5)
 
         self.assertTrue(recovery['ok'])
         self.assertEqual(recovery['action'], 'stale-ref-recovery')
         self.assertIn(f'CLICK NOT PERFORMED: {stale_ref}', recovery['text'])
         self.assertIn('Fresh DOM snapshot:', recovery['text'])
+        self.assertIn('authoritative', recovery['text'])
         self.assertTrue(Path(recovery['screenshotPath']).is_file())
         self.assertEqual(Path(recovery['screenshotPath']).suffix, '.jpg')
-        self.assertFalse(guarded_failure['ok'])
-        self.assertIn('STALE_REF_GUARD', guarded_failure['error'])
-        self.assertIn('run exactly: snapshot -i', guarded_failure['error'])
 
-        fresh_snapshot = self.command('snapshot -i', request_id=6)['text']
-        fresh_ref = next(line for line in fresh_snapshot.splitlines() if 'Next step' in line).split()[0]
-        resumed = self.command(f'click {fresh_ref}', request_id=7)
+        fresh_ref = next(
+            line for line in recovery['text'].splitlines() if 'Next step' in line
+        ).split()[0]
+        resumed = self.command(f'click {fresh_ref}', request_id=5)
         self.assertIn('Clicked', resumed['text'])
 
     def test_browser_survives_client_disconnect(self):

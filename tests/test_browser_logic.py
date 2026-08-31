@@ -1,13 +1,81 @@
+import json
 import math
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+
+
+class GoogleSearchLogicTests(unittest.TestCase):
+    def test_parses_up_to_four_directional_queries_and_removes_duplicates(self):
+        payload = json.dumps([
+            {'direction': '官方', 'query': 'Pixel 11 official specs'},
+            {'direction': '新聞', 'query': 'Pixel 11 latest news'},
+            {'direction': '重複', 'query': '  pixel 11 OFFICIAL specs  '},
+            {'direction': '評價', 'query': 'Pixel 11 reviews'},
+            {'direction': '替代', 'query': 'Pixel 11 alternatives'},
+        ])
+
+        self.assertEqual(parse_google_search_payload(payload), [
+            {'direction': '官方', 'query': 'Pixel 11 official specs'},
+            {'direction': '新聞', 'query': 'Pixel 11 latest news'},
+            {'direction': '評價', 'query': 'Pixel 11 reviews'},
+            {'direction': '替代', 'query': 'Pixel 11 alternatives'},
+        ])
+
+    def test_unwraps_google_redirect_and_removes_tracking_parameters(self):
+        wrapped = 'https://www.google.com/url?q=https%3A%2F%2FExample.com%2Farticle%2F%3Futm_source%3Dgoogle%26id%3D7&sa=U'
+        self.assertEqual(
+            canonicalize_search_url(wrapped),
+            'https://example.com/article?id=7',
+        )
+
+    def test_resolves_opaque_google_goto_without_following_destination(self):
+        opaque = 'https://google.com/goto?url=CAESopaque'
+        response = Mock()
+        response.status = 302
+        response.headers = {'Location': 'https://Example.com/story/?utm_source=google&id=9'}
+        opener = Mock()
+        opener.open.return_value = response
+
+        self.assertEqual(
+            resolve_google_redirect_url(opaque, opener=opener),
+            'https://example.com/story?id=9',
+        )
+        opener.open.assert_called_once()
+        request = opener.open.call_args.args[0]
+        self.assertTrue(request.full_url.startswith('https://www.google.com/goto?'))
+
+    def test_selects_round_robin_results_and_deduplicates_across_directions(self):
+        groups = [
+            {
+                'direction': '官方',
+                'query': 'official',
+                'results': [
+                    {'title': 'Official', 'url': 'https://example.com/product?utm_source=google', 'snippet': 'Primary'},
+                    {'title': 'Docs', 'url': 'https://docs.example.com/product', 'snippet': 'Docs'},
+                ],
+            },
+            {
+                'direction': '新聞',
+                'query': 'news',
+                'results': [
+                    {'title': 'Duplicate official', 'url': 'https://www.example.com/product/', 'snippet': 'Duplicate'},
+                    {'title': 'News', 'url': 'https://news.example.com/story', 'snippet': 'Recent'},
+                ],
+            },
+        ]
+
+        selected = select_diverse_search_results(groups, limit=10)
+
+        self.assertEqual([item['title'] for item in selected], ['Official', 'News', 'Docs'])
+        self.assertEqual(selected[0]['directions'], ['官方', '新聞'])
+        self.assertEqual(selected[1]['direction'], '新聞')
 
 
 class DevToolsPortTests(unittest.TestCase):
@@ -42,6 +110,24 @@ class ParseCommandTests(unittest.TestCase):
         self.assertEqual(
             parse_command('upload @e1 "/tmp/doc 1.pdf" /tmp/doc2.png'),
             ['upload', '@e1', '/tmp/doc 1.pdf', '/tmp/doc2.png'],
+        )
+
+    def test_normalizes_legacy_angle_wrapped_refs_in_ref_positions(self):
+        cases = {
+            'click <@e16>': ['click', '@e16'],
+            'fill <@e6> hkhs7821@gmail.com': ['fill', '@e6', 'hkhs7821@gmail.com'],
+            'fill-submit <@e2> "cat treats"': ['fill-submit', '@e2', 'cat treats'],
+            'get text <@e4>': ['get', 'text', '@e4'],
+        }
+
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(parse_command(command), expected)
+
+    def test_does_not_rewrite_angle_wrapped_text_arguments(self):
+        self.assertEqual(
+            parse_command('click-text "<@e16>"'),
+            ['click-text', '<@e16>'],
         )
 
     def test_parses_scroll_commands(self):
@@ -343,39 +429,236 @@ class BrowserExecutableTests(unittest.TestCase):
             self.assertEqual(resolve_browser_executable(), '/usr/bin/google-chrome')
 
 
+class OpenUrlNormalizationTests(unittest.TestCase):
+    def test_rewrites_only_exact_alias_hosts(self):
+        self.assertEqual(
+            normalize_open_url('https://shop.pchome.tw/item?id=1'),
+            'https://shop.pchome.com.tw/item?id=1',
+        )
+        self.assertEqual(
+            normalize_open_url('https://www.momoshop.tw/product/1'),
+            'https://www.momoshop.com.tw/product/1',
+        )
+
+    def test_does_not_rewrite_unrelated_hosts_paths_or_queries(self):
+        urls = (
+            'https://pchome.tw.evil.example/path',
+            'https://example.test/pchome.tw/item',
+            'https://example.test/?next=https://momoshop.tw/item',
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertEqual(normalize_open_url(url), url)
+
+    def test_rewrites_only_the_exact_legacy_momo_login_route(self):
+        self.assertEqual(
+            normalize_open_url('https://www.momoshop.com.tw/mymomo/login.momo'),
+            'https://account.momoshop.com.tw/mobile',
+        )
+        unrelated = 'https://example.test/momoshop.com.tw/mymomo/login.momo'
+        self.assertEqual(normalize_open_url(unrelated), unrelated)
+
+
 class OpenActionGuardTests(unittest.TestCase):
-    def test_blocks_third_consecutive_open_even_when_urls_differ(self):
+    def test_blocks_third_consecutive_open_to_the_same_origin(self):
         guard = OpenActionGuard(limit=2)
-        guard.check('session-a', 'open')
-        guard.check('session-a', 'open')
+        guard.check('session-a', 'open', 'https://shop.example/a')
+        guard.check('session-a', 'open', 'https://shop.example/b')
 
         with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
-            guard.check('session-a', 'open')
+            guard.check('session-a', 'open', 'https://shop.example/c')
 
-    def test_remains_blocked_until_a_non_open_action(self):
+    def test_blocked_same_origin_remains_blocked_until_recovery_action(self):
         guard = OpenActionGuard(limit=2)
-        guard.check('session-a', 'open')
-        guard.check('session-a', 'open')
+        guard.check('session-a', 'open', 'https://shop.example/a')
+        guard.check('session-a', 'open', 'https://shop.example/b')
 
-        for _ in range(2):
-            with self.assertRaisesRegex(ValueError, 'blocked until'):
-                guard.check('session-a', 'open')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'https://shop.example/c')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'https://shop.example/d')
 
+    def test_success_and_failure_counts_combine_for_same_origin_limit(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://shop.example/success')
+        guard.record_failure('session-a', 'https://shop.example/failure')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.pending_open('session-a', 'https://shop.example/third')
+
+    def test_equivalent_idn_spellings_share_an_origin_streak(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://bücher.example/a')
+        guard.check('session-a', 'open', 'https://xn--bcher-kva.example/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'https://BÜCHER.example:443/c')
+
+    def test_equivalent_ipv4_spellings_share_an_origin_streak(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://127.1/a')
+        guard.check('session-a', 'open', 'http://2130706433/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://127.0.0.1:80/c')
+
+    def test_idna_deviation_character_shares_chromium_origin(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://faß.de/a')
+        guard.check('session-a', 'open', 'https://xn--fa-hia.de/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'https://faß.de:443/c')
+
+    def test_percent_encoded_ipv4_shares_chromium_origin(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://%31%32%37.0.0.1/a')
+        guard.check('session-a', 'open', 'http://127.1/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://2130706433/c')
+
+    def test_special_url_backslashes_share_chromium_origin(self):
+        guard = OpenActionGuard(limit=3)
+        guard.check('session-a', 'open', 'http://example.test/a')
+        guard.check('session-a', 'open', r'http://example.test\b')
+        guard.check('session-a', 'open', r'http:/\\example.test/c')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://example.test/d')
+
+    def test_domain_trailing_dot_remains_a_distinct_chromium_origin(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://example.test/a')
+        guard.check('session-a', 'open', 'http://example.test./b')
+        guard.check('session-a', 'open', 'http://example.test/c')
+
+    def test_fullwidth_legacy_ipv4_is_remapped_before_numeric_parsing(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://０x７f.１/a')
+        guard.check('session-a', 'open', 'http://127.0.0.1/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://2130706433/c')
+
+    def test_ascii_tab_preprocessing_matches_chromium_special_url_origin(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://example.test/a')
+        guard.check('session-a', 'open', 'http:\t//example.test/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://example.test/c')
+
+    def test_default_ports_match_chromium_for_all_special_origin_schemes(self):
+        for scheme, port in (('ftp', 21), ('http', 80), ('https', 443), ('ws', 80), ('wss', 443)):
+            with self.subTest(scheme=scheme):
+                guard = OpenActionGuard(limit=2)
+                guard.check('session-a', 'open', f'{scheme}://example.test/a')
+                guard.check('session-a', 'open', f'{scheme}://example.test:{port}/b')
+                with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+                    guard.check('session-a', 'open', f'{scheme}://example.test/c')
+
+    def test_chromium_ignored_host_format_characters_do_not_split_origins(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://exa\u2061mple.test/a')
+        guard.check('session-a', 'open', 'http://exa\u206ample.test/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://example.test/c')
+
+    def test_unicode_symbol_host_shares_chromium_punycode_origin(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://☃.net/a')
+        guard.check('session-a', 'open', 'http://xn--n3h.net/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://%E2%98%83.net/c')
+
+    def test_ipv4_mapped_ipv6_shares_chromium_hex_origin(self):
+        self.assertEqual(
+            OpenActionGuard.origin('http://[::ffff:127.0.0.1]/a'),
+            'http://[::ffff:7f00:1]',
+        )
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://[::ffff:127.0.0.1]/a')
+        guard.check('session-a', 'open', 'http://[::ffff:7f00:1]/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://[0:0:0:0:0:ffff:7f00:1]/c')
+
+    def test_ascii_host_disallowed_by_idna_but_allowed_by_chromium_is_stable(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://exa_mple.test/a')
+        guard.check('session-a', 'open', 'http://exa_mple.test/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'http://exa_mple.test/c')
+
+    def test_numeric_hosts_with_multiple_trailing_dots_remain_distinct_domains(self):
+        self.assertEqual(OpenActionGuard.origin('http://1../a'), 'http://1..')
+        self.assertEqual(OpenActionGuard.origin('http://1.../a'), 'http://1...')
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'http://1../a')
+        guard.check('session-a', 'open', 'http://1.../b')
+        guard.check('session-a', 'open', 'http://1../c')
+
+    def test_blob_urls_inherit_their_http_origin(self):
+        self.assertEqual(
+            OpenActionGuard.origin('blob:https://example.test/first-id'),
+            'https://example.test',
+        )
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'blob:https://example.test/first-id')
+        guard.check('session-a', 'open', 'https://example.test/page')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'blob:https://example.test/second-id')
+
+    def test_opaque_url_schemes_share_the_null_origin(self):
+        self.assertEqual(OpenActionGuard.origin('blob:null/first-id'), 'null')
+        self.assertEqual(OpenActionGuard.origin('file:///tmp/example'), 'null')
+        self.assertEqual(OpenActionGuard.origin('data:text/plain,example'), 'null')
+
+    def test_known_open_url_aliases_share_an_origin_streak(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://pchome.tw/a')
+        guard.check('session-a', 'open', 'https://pchome.com.tw/b')
+
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            guard.check('session-a', 'open', 'https://pchome.tw/c')
+
+    def test_allows_consecutive_opens_to_distinct_origins(self):
+        guard = OpenActionGuard(limit=2)
+
+        for index in range(30):
+            guard.check('session-a', 'open', f'https://shop-{index}.example/')
+
+    def test_a_distinct_origin_recovers_after_a_same_origin_block(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://blocked.example/a')
+        guard.check('session-a', 'open', 'https://blocked.example/b')
+        with self.assertRaisesRegex(ValueError, 'same origin'):
+            guard.check('session-a', 'open', 'https://blocked.example/c')
+
+        guard.check('session-a', 'open', 'https://next.example/')
+
+    def test_non_open_action_resets_same_origin_count(self):
+        guard = OpenActionGuard(limit=2)
+        guard.check('session-a', 'open', 'https://shop.example/a')
+        guard.check('session-a', 'open', 'https://shop.example/b')
         guard.check('session-a', 'snapshot')
-        guard.check('session-a', 'open')
-        guard.check('session-a', 'open')
+        guard.check('session-a', 'open', 'https://shop.example/c')
+        guard.check('session-a', 'open', 'https://shop.example/d')
 
     def test_tracks_sessions_independently(self):
         guard = OpenActionGuard(limit=2)
-        guard.check('session-a', 'open')
-        guard.check('session-a', 'open')
-        guard.check('session-b', 'open')
-        guard.check('session-b', 'open')
+        for session_id in ('session-a', 'session-b'):
+            guard.check(session_id, 'open', 'https://shop.example/a')
+            guard.check(session_id, 'open', 'https://shop.example/b')
 
         with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
-            guard.check('session-a', 'open')
+            guard.check('session-a', 'open', 'https://shop.example/c')
         with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
-            guard.check('session-b', 'open')
+            guard.check('session-b', 'open', 'https://shop.example/c')
 
 
 class FakeTarget:
@@ -573,6 +856,20 @@ class SnapshotFormattingTests(unittest.TestCase):
         }])
 
         self.assertIn('selected="AMD Ryzen 7 9800X3D"', output)
+
+    def test_exposes_checkbox_proxy_state(self):
+        output = format_snapshot([{
+            'ref': 'e4',
+            'tag': 'label',
+            'text': 'Receive marketing email',
+            'controlType': 'checkbox',
+            'checked': True,
+            'required': False,
+        }])
+
+        self.assertIn('control="checkbox"', output)
+        self.assertIn('checked="true"', output)
+        self.assertIn('required="false"', output)
 
     def test_describes_large_dropdown_without_dumping_its_option_corpus(self):
         output = format_snapshot([{

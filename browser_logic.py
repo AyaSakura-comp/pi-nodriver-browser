@@ -1,3 +1,5 @@
+import ipaddress
+import json
 import math
 import os
 import re
@@ -5,10 +7,187 @@ import shlex
 import shutil
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
+
+import idna
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
+
+
+GOOGLE_REDIRECT_PATHS = {'/url', '/goto'}
+SEARCH_TRACKING_PARAMETERS = {
+    'fbclid', 'gclid', 'gbraid', 'msclkid', 'sa', 'source', 'ved', 'wbraid',
+}
+
+
+def parse_google_search_payload(payload: str, limit: int = 4) -> list[dict[str, str]]:
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError('google-search requires a JSON query array') from error
+
+    if isinstance(decoded, dict):
+        decoded = decoded.get('searches', [decoded])
+    if not isinstance(decoded, list):
+        raise ValueError('google-search requires a JSON query array')
+
+    searches: list[dict[str, str]] = []
+    seen_queries: set[str] = set()
+    for index, item in enumerate(decoded):
+        if isinstance(item, str):
+            direction = f'方向 {index + 1}'
+            query = item
+        elif isinstance(item, dict):
+            direction = str(item.get('direction') or f'方向 {index + 1}')
+            query = str(item.get('query') or '')
+        else:
+            continue
+        direction = ' '.join(direction.split())
+        query = ' '.join(query.split())
+        key = query.casefold()
+        if not query or key in seen_queries:
+            continue
+        seen_queries.add(key)
+        searches.append({'direction': direction, 'query': query})
+        if len(searches) >= limit:
+            break
+    if not searches:
+        raise ValueError('google-search requires at least one non-empty query')
+    return searches
+
+
+def _google_redirect_target(url: str) -> tuple[urllib.parse.SplitResult, str] | None:
+    try:
+        parsed = urllib.parse.urlsplit(str(url or '').strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or '').lower().removeprefix('www.')
+    if not host.startswith('google.') or parsed.path not in GOOGLE_REDIRECT_PATHS:
+        return None
+    params = urllib.parse.parse_qs(parsed.query)
+    return parsed, (params.get('q') or params.get('url') or [''])[0]
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def resolve_google_redirect_url(url: str, timeout: float = 3.0, opener=None) -> str:
+    redirect = _google_redirect_target(url)
+    if redirect is None:
+        return canonicalize_search_url(url)
+    parsed, target = redirect
+    if target.startswith(('http://', 'https://')):
+        return canonicalize_search_url(target)
+    if not target:
+        return ''
+
+    opener = opener or urllib.request.build_opener(_NoRedirectHandler())
+    request_url = urllib.parse.urlunsplit((
+        parsed.scheme or 'https',
+        'www.google.com',
+        parsed.path,
+        parsed.query,
+        '',
+    ))
+    request = urllib.request.Request(
+        request_url,
+        headers={'User-Agent': 'Mozilla/5.0'},
+        method='GET',
+    )
+    response = None
+    try:
+        response = opener.open(request, timeout=timeout)
+        location = response.headers.get('Location', '')
+    except urllib.error.HTTPError as error:
+        if error.code not in {301, 302, 303, 307, 308}:
+            return ''
+        location = error.headers.get('Location', '')
+    except (OSError, ValueError):
+        return ''
+    finally:
+        close = getattr(response, 'close', None)
+        if callable(close):
+            close()
+    return canonicalize_search_url(urllib.parse.urljoin(str(url), location)) if location else ''
+
+
+def canonicalize_search_url(url: str) -> str:
+    candidate = str(url or '').strip()
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return ''
+
+    host = (parsed.hostname or '').lower()
+    if host.removeprefix('www.').startswith('google.') and parsed.path in GOOGLE_REDIRECT_PATHS:
+        redirect_params = urllib.parse.parse_qs(parsed.query)
+        target = (redirect_params.get('q') or redirect_params.get('url') or [''])[0]
+        if target.startswith(('http://', 'https://')):
+            return canonicalize_search_url(target)
+        if target:
+            opaque_query = urllib.parse.urlencode({'url': target})
+            return urllib.parse.urlunsplit((parsed.scheme.lower(), 'google.com', parsed.path, opaque_query, ''))
+
+    if parsed.scheme not in {'http', 'https'} or not host:
+        return ''
+    host = host.removeprefix('www.')
+    if parsed.port:
+        host = f'{host}:{parsed.port}'
+    path = parsed.path.rstrip('/') or '/'
+    clean_query = []
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        lower_key = key.lower()
+        if lower_key.startswith('utm_') or lower_key in SEARCH_TRACKING_PARAMETERS:
+            continue
+        clean_query.append((key, value))
+    query = urllib.parse.urlencode(clean_query, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), host, path, query, ''))
+
+
+def select_diverse_search_results(groups: list[dict], limit: int = 10) -> list[dict]:
+    selected: list[dict] = []
+    selected_by_url: dict[str, dict] = {}
+    positions = [0] * len(groups)
+
+    while len(selected) < limit:
+        progressed = False
+        for group_index, group in enumerate(groups):
+            results = group.get('results') or []
+            while positions[group_index] < len(results):
+                raw = results[positions[group_index]]
+                positions[group_index] += 1
+                canonical_url = canonicalize_search_url(raw.get('url', ''))
+                if not canonical_url:
+                    continue
+                direction = str(group.get('direction') or f'方向 {group_index + 1}')
+                existing = selected_by_url.get(canonical_url)
+                if existing is not None:
+                    if direction not in existing['directions']:
+                        existing['directions'].append(direction)
+                    continue
+                item = {
+                    'title': str(raw.get('title') or 'No Title').strip(),
+                    'url': canonical_url,
+                    'snippet': str(raw.get('snippet') or '').strip(),
+                    'direction': direction,
+                    'directions': [direction],
+                    'query': str(group.get('query') or '').strip(),
+                }
+                selected.append(item)
+                selected_by_url[canonical_url] = item
+                progressed = True
+                break
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
 
 
 class TabLimitError(ValueError):
@@ -99,27 +278,239 @@ class TabActivityRegistry:
         return candidates[:overflow]
 
 
+def normalize_open_url(target_url: str) -> str:
+    normalized = str(target_url)
+    try:
+        parsed = urllib.parse.urlsplit(normalized)
+    except (TypeError, ValueError):
+        return normalized
+    if parsed.scheme.lower() not in {'http', 'https'} or not parsed.hostname:
+        return normalized
+
+    host = parsed.hostname.lower()
+    replacement_host = None
+    for alias, canonical in (
+        ('momoshop.tw', 'momoshop.com.tw'),
+        ('pchome.tw', 'pchome.com.tw'),
+    ):
+        if host == alias or host.endswith(f'.{alias}'):
+            replacement_host = f'{host[:-len(alias)]}{canonical}'
+            break
+    if replacement_host is not None:
+        netloc = parsed.netloc
+        host_index = netloc.lower().rfind(host)
+        if host_index >= 0:
+            netloc = (
+                f'{netloc[:host_index]}{replacement_host}'
+                f'{netloc[host_index + len(host):]}'
+            )
+            parsed = parsed._replace(netloc=netloc)
+            normalized = urllib.parse.urlunsplit(parsed)
+            host = replacement_host
+
+    if (
+        (host == 'momoshop.com.tw' or host.endswith('.momoshop.com.tw'))
+        and parsed.path == '/mymomo/login.momo'
+    ):
+        return 'https://account.momoshop.com.tw/mobile'
+    return normalized
+
+
 class OpenActionGuard:
     def __init__(self, limit: int = 2):
         self.limit = limit
-        self._counts: dict[str, int] = {}
+        self._counts: dict[str, tuple[str, int]] = {}
+        self._failed_counts: dict[str, dict[str, int]] = {}
 
-    def check(self, session_id: str, action: str) -> None:
-        if action != 'open':
-            self._counts.pop(session_id, None)
-            return
+    @staticmethod
+    def _ipv4_number(piece: str) -> int | None:
+        base = 10
+        digits = piece
+        if len(digits) >= 2 and digits[:2].lower() == '0x':
+            base, digits = 16, digits[2:]
+        elif len(digits) >= 2 and digits.startswith('0'):
+            base, digits = 8, digits[1:]
+        if not digits:
+            return 0
+        allowed = {
+            8: r'[0-7]+',
+            10: r'[0-9]+',
+            16: r'[0-9a-fA-F]+',
+        }[base]
+        if not re.fullmatch(allowed, digits):
+            return None
+        return int(digits, base)
 
-        count = self._counts.get(session_id, 0) + 1
-        self._counts[session_id] = count
-        if count > self.limit:
-            raise ValueError(
-                f'OPEN_LOOP_GUARD: open has run {count} times consecutively in this session and is '
-                f'blocked until a non-open browser action runs. Use the current page, crawl URLs in '
-                f'one batch, or stop browsing instead of opening more pages.'
+    @classmethod
+    def _canonical_ipv4(cls, host: str) -> str | None:
+        pieces = host.split('.')
+        if pieces and pieces[-1] == '':
+            pieces.pop()
+        if not pieces or len(pieces) > 4 or any(piece == '' for piece in pieces):
+            return None
+        numbers = [cls._ipv4_number(piece) for piece in pieces]
+        if any(number is None for number in numbers):
+            return None
+        values = [int(number) for number in numbers]
+        if any(number > 255 for number in values[:-1]):
+            return None
+        last_limit = 256 ** (5 - len(values))
+        if values[-1] >= last_limit:
+            return None
+        numeric = values[-1]
+        for index, number in enumerate(values[:-1]):
+            numeric += number * (256 ** (3 - index))
+        return str(ipaddress.IPv4Address(numeric))
+
+    @staticmethod
+    def _canonical_ipv6(host: str) -> str:
+        value = int(ipaddress.IPv6Address(host))
+        pieces = [(value >> (16 * (7 - index))) & 0xFFFF for index in range(8)]
+        best_start = -1
+        best_length = 0
+        index = 0
+        while index < len(pieces):
+            if pieces[index] != 0:
+                index += 1
+                continue
+            end = index
+            while end < len(pieces) and pieces[end] == 0:
+                end += 1
+            length = end - index
+            if length > best_length:
+                best_start, best_length = index, length
+            index = end
+        rendered = [format(piece, 'x') for piece in pieces]
+        if best_length < 2:
+            return ':'.join(rendered)
+        left = ':'.join(rendered[:best_start])
+        right = ':'.join(rendered[best_start + best_length:])
+        if left and right:
+            return f'{left}::{right}'
+        if left:
+            return f'{left}::'
+        if right:
+            return f'::{right}'
+        return '::'
+
+    @staticmethod
+    def _strip_chromium_ignored_host_characters(host: str) -> str:
+        ignored_singletons = {0x00AD, 0x034F, 0x200B, 0x3164, 0xFEFF, 0xFFA0}
+        ignored_ranges = (
+            (0x115F, 0x1160),
+            (0x17B4, 0x17B5),
+            (0x180B, 0x180E),
+            (0x2060, 0x2064),
+            (0x206A, 0x206F),
+            (0xFE00, 0xFE0F),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0100, 0xE01EF),
+        )
+        return ''.join(
+            character for character in host
+            if ord(character) not in ignored_singletons and not any(
+                start <= ord(character) <= end for start, end in ignored_ranges
             )
+        )
+
+    @classmethod
+    def _canonical_host(cls, host: str) -> str:
+        decoded = urllib.parse.unquote(host, encoding='utf-8', errors='strict')
+        lowered = cls._strip_chromium_ignored_host_characters(decoded).lower()
+        if ':' in lowered:
+            try:
+                return cls._canonical_ipv6(lowered)
+            except ipaddress.AddressValueError:
+                pass
+        remapped = idna.uts46_remap(
+            lowered,
+            std3_rules=False,
+            transitional=False,
+        )
+        ipv4 = cls._canonical_ipv4(remapped)
+        if ipv4 is not None:
+            return ipv4
+        if remapped.isascii():
+            return remapped
+        try:
+            return idna.encode(
+                remapped,
+                uts46=True,
+                transitional=False,
+                std3_rules=True,
+            ).decode('ascii').lower()
+        except idna.IDNAError:
+            return '.'.join(
+                label if label.isascii() else f'xn--{label.encode("punycode").decode("ascii")}'
+                for label in remapped.split('.')
+            ).lower()
+
+    @classmethod
+    def origin(cls, target_url: str | None) -> str:
+        if not target_url:
+            return '<unknown>'
+        try:
+            cleaned_url = re.sub(r'[\t\n\r]', '', str(target_url)).strip(
+                ''.join(chr(value) for value in range(33))
+            )
+            normalized_url = normalize_open_url(cleaned_url)
+            scheme, separator, remainder = normalized_url.partition(':')
+            scheme = scheme.lower()
+            special_schemes = {'ftp', 'http', 'https', 'ws', 'wss'}
+            if separator and scheme == 'blob':
+                inner_scheme = remainder.partition(':')[0].lower()
+                return cls.origin(remainder) if inner_scheme in {'http', 'https'} else 'null'
+            if separator and scheme in special_schemes:
+                remainder = remainder.lstrip('/\\').replace('\\', '/')
+                normalized_url = f'{scheme}://{remainder}'
+            parsed = urllib.parse.urlsplit(normalized_url)
+            parsed_scheme = parsed.scheme.lower()
+            if parsed_scheme and parsed_scheme not in special_schemes:
+                return 'null'
+            raw_host = parsed.hostname or ''
+            if not parsed_scheme or not raw_host:
+                return target_url
+            host = cls._canonical_host(raw_host)
+            port = parsed.port
+            default_ports = {'ftp': 21, 'http': 80, 'https': 443, 'ws': 80, 'wss': 443}
+            default_port = port == default_ports.get(parsed.scheme.lower())
+            display_host = f'[{host}]' if ':' in host else host
+            authority = display_host if port is None or default_port else f'{display_host}:{port}'
+            return f'{parsed.scheme.lower()}://{authority}'
+        except (TypeError, ValueError, UnicodeError, idna.IDNAError):
+            return str(target_url)
+
+    def pending_open(self, session_id: str, target_url: str | None = None) -> tuple[str, int]:
+        origin = self.origin(target_url)
+        previous_origin, previous_count = self._counts.get(session_id, ('', 0))
+        successful_count = previous_count if previous_origin == origin else 0
+        failed_count = self._failed_counts.get(session_id, {}).get(origin, 0)
+        count = successful_count + failed_count + 1
+        if count > self.limit:
+            blocked_count = count
+            raise ValueError(
+                f'OPEN_LOOP_GUARD: open has targeted the same origin {origin} {blocked_count} times '
+                f'consecutively and is blocked until a non-open browser action or a different-origin '
+                f'open runs. Use the current page, crawl same-site URLs in one batch, or stop browsing.'
+            )
+        return origin, count
+
+    def record_failure(self, session_id: str, target_url: str | None = None) -> None:
+        origin = self.origin(target_url)
+        counts = self._failed_counts.setdefault(session_id, {})
+        counts[origin] = counts.get(origin, 0) + 1
+
+    def check(self, session_id: str, action: str, target_url: str | None = None) -> None:
+        if action != 'open':
+            self.clear(session_id)
+            return
+        self._counts[session_id] = self.pending_open(session_id, target_url)
+        self._failed_counts.pop(session_id, None)
 
     def clear(self, session_id: str) -> None:
         self._counts.pop(session_id, None)
+        self._failed_counts.pop(session_id, None)
 
 
 @dataclass(frozen=True)
@@ -372,12 +763,29 @@ def parse_dismiss_options(parts: list[str]) -> str:
     return policy
 
 
+REF_FIRST_ARGUMENT_ACTIONS = {
+    'click', 'click-js', 'download', 'download-info', 'fill', 'fill-submit',
+    'fill_submit', 'select', 'type', 'upload',
+}
+
+
+def _normalize_legacy_ref_token(token: str) -> str:
+    match = re.fullmatch(r'<@e(\d+)>', token, flags=re.IGNORECASE)
+    return f'@e{match.group(1)}' if match else token
+
+
 def parse_command(command: str) -> list[str]:
     parts = shlex.split(command)
     if not parts:
         raise ValueError('empty browser command')
     if any(token in {'&&', '||', ';', '|'} for token in parts):
         raise ValueError('run exactly one browser command per tool call; command chaining is not supported')
+
+    action = parts[0].lower()
+    if action in REF_FIRST_ARGUMENT_ACTIONS and len(parts) > 1:
+        parts[1] = _normalize_legacy_ref_token(parts[1])
+    elif action == 'get' and len(parts) > 2:
+        parts[2] = _normalize_legacy_ref_token(parts[2])
     return parts
 
 
@@ -600,6 +1008,18 @@ def format_snapshot(elements: list[dict]) -> str:
             value = _compact(str(item.get(key) or ''), 160)
             if value:
                 line += f' {label}="{_quoted(value)}"'
+        control_type = _compact(str(item.get('controlType') or ''), 40)
+        if control_type:
+            attribute = 'control' if tag == 'label' else 'type'
+            line += f' {attribute}="{_quoted(control_type)}"'
+        for state, label in (
+            ('checked', 'checked'),
+            ('required', 'required'),
+            ('disabled', 'disabled'),
+            ('valueSet', 'value-set'),
+        ):
+            if item.get(state) is not None:
+                line += f' {label}="{str(bool(item[state])).lower()}"'
         if tag == 'select' and item.get('optionCount') is not None:
             option_summary = str(item['optionCount'])
             if item.get('optionType'):

@@ -1,0 +1,227 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base target="_self">
+  <style>
+    body { font-family: sans-serif; zoom: 0.45; }
+    .visually-hidden-control {
+      position: absolute;
+      opacity: 0;
+      width: 1px;
+      height: 1px;
+    }
+    label { display: block; min-height: 16px; margin: 1px 0; }
+    input, textarea, button { min-height: 18px; margin: 0; }
+  </style>
+</head>
+<body>
+  <label for="phone">Phone</label>
+  <input id="phone" placeholder="Phone number">
+
+  <label id="profile-label" for="profile-name"
+         onclick="document.querySelector('#status').textContent='profile-label-clicked'">
+    Profile name
+  </label>
+  <input id="profile-name" placeholder="Profile name">
+
+  <label for="password">Password</label>
+  <input id="password" type="password" placeholder="Password">
+
+  <label for="mutating-password">Mutating password</label>
+  <input id="mutating-password" type="password" placeholder="Mutating password"
+         oninput="this.type='text'">
+  <label for="click-mutating-password">Click-mutating password</label>
+  <input id="click-mutating-password" type="password" placeholder="Click-mutating password"
+         value="prefilled-private-test-password" onclick="this.type='text'">
+  <label for="replacement-password">Replacement password</label>
+  <input id="replacement-password" type="password" placeholder="Replacement password"
+         onchange="const replacement=document.createElement('input');replacement.type='text';replacement.placeholder='Replacement password';replacement.value=this.value;this.replaceWith(replacement)">
+
+  <label for="readonly-input">Readonly input</label>
+  <input id="readonly-input" value="locked input" readonly>
+  <label for="readonly-textarea">Readonly textarea</label>
+  <textarea id="readonly-textarea" readonly>locked textarea</textarea>
+
+  <label for="focus-lock-input">Focus-lock input</label>
+  <input id="focus-lock-input" value="focus original" onfocus="this.readOnly=true">
+  <label for="keydown-block-input">Keydown-block input</label>
+  <input id="keydown-block-input" value="keydown original" form="safe-submit-form"
+         onkeydown="event.preventDefault()">
+  <label for="beforeinput-block-input">Beforeinput-block input</label>
+  <input id="beforeinput-block-input" value="beforeinput original"
+         onbeforeinput="event.preventDefault()">
+  <label for="partial-lock-input">Partial-lock input</label>
+  <input id="partial-lock-input" value="partial original" oninput="this.readOnly=true">
+  <label for="enter-block-input">Enter-block input</label>
+  <input id="enter-block-input" value="enter original" form="safe-submit-form"
+         onkeydown="if(event.key==='Enter')event.preventDefault()">
+  <label for="partial-cancel-input">Partial-cancel input</label>
+  <input id="partial-cancel-input" form="safe-submit-form"
+         onkeydown="if(event.key!=='Enter' && this.value.length>=1)event.preventDefault()">
+  <label for="clear-block-input">Clear-block input</label>
+  <input id="clear-block-input" value="clear original" form="safe-submit-form"
+         onbeforeinput="if(event.inputType.startsWith('delete'))event.preventDefault()">
+  <label for="sanitizing-input">Sanitizing input</label>
+  <input id="sanitizing-input" form="safe-submit-form"
+         oninput="this.value=this.value.slice(0,1)">
+  <label for="change-mutating-input">Change-mutating input</label>
+  <input id="change-mutating-input" value="change original" form="safe-submit-form"
+         onchange="this.value='change-mutated'">
+  <label for="enter-mutating-input">Enter-mutating input</label>
+  <input id="enter-mutating-input" value="enter mutation original" form="safe-submit-form"
+         onkeydown="if(event.key==='Enter')this.value='enter-mutated'">
+
+  <label id="editable-label" contenteditable="true">Editable label</label>
+
+  <label for="default-textarea">Default textarea</label>
+  <textarea id="default-textarea" placeholder="Default textarea">server default</textarea>
+
+  <label for="empty-fill-model">Empty fill model</label>
+  <input id="empty-fill-model" value="stale model value"
+         oninput="document.querySelector('#input-event-state').textContent='input-events:1'">
+  <div id="input-event-state">input-events:0</div>
+
+  <input class="visually-hidden-control" id="terms" type="checkbox" required>
+  <label for="terms">Required terms</label>
+
+  <input class="visually-hidden-control" id="marketing" type="checkbox" checked>
+  <label for="marketing">Receive marketing email</label>
+
+  <input class="visually-hidden-control" id="disabled-choice" type="checkbox" checked disabled>
+  <label for="disabled-choice">Disabled preference</label>
+
+  <form id="safe-submit-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='submitted'">
+  </form>
+
+  <form id="throwing-form">
+    <label for="throwing-submit-input">Throwing submit input</label>
+    <input id="throwing-submit-input" placeholder="Throwing submit input">
+  </form>
+
+  <form id="ancestor-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='wrong-form-submitted'">
+    <label for="override-form-input">Override form input</label>
+    <input id="override-form-input" form="override-form" placeholder="Override form input">
+  </form>
+  <form id="override-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='override-form-submitted'">
+  </form>
+
+  <form id="invalid-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='invalid-form-submitted'">
+    <input required aria-label="Unfilled required peer">
+    <label for="invalid-form-input">Invalid form input</label>
+    <input id="invalid-form-input" placeholder="Invalid form input">
+  </form>
+
+  <form id="enter-handler-form"
+        onsubmit="event.preventDefault();const count=Number(this.dataset.count||0)+1;this.dataset.count=count;document.querySelector('#status').textContent='handler-submit-count:'+count">
+    <label for="enter-handler-input">Enter handler input</label>
+    <input id="enter-handler-input" placeholder="Enter handler input"
+           onkeydown="if(event.key==='Enter')this.form.requestSubmit()">
+  </form>
+
+  <form id="unsafe-enter-handler-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='unsafe-handler-submitted'">
+    <label for="unsafe-enter-handler-input">Unsafe enter handler input</label>
+    <input id="unsafe-enter-handler-input" placeholder="Unsafe enter handler input"
+           onkeydown="if(event.key==='Enter'){this.value='tampered';this.form.target='_blank';this.form.requestSubmit()}">
+  </form>
+
+  <form id="late-mutating-form" method="get"
+        onsubmit="document.querySelector('#status').textContent='late-mutating-form-submitted'">
+    <label for="late-mutating-input">Late-mutating input</label>
+    <input id="late-mutating-input" placeholder="Late-mutating input">
+  </form>
+
+  <form id="default-submitter-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='default-submitter:'+event.submitter?.id+':clicks='+this.dataset.clicks">
+    <label for="default-submitter-input">Default submitter input</label>
+    <input id="default-submitter-input" placeholder="Default submitter input">
+    <button id="default-submit-button" type="submit" name="operation" value="default"
+            onclick="this.form.dataset.clicks=Number(this.form.dataset.clicks||0)+1">
+      Default submit
+    </button>
+    <button id="other-submit-button" type="submit" name="operation" value="other">
+      Other submit
+    </button>
+  </form>
+
+  <form id="unsupported-target-form" target="_blank"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='unsupported-target-submitted'">
+    <label for="unsupported-target-input">Unsupported target input</label>
+    <input id="unsupported-target-input" placeholder="Unsupported target input">
+    <button type="submit">Open target</button>
+  </form>
+
+  <form id="base-target-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='base-target-submitted'">
+    <label for="base-target-input">Base target input</label>
+    <input id="base-target-input" placeholder="Base target input"
+           oninput="document.querySelector('base').setAttribute('target','_blank')">
+    <button type="submit">Base target submit</button>
+  </form>
+
+  <form id="whitespace-target-form" target=" _self "
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='whitespace-target-submitted'">
+    <label for="whitespace-target-input">Whitespace target input</label>
+    <input id="whitespace-target-input" placeholder="Whitespace target input">
+    <button type="submit">Whitespace target submit</button>
+  </form>
+
+  <form id="disabled-default-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='disabled-default-submitted:'+event.submitter?.id">
+    <label for="disabled-default-input">Disabled default input</label>
+    <input id="disabled-default-input" placeholder="Disabled default input">
+    <button id="disabled-first-submitter" type="submit" disabled>Disabled first</button>
+    <button id="enabled-second-submitter" type="submit">Enabled second</button>
+  </form>
+
+  <form id="image-default-form"
+        onsubmit="event.preventDefault();document.querySelector('#status').textContent='image-default-submitted:'+event.submitter?.id">
+    <label for="image-default-input">Image default input</label>
+    <input id="image-default-input" placeholder="Image default input">
+    <input id="image-default-submitter" type="image"
+           src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+           alt="Image default submit">
+    <button id="image-second-submitter" type="submit">Image second</button>
+  </form>
+
+  <div id="shadow-form-host"></div>
+
+  <button id="next-action"
+          onclick="document.querySelector('#status').textContent='next-clicked'">
+    Next
+  </button>
+  <div id="status">idle</div>
+  <script>
+    document.querySelector('#throwing-form').requestSubmit = () => {
+      throw new Error('synthetic requestSubmit failure');
+    };
+    const shadow = document.querySelector('#shadow-form-host').attachShadow({mode: 'open'});
+    shadow.innerHTML = `
+      <form id="shadow-submit-form">
+        <label for="shadow-submit-input">Shadow submit input</label>
+        <input id="shadow-submit-input" placeholder="Shadow submit input">
+        <button id="shadow-default-submitter" type="submit">Shadow default submit</button>
+      </form>
+    `;
+    const shadowForm = shadow.querySelector('#shadow-submit-form');
+    shadow.querySelector('#shadow-default-submitter').addEventListener('click', () => {
+      shadowForm.dataset.clicks = Number(shadowForm.dataset.clicks || 0) + 1;
+    });
+    shadowForm.addEventListener('submit', event => {
+      event.preventDefault();
+      document.querySelector('#status').textContent =
+        `shadow-submitter:${event.submitter?.id}:clicks=${shadowForm.dataset.clicks}`;
+    });
+    document.addEventListener('submit', event => {
+      if (event.target.id !== 'late-mutating-form') return;
+      event.target.method = 'post';
+      event.preventDefault();
+    });
+  </script>
+</body>
+</html>

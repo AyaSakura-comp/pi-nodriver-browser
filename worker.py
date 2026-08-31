@@ -24,13 +24,13 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_profile_dir, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_google_search_payload, parse_vision_click, parse_vision_mark, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
-    'fill-submit', 'fill_submit', 'find-option', 'get', 'mobile', 'open', 'press', 'screenshot',
+    'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'mobile', 'open', 'press', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
     'vision-click', 'vision-mark', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
@@ -74,6 +74,26 @@ IMAGE_DISCOVERY_TIMEOUT_SECONDS = 0.25
 IMAGE_FETCH_MAX_CONCURRENCY = 4
 IMAGE_CANDIDATE_TEXT_MAX_BYTES = 6000
 CRAWL_IMAGE_SIDECAR_MAX_BYTES = 12000
+GOOGLE_RESULTS_JS = r'''JSON.stringify((() => {
+  const rows = [];
+  for (const anchor of document.querySelectorAll('a')) {
+    const heading = anchor.querySelector('h3');
+    if (!heading) continue;
+    const title = (heading.innerText || heading.textContent || '').trim();
+    const url = anchor.href || '';
+    if (!title || !url) continue;
+    const card = anchor.closest('.MjjYud, .g') || anchor.closest('[data-snhf]')?.parentElement || anchor.parentElement?.parentElement?.parentElement;
+    const snippetElement = card?.querySelector('[data-sncf="1"], .VwiC3b, [data-snf="nke7rc"]');
+    const explicitSnippet = (snippetElement?.innerText || snippetElement?.textContent || '').trim();
+    const lines = (card?.innerText || '')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line && line !== title && !/^https?:\/\//i.test(line));
+    const snippet = explicitSnippet || lines.slice(0, 4).join(' ');
+    rows.push({ title, url, snippet: snippet.slice(0, 600) });
+  }
+  return rows.slice(0, 20);
+})())'''
 IMAGE_NAT64_WELL_KNOWN = ipaddress.ip_network('64:ff9b::/96')
 IMAGE_NAT64_LOCAL_USE = ipaddress.ip_network('64:ff9b:1::/48')
 IMAGE_IPV6_SITE_LOCAL = ipaddress.ip_network('fec0::/10')
@@ -184,7 +204,7 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
 SNAPSHOT_JS = r'''JSON.stringify((() => {
   const seen = new Set();
   const entries = [];
-  const semanticSelector = 'a,button,input,textarea,select,summary,details,label,' +
+  const semanticSelector = 'a,button,input,textarea,select,summary,details,' +
     '[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],' +
     '[role="checkbox"],[role="radio"],[role="switch"],[contenteditable="true"]';
 
@@ -198,7 +218,27 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
         rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth;
     } catch (_) { return false; }
   };
+  const associatedControl = el => {
+    if (el.tagName !== 'LABEL') return el;
+    return el.control || el.querySelector?.(
+      'input,textarea,select,[role="checkbox"],[role="radio"],[role="switch"]'
+    ) || null;
+  };
+  const controlType = el => {
+    const control = associatedControl(el);
+    if (!control) return '';
+    if (control.tagName === 'INPUT') return String(control.type || 'text').toLowerCase();
+    const role = String(control.getAttribute?.('role') || '').toLowerCase();
+    if (['checkbox', 'radio', 'switch'].includes(role)) return role;
+    if (el.tagName === 'LABEL') return control.tagName.toLowerCase();
+    return '';
+  };
   const interactive = el => {
+    const control = associatedControl(el);
+    if (el.tagName === 'LABEL') {
+      const proxyType = controlType(el);
+      if (['checkbox', 'radio', 'switch'].includes(proxyType)) return true;
+    }
     if (el.matches?.(':disabled') || el.getAttribute('aria-disabled') === 'true') return false;
     if (el.matches(semanticSelector)) return true;
     const style = getComputedStyle(el);
@@ -265,11 +305,51 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
       if (named) return named;
       try { return new URL(item.src, item.ownerDocument.location.href).origin; } catch (_) { return 'iframe'; }
     }).join(' > ');
+    const control = associatedControl(el);
+    const type = controlType(el);
+    const checkable = ['checkbox', 'radio', 'switch'].includes(type);
+    const formControl = control && ['INPUT', 'TEXTAREA', 'SELECT'].includes(control.tagName);
+    const passwordNow = el.tagName === 'INPUT' && type === 'password';
+    let sensitiveValues = el.ownerDocument.__piSensitiveValues;
+    if (passwordNow && (!sensitiveValues || typeof sensitiveValues.has !== 'function' ||
+        typeof sensitiveValues.add !== 'function')) {
+      sensitiveValues = new el.ownerDocument.defaultView.Set();
+      try {
+        Object.defineProperty(el.ownerDocument, '__piSensitiveValues', {
+          value: sensitiveValues,
+          writable: false,
+          configurable: false
+        });
+      } catch (_) {
+        try { el.ownerDocument.__piSensitiveValues = sensitiveValues; } catch (_) {}
+      }
+    }
+    const knownSensitiveValue = Boolean(el.value) &&
+      sensitiveValues && typeof sensitiveValues.has === 'function' &&
+      sensitiveValues.has(String(el.value));
+    if (passwordNow) {
+      el.setAttribute('data-pi-sensitive', 'true');
+      try {
+        Object.defineProperty(el, '__piSensitiveValue', {
+          value: true,
+          writable: false,
+          configurable: false
+        });
+      } catch (_) {}
+      if (sensitiveValues && typeof sensitiveValues.add === 'function' && el.value) {
+        sensitiveValues.add(String(el.value));
+      }
+    }
+    const sensitive = el.tagName === 'INPUT' && (
+      passwordNow || knownSensitiveValue || el.__piSensitiveValue === true ||
+      el.getAttribute('data-pi-sensitive') === 'true'
+    );
     return {
       ref,
       tag: el.tagName.toLowerCase(),
       text: (el.innerText || el.textContent || '').trim(),
-      value: el.value || '',
+      value: sensitive ? '' : (el.value || ''),
+      valueSet: sensitive ? Boolean(el.value) : null,
       href: el.href || '',
       download: el.getAttribute('download') || '',
       placeholder: el.getAttribute('placeholder') || '',
@@ -277,7 +357,19 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
       selected: el.tagName === 'SELECT' && el.selectedIndex >= 0
         ? String(el.options[el.selectedIndex]?.textContent || '').trim()
         : '',
-      controlLabel: el.tagName === 'SELECT' ? controlLabel(el) : '',
+      controlLabel: formControl && el.tagName !== 'LABEL' ? controlLabel(control) : '',
+      controlType: type,
+      checked: checkable
+        ? (typeof control.checked === 'boolean'
+          ? control.checked
+          : control.getAttribute?.('aria-checked') === 'true')
+        : null,
+      required: checkable || formControl
+        ? Boolean(control.required || control.getAttribute?.('aria-required') === 'true')
+        : null,
+      disabled: checkable || formControl
+        ? Boolean(control.matches?.(':disabled') || control.getAttribute?.('aria-disabled') === 'true')
+        : null,
       optionCount: el.tagName === 'SELECT' ? el.options.length : null,
       optionType: el.tagName === 'SELECT' && Array.from(el.options).every(option =>
         /^[-+]?\d+(?:\.\d+)?$/.test(String(option.textContent || '').trim())
@@ -733,6 +825,19 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
         el.ownerDocument.defaultView.getComputedStyle(el).cursor
       ));
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const labelText = el => {
+    const sensitiveValues = el.ownerDocument.__piSensitiveValues;
+    const knownSensitiveValue = Boolean(el.value) && sensitiveValues &&
+      typeof sensitiveValues.has === 'function' && sensitiveValues.has(String(el.value));
+    const sensitive = el.tagName === 'INPUT' && (
+      String(el.type || '').toLowerCase() === 'password' || knownSensitiveValue ||
+      el.__piSensitiveValue === true ||
+      el.getAttribute('data-pi-sensitive') === 'true'
+    );
+    return normalize(el.innerText || el.textContent ||
+      (sensitive ? '' : el.value) || el.getAttribute('aria-label') ||
+      el.getAttribute('title'));
+  };
   const entries = [];
 
   const visit = (root, offsetX = 0, offsetY = 0, frames = []) => {
@@ -772,22 +877,20 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
       const wanted = normalize(request.value);
       let candidates = entries.filter(item => {
         const el = item.el;
-        const label = normalize(el.innerText || el.textContent || el.value ||
-          el.getAttribute('aria-label') || el.getAttribute('title'));
+        const label = labelText(el);
+        const shortQuery = Array.from(wanted).length <= 2;
         return label === wanted || (
-          label.includes(wanted) && label.length <= Math.max(160, wanted.length * 4)
+          !shortQuery && label.startsWith(wanted) &&
+          label.length <= Math.max(160, wanted.length * 4)
         );
       });
       candidates = candidates.filter(item => !candidates.some(other =>
         other.el !== item.el && item.el.contains?.(other.el) &&
-        normalize(other.el.innerText || other.el.textContent || other.el.value ||
-          other.el.getAttribute('aria-label') || other.el.getAttribute('title')).length <=
-        normalize(item.el.innerText || item.el.textContent || item.el.value ||
-          item.el.getAttribute('aria-label') || item.el.getAttribute('title')).length
+        labelText(other.el).length <= labelText(item.el).length
       ));
       candidates.sort((a, b) => {
-        const aText = normalize(a.el.innerText || a.el.textContent || a.el.value || a.el.getAttribute('aria-label'));
-        const bText = normalize(b.el.innerText || b.el.textContent || b.el.value || b.el.getAttribute('aria-label'));
+        const aText = labelText(a.el);
+        const bText = labelText(b.el);
         const aScore = (aText === wanted ? 0 : 1000) + (interactive(a.el) ? 0 : 100) + aText.length;
         const bScore = (bText === wanted ? 0 : 1000) + (interactive(b.el) ? 0 : 100) + bText.length;
         return aScore - bScore;
@@ -796,6 +899,15 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
     }
   }
   if (!match) return { found: false, invalidSelector };
+  const labelControl = match.el.tagName === 'LABEL'
+    ? (match.el.control || match.el.querySelector?.(
+      'input,textarea,select,[role="checkbox"],[role="radio"],[role="switch"]'
+    ))
+    : null;
+  const disabled = match.el.matches?.(':disabled') ||
+    match.el.getAttribute?.('aria-disabled') === 'true' ||
+    labelControl?.matches?.(':disabled') || labelControl?.getAttribute?.('aria-disabled') === 'true';
+  if (disabled) return { found: true, disabled: true };
 
   for (const frame of match.frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
   match.el.scrollIntoView({ block: 'center', inline: 'center' });
@@ -804,12 +916,48 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
     const frameRect = frame.getBoundingClientRect();
     return { x: offset.x + frameRect.left, y: offset.y + frameRect.top };
   }, { x: 0, y: 0 });
+  const passwordNow = match.el.tagName === 'INPUT' &&
+    String(match.el.type || '').toLowerCase() === 'password';
+  if (passwordNow) {
+    match.el.setAttribute('data-pi-sensitive', 'true');
+    let sensitiveValues = match.el.ownerDocument.__piSensitiveValues;
+    if (!sensitiveValues || typeof sensitiveValues.has !== 'function' ||
+        typeof sensitiveValues.add !== 'function') {
+      sensitiveValues = new match.el.ownerDocument.defaultView.Set();
+      try {
+        Object.defineProperty(match.el.ownerDocument, '__piSensitiveValues', {
+          value: sensitiveValues,
+          writable: false,
+          configurable: false
+        });
+      } catch (_) {
+        try { match.el.ownerDocument.__piSensitiveValues = sensitiveValues; } catch (_) {}
+      }
+    }
+    if (match.el.value) {
+      sensitiveValues.add(String(match.el.value));
+    }
+    try {
+      Object.defineProperty(match.el, '__piSensitiveValue', {
+        value: true,
+        writable: false,
+        configurable: false
+      });
+    } catch (_) {}
+  }
+  const sensitiveValues = match.el.ownerDocument.__piSensitiveValues;
+  const knownSensitiveValue = Boolean(match.el.value) && sensitiveValues &&
+    typeof sensitiveValues.has === 'function' && sensitiveValues.has(String(match.el.value));
+  const sensitive = match.el.tagName === 'INPUT' && (
+    passwordNow || knownSensitiveValue || match.el.__piSensitiveValue === true ||
+    match.el.getAttribute('data-pi-sensitive') === 'true'
+  );
   return {
     found: true,
     x: currentOffset.x + rect.left + rect.width / 2,
     y: currentOffset.y + rect.top + rect.height / 2,
     tag: match.el.tagName.toLowerCase(),
-    text: (match.el.innerText || match.el.textContent || match.el.value || '').trim(),
+    text: sensitive ? '' : (match.el.innerText || match.el.textContent || match.el.value || '').trim(),
     href: match.el.href || match.el.closest?.('a')?.href || '',
     download: match.el.getAttribute?.('download') || match.el.closest?.('a')?.getAttribute?.('download') || ''
   };
@@ -858,8 +1006,54 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
       shadowHosts.some(host => !visible(host))) {
     return { found: true, ok: false, error: 'target or owning frame/shadow host is not visible; run snapshot -i again' };
   }
-  if (element.matches?.(':disabled') || element.getAttribute?.('aria-disabled') === 'true') {
+  const labelControl = element.tagName === 'LABEL'
+    ? (element.control || element.querySelector?.(
+      'input,textarea,select,[role="checkbox"],[role="radio"],[role="switch"]'
+    ))
+    : null;
+  if (element.matches?.(':disabled') || element.getAttribute?.('aria-disabled') === 'true' ||
+      labelControl?.matches?.(':disabled') || labelControl?.getAttribute?.('aria-disabled') === 'true') {
     return { found: true, ok: false, error: 'target control is disabled' };
+  }
+
+  const registryFor = doc => {
+    let registry = doc.__piSensitiveValues;
+    if (!registry || typeof registry.has !== 'function' || typeof registry.add !== 'function') {
+      registry = new doc.defaultView.Set();
+      try {
+        Object.defineProperty(doc, '__piSensitiveValues', {
+          value: registry,
+          writable: false,
+          configurable: false
+        });
+      } catch (_) {
+        try { doc.__piSensitiveValues = registry; } catch (_) {}
+      }
+    }
+    return registry;
+  };
+  const isSensitive = target => {
+    const registry = registryFor(target.ownerDocument);
+    const knownSensitiveValue = Boolean(target.value) && registry.has(String(target.value));
+    return target.tagName === 'INPUT' && (
+    String(target.type || '').toLowerCase() === 'password' || knownSensitiveValue ||
+    target.__piSensitiveValue === true ||
+    target.getAttribute('data-pi-sensitive') === 'true'
+    );
+  };
+  const sensitiveRegistry = registryFor(element.ownerDocument);
+  const initiallySensitive = isSensitive(element);
+  if (initiallySensitive) {
+    element.setAttribute('data-pi-sensitive', 'true');
+    try {
+      Object.defineProperty(element, '__piSensitiveValue', {
+        value: true,
+        writable: false,
+        configurable: false
+      });
+    } catch (_) {}
+    if (element.value) sensitiveRegistry.add(String(element.value));
+    if (request.value) sensitiveRegistry.add(String(request.value));
   }
 
   const dispatchValueEvents = target => {
@@ -868,8 +1062,26 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
     target.dispatchEvent(new view.Event('change', { bubbles: true, cancelable: true }));
   };
   const setText = (target, text, append = false) => {
+    if (target.tagName === 'LABEL') return { ok: false, mutated: false, complete: false };
     const view = target.ownerDocument.defaultView;
-    target.focus();
+    const textInputTypes = new Set([
+      'text', 'search', 'email', 'tel', 'url', 'password', 'number',
+      'date', 'month', 'week', 'time', 'datetime-local'
+    ]);
+    const editable = () => {
+      if (target.matches?.(':disabled') || target.getAttribute?.('aria-disabled') === 'true') {
+        return false;
+      }
+      if (target instanceof view.HTMLInputElement) {
+        return !target.readOnly && textInputTypes.has(
+          String(target.type || 'text').toLowerCase()
+        );
+      }
+      if (target instanceof view.HTMLTextAreaElement) return !target.readOnly;
+      return target.isContentEditable;
+    };
+    if (!editable()) return { ok: false, mutated: false, complete: false };
+
     let setValue;
     if (target instanceof view.HTMLInputElement) {
       const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value')?.set;
@@ -877,66 +1089,359 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
     } else if (target instanceof view.HTMLTextAreaElement) {
       const setter = Object.getOwnPropertyDescriptor(view.HTMLTextAreaElement.prototype, 'value')?.set;
       setValue = value => setter ? setter.call(target, value) : (target.value = value);
-    } else if (target.isContentEditable) {
-      setValue = value => { target.textContent = value; };
     } else {
-      return false;
+      setValue = value => { target.textContent = value; };
     }
 
-    let current = append ? String(target.value || target.textContent || '') : '';
-    if (!append) setValue('');
-    for (const character of String(text)) {
+    const dispatchInput = options => {
+      try {
+        target.dispatchEvent(new view.InputEvent('input', options));
+      } catch (_) {
+        target.dispatchEvent(new view.Event('input', { bubbles: true, cancelable: true }));
+      }
+    };
+    const dispatchBeforeInput = options => {
+      try {
+        return target.dispatchEvent(new view.InputEvent('beforeinput', options));
+      } catch (_) {
+        return target.dispatchEvent(new view.Event('beforeinput', {
+          bubbles: true,
+          cancelable: true
+        }));
+      }
+    };
+    const liveValue = () => target instanceof view.HTMLInputElement ||
+      target instanceof view.HTMLTextAreaElement
+      ? String(target.value ?? '')
+      : String(target.textContent ?? '');
+    const originalValue = liveValue();
+    let mutated = false;
+    let acceptedCount = 0;
+    const rollback = () => {
+      if (mutated) {
+        setValue(originalValue);
+        dispatchInput({
+          data: null,
+          inputType: 'historyUndo',
+          bubbles: true,
+          cancelable: false
+        });
+        mutated = false;
+      }
+      return { ok: false, mutated: false, complete: false };
+    };
+
+    target.focus();
+    if (!editable()) return rollback();
+    const requested = String(text);
+    let current = append ? originalValue : '';
+
+    if (!append && requested.length > 0 && originalValue.length > 0) {
+      const clearOptions = {
+        data: null,
+        inputType: 'deleteByCut',
+        bubbles: true,
+        cancelable: true
+      };
+      if (!dispatchBeforeInput(clearOptions) || !editable()) {
+        return { ok: true, mutated: false, complete: false, value: originalValue };
+      }
+      setValue('');
+      mutated = true;
+      dispatchInput(clearOptions);
+      if (!editable() || liveValue() !== '') return rollback();
+    }
+
+    if (!append && requested.length === 0) {
+      const clearOptions = {
+        data: null,
+        inputType: 'deleteContentBackward',
+        bubbles: true,
+        cancelable: true
+      };
+      if (dispatchBeforeInput(clearOptions) && editable()) {
+        setValue('');
+        mutated = true;
+        dispatchInput(clearOptions);
+      }
+    }
+
+    for (let index = 0; index < requested.length; index += 1) {
+      if (!editable()) return rollback();
+      const character = requested[index];
       const keyOptions = { key: character, bubbles: true, cancelable: true };
-      target.dispatchEvent(new view.KeyboardEvent('keydown', keyOptions));
+      const keydownAllowed = target.dispatchEvent(new view.KeyboardEvent('keydown', keyOptions));
+      if (!keydownAllowed || !editable()) {
+        target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+        if (!editable()) return rollback();
+        continue;
+      }
       const inputOptions = {
         data: character,
         inputType: 'insertText',
         bubbles: true,
         cancelable: true
       };
-      try { target.dispatchEvent(new view.InputEvent('beforeinput', inputOptions)); } catch (_) {}
+      const beforeInputAllowed = dispatchBeforeInput(inputOptions);
+      if (!beforeInputAllowed || !editable()) {
+        target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+        if (!editable()) return rollback();
+        continue;
+      }
       current += character;
       setValue(current);
-      try {
-        target.dispatchEvent(new view.InputEvent('input', inputOptions));
-      } catch (_) {
-        target.dispatchEvent(new view.Event('input', { bubbles: true, cancelable: true }));
-      }
+      mutated = true;
+      acceptedCount += 1;
+      dispatchInput(inputOptions);
       target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+      if (!editable() && index < requested.length - 1) return rollback();
     }
-    target.dispatchEvent(new view.Event('change', { bubbles: true, cancelable: true }));
-    return true;
+    if (mutated && liveValue() !== current) return rollback();
+    if (mutated) {
+      target.dispatchEvent(new view.Event('change', { bubbles: true, cancelable: true }));
+      if (liveValue() !== current) return rollback();
+    }
+    const complete = requested.length === 0
+      ? mutated
+      : acceptedCount === requested.length;
+    return { ok: true, mutated, complete, value: current };
   };
 
   if (request.action === 'fill' || request.action === 'type' || request.action === 'fill-submit') {
-    if (!setText(element, request.value || '', request.action === 'type')) {
-      return { found: true, ok: false, error: 'target is not text-editable' };
+    const elementView = element.ownerDocument.defaultView;
+    const elementTextTypes = new Set([
+      'text', 'search', 'email', 'tel', 'url', 'password', 'number',
+      'date', 'month', 'week', 'time', 'datetime-local'
+    ]);
+    const editableAtRest = element.tagName !== 'LABEL' &&
+      !element.matches?.(':disabled') && element.getAttribute?.('aria-disabled') !== 'true' && (
+        (element instanceof elementView.HTMLInputElement && !element.readOnly &&
+          elementTextTypes.has(String(element.type || 'text').toLowerCase())) ||
+        (element instanceof elementView.HTMLTextAreaElement && !element.readOnly) ||
+        element.isContentEditable
+      );
+    if (!editableAtRest) {
+      return { found: true, ok: false, error: 'target is not text-editable; use an input, textarea, or contenteditable ref, never a label ref' };
     }
+    const resolveSubmitForm = () => {
+      if (element instanceof elementView.HTMLInputElement ||
+          element instanceof elementView.HTMLTextAreaElement) {
+        return element.form || null;
+      }
+      return element.closest?.('form') || null;
+    };
+    const submitForm = request.action === 'fill-submit' ? resolveSubmitForm() : null;
+    if (request.action === 'fill-submit' && !submitForm) {
+      return { found: true, ok: false, error: 'target has no associated form; form was not submitted' };
+    }
+    if (request.action === 'fill-submit' && typeof submitForm.requestSubmit !== 'function') {
+      return { found: true, ok: false, error: 'associated form has no requestSubmit method; form was not submitted' };
+    }
+    const defaultSubmitterFor = form => Array.from(
+      form?.getRootNode?.()?.querySelectorAll?.('button,input') || []
+    ).find(control => {
+      if (control.form !== form) return false;
+      if (control.tagName === 'BUTTON') return String(control.type || 'submit').toLowerCase() === 'submit';
+      if (control.tagName === 'INPUT') {
+        return ['submit', 'image'].includes(String(control.type || '').toLowerCase());
+      }
+      return false;
+    }) || null;
+    const submissionContext = (form, submitter) => {
+      const explicitTarget = submitter?.hasAttribute?.('formtarget')
+        ? submitter.getAttribute('formtarget')
+        : (form?.hasAttribute?.('target') ? form.getAttribute('target') : null);
+      const baseTarget = form?.ownerDocument?.querySelector('base[target]')?.getAttribute('target');
+      return {
+        target: String(explicitTarget ?? baseTarget ?? '').toLowerCase(),
+        method: String(
+          submitter?.hasAttribute?.('formmethod') ? submitter.formMethod : form?.method || 'get'
+        ).toLowerCase(),
+        action: String(
+          submitter?.hasAttribute?.('formaction') ? submitter.formAction : form?.action || ''
+        ),
+        enctype: String(
+          submitter?.hasAttribute?.('formenctype') ? submitter.formEnctype : form?.enctype || ''
+        ).toLowerCase(),
+        skipsValidation: Boolean(form?.noValidate || submitter?.formNoValidate)
+      };
+    };
+    const contextSignature = context => JSON.stringify(context);
+    const submissionContextError = (form, submitter) => {
+      if (submitter?.matches?.(':disabled')) return 'disabled default submitter cannot be activated';
+      const context = submissionContext(form, submitter);
+      if (context.target && context.target !== '_self') {
+        return `unsupported form target: ${context.target}`;
+      }
+      if (context.method === 'dialog') return 'unsupported form method: dialog';
+      return '';
+    };
+    const submitFormDefault = submitForm ? defaultSubmitterFor(submitForm) : null;
+    const submitFormContext = submitForm
+      ? contextSignature(submissionContext(submitForm, submitFormDefault))
+      : '';
     if (request.action === 'fill-submit') {
-      const ownerFrame = frames[frames.length - 1];
-      const form = element.closest?.('form') || element.form || null;
-      ownerFrame?.setAttribute('data-pi-submit-frame', request.ref);
-      ownerFrame?.setAttribute('data-pi-submit-url', element.ownerDocument.location.href);
-      ownerFrame?.setAttribute('data-pi-submit-navigates', form ? 'true' : 'false');
-      const view = element.ownerDocument.defaultView;
-      const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-      element.dispatchEvent(new view.KeyboardEvent('keydown', opts));
-      element.dispatchEvent(new view.KeyboardEvent('keypress', opts));
-      element.dispatchEvent(new view.KeyboardEvent('keyup', opts));
-      if (form && typeof form.requestSubmit === 'function') {
-        try { form.requestSubmit(); } catch (_) {}
-      } else {
-        const searchButton = element.parentElement?.querySelector(
-          'button,[class*="search"],input[type="submit"]'
-        );
-        try { searchButton?.click(); } catch (_) {}
+      const contextError = submissionContextError(submitForm, submitFormDefault);
+      if (contextError) {
+        return { found: true, ok: false, error: `${contextError}; form was not submitted` };
       }
     }
+    let submissionExpectsNavigation = null;
+    const textResult = setText(element, request.value || '', request.action === 'type');
+    if (!textResult.ok) {
+      return { found: true, ok: false, error: 'target is not text-editable; use an input, textarea, or contenteditable ref, never a label ref' };
+    }
+    if (request.action === 'fill-submit') {
+      if (!textResult.mutated || !textResult.complete) {
+        return { found: true, ok: false, error: 'text input was canceled; form was not submitted' };
+      }
+      const ownerFrame = frames[frames.length - 1];
+      const form = resolveSubmitForm();
+      const submitter = defaultSubmitterFor(form);
+      if (form !== submitForm || submitter !== submitFormDefault ||
+          contextSignature(submissionContext(form, submitter)) !== submitFormContext) {
+        return { found: true, ok: false, error: 'form association, default submitter, or submission context changed during input; form was not submitted' };
+      }
+      const contextError = submissionContextError(form, submitter);
+      if (contextError) {
+        return { found: true, ok: false, error: `${contextError}; form was not submitted` };
+      }
+      const skipsValidation = submissionContext(form, submitter).skipsValidation;
+      if (!skipsValidation && !form.checkValidity()) {
+        return { found: true, ok: false, error: 'constraint validation prevented form submission' };
+      }
+      const view = element.ownerDocument.defaultView;
+      let submitEvent = null;
+      let submitError = '';
+      const observeSubmit = event => {
+        submitEvent = event;
+        const observedSubmitter = event.submitter || null;
+        const observedValue = element instanceof view.HTMLInputElement ||
+          element instanceof view.HTMLTextAreaElement
+          ? String(element.value ?? '')
+          : String(element.textContent ?? '');
+        if (resolveSubmitForm() !== form) {
+          submitError = 'form association changed during submission';
+        } else if (observedSubmitter !== submitter) {
+          submitError = 'default submitter changed during submission';
+        } else if (observedValue !== textResult.value) {
+          submitError = 'text value changed during submission';
+        } else if (contextSignature(submissionContext(form, observedSubmitter)) !== submitFormContext) {
+          submitError = 'submission context changed during submission';
+        } else {
+          submitError = submissionContextError(form, observedSubmitter);
+        }
+        if (submitError) event.preventDefault();
+      };
+      const submitRoot = form.getRootNode?.();
+      const submitObservationTarget = submitRoot?.nodeType === 11
+        ? submitRoot
+        : form.ownerDocument.defaultView;
+      const clearSubmitTracking = () => {
+        form.removeEventListener('submit', observeSubmit, false);
+        submitObservationTarget?.removeEventListener('submit', observeSubmit, false);
+        ownerFrame?.removeAttribute('data-pi-submit-frame');
+        ownerFrame?.removeAttribute('data-pi-submit-url');
+        ownerFrame?.removeAttribute('data-pi-submit-navigates');
+        if (ownerFrame) {
+          delete ownerFrame.__piSubmitDocument;
+          delete ownerFrame.__piSubmitStartedAt;
+          delete ownerFrame.__piSubmitLastSignature;
+          delete ownerFrame.__piSubmitLastChangeAt;
+          delete ownerFrame.__piSubmitSawMutation;
+        }
+      };
+      form.addEventListener('submit', observeSubmit, false);
+      submitObservationTarget?.addEventListener('submit', observeSubmit, false);
+      ownerFrame?.setAttribute('data-pi-submit-frame', request.ref);
+      ownerFrame?.setAttribute('data-pi-submit-url', element.ownerDocument.location.href);
+      ownerFrame?.setAttribute('data-pi-submit-navigates', 'true');
+      if (ownerFrame) {
+        ownerFrame.__piSubmitDocument = element.ownerDocument;
+        ownerFrame.__piSubmitStartedAt = Date.now();
+        ownerFrame.__piSubmitLastSignature = '';
+        ownerFrame.__piSubmitLastChangeAt = Date.now();
+        ownerFrame.__piSubmitSawMutation = false;
+      }
+
+      const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+      const keydownAllowed = element.dispatchEvent(new view.KeyboardEvent('keydown', opts));
+      const keypressAllowed = keydownAllowed
+        ? element.dispatchEvent(new view.KeyboardEvent('keypress', opts))
+        : false;
+      element.dispatchEvent(new view.KeyboardEvent('keyup', opts));
+
+      if (!submitEvent) {
+        if (!keydownAllowed || !keypressAllowed) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: 'Enter input was canceled; form was not submitted' };
+        }
+        const liveValue = element instanceof view.HTMLInputElement ||
+          element instanceof view.HTMLTextAreaElement
+          ? String(element.value ?? '')
+          : String(element.textContent ?? '');
+        if (liveValue !== textResult.value) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: 'text value changed before submission; form was not submitted' };
+        }
+        if (resolveSubmitForm() !== form || defaultSubmitterFor(form) !== submitter ||
+            contextSignature(submissionContext(form, submitter)) !== submitFormContext) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: 'form association, default submitter, or submission context changed before submission; form was not submitted' };
+        }
+        const contextError = submissionContextError(form, submitter);
+        if (contextError) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: `${contextError}; form was not submitted` };
+        }
+        if (!skipsValidation && !form.checkValidity()) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: 'constraint validation prevented form submission' };
+        }
+        try {
+          if (submitter) submitter.click();
+          else form.requestSubmit();
+        } catch (_) {
+          form.removeEventListener('submit', observeSubmit, false);
+          clearSubmitTracking();
+          return { found: true, ok: false, error: 'requestSubmit failed; form was not submitted' };
+        }
+      }
+      form.removeEventListener('submit', observeSubmit, false);
+      submitObservationTarget?.removeEventListener('submit', observeSubmit, false);
+      if (!submitEvent) {
+        clearSubmitTracking();
+        return { found: true, ok: false, error: 'constraint validation prevented form submission' };
+      }
+      if (submitError) {
+        clearSubmitTracking();
+        return { found: true, ok: false, error: `${submitError}; form was not submitted` };
+      }
+      submissionExpectsNavigation = !submitEvent.defaultPrevented;
+      ownerFrame?.setAttribute(
+        'data-pi-submit-navigates',
+        submissionExpectsNavigation ? 'true' : 'false'
+      );
+    }
+    const sensitive = initiallySensitive || isSensitive(element);
+    if (sensitive && element.value) sensitiveRegistry.add(String(element.value));
+    const currentValue = element instanceof element.ownerDocument.defaultView.HTMLInputElement ||
+      element instanceof element.ownerDocument.defaultView.HTMLTextAreaElement
+      ? element.value
+      : element.textContent;
     return {
       found: true,
       ok: true,
-      value: element.value || element.textContent || '',
-      frameDepth: frames.length
+      value: sensitive ? '' : String(currentValue ?? ''),
+      valueSet: sensitive ? Boolean(element.value) : null,
+      sensitive,
+      frameDepth: frames.length,
+      expectsNavigation: submissionExpectsNavigation
     };
   }
 
@@ -973,10 +1478,11 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   if (request.action === 'click-js') {
     element.scrollIntoView({ block: 'center', inline: 'center' });
     setTimeout(() => element.click(), 0);
+    const sensitive = isSensitive(element);
     return {
       found: true,
       ok: true,
-      text: String(element.innerText || element.textContent || element.value || '').trim()
+      text: sensitive ? '' : String(element.innerText || element.textContent || element.value || '').trim()
     };
   }
 
@@ -1644,7 +2150,23 @@ class BrowserWorker:
     async def create_managed_tab(self, session_id, kind='page'):
         async with self.tab_management_lock:
             await self._ensure_tab_capacity(required=1)
-            page = await self.browser.get('about:blank', new_tab=True)
+            before_target_ids = {
+                self.tab_registry.target_id(page) for page in self.browser.tabs
+            }
+            try:
+                page = await self.browser.get('about:blank', new_tab=True)
+            except (Exception, asyncio.CancelledError):
+                try:
+                    await self.browser.update_targets()
+                    for new_page in list(self.browser.tabs):
+                        if self.tab_registry.target_id(new_page) in before_target_ids:
+                            continue
+                        try:
+                            await new_page.close()
+                        except Exception:
+                            pass
+                finally:
+                    raise
             self.register_tab(page, session_id, kind)
             return page
 
@@ -1678,7 +2200,8 @@ class BrowserWorker:
             profile.mkdir(parents=True, exist_ok=True)
             try:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
-                b_args = ['--window-size=1600,1000', '--no-first-run', '--no-default-browser-check']
+                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '410,950')
+                b_args = [f'--window-size={window_size}', '--no-first-run', '--no-default-browser-check']
                 if ext_path.is_dir():
                     b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
                 self.browser = await uc.start(
@@ -2769,11 +3292,11 @@ class BrowserWorker:
             timeout=screenshot_timeout,
         )
         snapshot = format_snapshot(elements or [])
+        self.snapshot_required_sessions.discard(session_id)
         return {
             'text': (
-                f'CLICK NOT PERFORMED: {ref} is stale.\n'
-                'STALE_REF_GUARD remains active; use the image and fresh DOM snapshot together to reassess the page. '
-                'Run exactly: snapshot -i before issuing another ref-based command.\n\n'
+                f'CLICK NOT PERFORMED: {ref} is stale. Never retry that ref.\n'
+                'The image and Fresh DOM snapshot below were captured together; their refs are authoritative and may be used immediately after reassessing the page.\n\n'
                 f'Fresh DOM snapshot:\n{snapshot}'
             ),
             'action': 'stale-ref-recovery',
@@ -2954,18 +3477,80 @@ class BrowserWorker:
             )
         return '\n'.join(lines)
 
+    async def wait_for_dom_settle(
+        self, page, timeout_sec=2.0, minimum_seconds=0.3, quiet_seconds=0.15,
+    ):
+        signature_script = '''(() => {
+            const markup = document.documentElement?.outerHTML || '';
+            let hash = 2166136261;
+            for (let index = 0; index < markup.length; index += 1) {
+                hash ^= markup.charCodeAt(index);
+                hash = Math.imul(hash, 16777619);
+            }
+            return `${markup.length}:${hash >>> 0}`;
+        })()'''
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        last_changed_at = started_at
+        last_signature = None
+        saw_change = False
+        deadline = started_at + timeout_sec
+        while loop.time() < deadline:
+            try:
+                signature = str(await page.evaluate(signature_script))
+            except Exception:
+                await asyncio.sleep(0.05)
+                continue
+            now = loop.time()
+            if last_signature is None:
+                last_signature = signature
+                last_changed_at = now
+            elif signature != last_signature:
+                last_signature = signature
+                last_changed_at = now
+                saw_change = True
+            if saw_change and now - started_at >= minimum_seconds and now - last_changed_at >= quiet_seconds:
+                return
+            if not saw_change and now - started_at >= max(minimum_seconds, timeout_sec - 0.1):
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError('submitted page DOM did not settle')
+
+    async def wait_for_main_document_replacement(
+        self, page, previous_loader_id, previous_url, timeout_sec=2.0,
+    ):
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                frame_tree = await page.send(uc.cdp.page.get_frame_tree())
+                frame = frame_tree.frame
+                if str(frame.loader_id) != previous_loader_id or str(frame.url) != previous_url:
+                    await self.wait_for_page_ready(page)
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        raise TimeoutError('submitted page did not replace the previous document')
+
     async def wait_for_ref_frame_ready(self, page, ref, timeout_sec=2.0):
         normalized = json.dumps(ref.removeprefix('@'))
         script = f'''JSON.stringify((() => {{
             const findFrame = root => {{
                 let elements = [];
-                try {{ elements = Array.from(root.querySelectorAll('iframe')); }} catch (_) {{ return null; }}
-                for (const frame of elements) {{
-                    if (frame.getAttribute('data-pi-submit-frame') === {normalized}) return frame;
-                    try {{
-                        const nested = frame.contentDocument ? findFrame(frame.contentDocument) : null;
-                        if (nested) return nested;
-                    }} catch (_) {{}}
+                try {{ elements = Array.from(root.querySelectorAll('*')); }} catch (_) {{ return null; }}
+                for (const element of elements) {{
+                    if (element.tagName === 'IFRAME' &&
+                        element.getAttribute('data-pi-submit-frame') === {normalized}) return element;
+                    if (element.shadowRoot) {{
+                        const shadowMatch = findFrame(element.shadowRoot);
+                        if (shadowMatch) return shadowMatch;
+                    }}
+                    if (element.tagName === 'IFRAME') {{
+                        try {{
+                            const nested = element.contentDocument ? findFrame(element.contentDocument) : null;
+                            if (nested) return nested;
+                        }} catch (_) {{}}
+                    }}
                 }}
                 return null;
             }};
@@ -2974,16 +3559,72 @@ class BrowserWorker:
             try {{
                 const doc = frame.contentDocument;
                 const oldUrl = frame.getAttribute('data-pi-submit-url') || '';
+                const oldDocument = frame.__piSubmitDocument || null;
                 const expectsNavigation = frame.getAttribute('data-pi-submit-navigates') === 'true';
-                const navigated = !expectsNavigation || Boolean(doc && doc.location.href !== oldUrl);
-                const ready = Boolean(navigated && doc && doc.readyState === 'complete' && doc.body);
+                const now = Date.now();
+                const startedAt = frame.__piSubmitStartedAt || now;
+                if (expectsNavigation && !doc && now - startedAt >= 300) {{
+                    frame.removeAttribute('data-pi-submit-frame');
+                    frame.removeAttribute('data-pi-submit-url');
+                    frame.removeAttribute('data-pi-submit-navigates');
+                    delete frame.__piSubmitDocument;
+                    delete frame.__piSubmitStartedAt;
+                    delete frame.__piSubmitLastSignature;
+                    delete frame.__piSubmitLastChangeAt;
+                    delete frame.__piSubmitSawMutation;
+                    return {{ found: true, ready: true }};
+                }}
+                const navigated = Boolean(
+                    doc && (doc !== oldDocument || doc.location.href !== oldUrl)
+                );
+                let ajaxSettled = false;
+                if (!expectsNavigation && doc?.body) {{
+                    const markup = doc.documentElement?.outerHTML || '';
+                    let hash = 2166136261;
+                    for (let index = 0; index < markup.length; index += 1) {{
+                        hash ^= markup.charCodeAt(index);
+                        hash = Math.imul(hash, 16777619);
+                    }}
+                    const signature = `${{markup.length}}:${{hash >>> 0}}`;
+                    if (!frame.__piSubmitLastSignature) {{
+                        frame.__piSubmitLastSignature = signature;
+                        frame.__piSubmitLastChangeAt = now;
+                    }} else if (signature !== frame.__piSubmitLastSignature) {{
+                        frame.__piSubmitLastSignature = signature;
+                        frame.__piSubmitLastChangeAt = now;
+                        frame.__piSubmitSawMutation = true;
+                    }}
+                    const lastChangeAt = frame.__piSubmitLastChangeAt || startedAt;
+                    ajaxSettled = frame.__piSubmitSawMutation
+                        ? now - startedAt >= 300 && now - lastChangeAt >= 150
+                        : now - startedAt >= 1800;
+                }}
+                const settled = expectsNavigation ? navigated : ajaxSettled;
+                const ready = Boolean(settled && doc && doc.readyState === 'complete' && doc.body);
                 if (ready) {{
                     frame.removeAttribute('data-pi-submit-frame');
                     frame.removeAttribute('data-pi-submit-url');
                     frame.removeAttribute('data-pi-submit-navigates');
+                    delete frame.__piSubmitDocument;
+                    delete frame.__piSubmitStartedAt;
+                    delete frame.__piSubmitLastSignature;
+                    delete frame.__piSubmitLastChangeAt;
+                    delete frame.__piSubmitSawMutation;
                 }}
                 return {{ found: true, ready }};
             }} catch (_) {{
+                const elapsed = Date.now() - (frame.__piSubmitStartedAt || Date.now());
+                if (frame.getAttribute('data-pi-submit-navigates') === 'true' && elapsed >= 300) {{
+                    frame.removeAttribute('data-pi-submit-frame');
+                    frame.removeAttribute('data-pi-submit-url');
+                    frame.removeAttribute('data-pi-submit-navigates');
+                    delete frame.__piSubmitDocument;
+                    delete frame.__piSubmitStartedAt;
+                    delete frame.__piSubmitLastSignature;
+                    delete frame.__piSubmitLastChangeAt;
+                    delete frame.__piSubmitSawMutation;
+                    return {{ found: true, ready: true }};
+                }}
                 return {{ found: true, ready: false }};
             }}
         }})())'''
@@ -3008,13 +3649,37 @@ class BrowserWorker:
             if kind == 'css' and result.get('invalidSelector'):
                 raise ValueError(f'invalid CSS selector: {value}')
             raise SemanticClickTargetError(f'click target not found by {kind}: {value}')
+        if result.get('disabled'):
+            raise ValueError('target control is disabled')
         return result
 
     @staticmethod
     def is_owned_popup(opener, popup):
         return popup.target.opener_id == opener.target.target_id
 
+    async def xvfb_mouse_click(self, page, x, y):
+        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+        screen_x = int(round(float(x)))
+        screen_y = int(round(float(y))) + toolbar_height
+        display = os.environ.get('DISPLAY')
+        if display:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    'xdotool', 'mousemove', '--sync', str(screen_x), str(screen_y), 'click', '1',
+                    env=os.environ,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                return True
+            except Exception:
+                pass
+        return False
+
     async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '0') == '1':
+            if await self.xvfb_mouse_click(page, x, y):
+                return True
         try:
             await asyncio.wait_for(
                 page.mouse_click(float(x), float(y)),
@@ -3142,9 +3807,20 @@ class BrowserWorker:
                     return opener
         return page
 
-    def track_open_action(self, session_id, action):
+    def preview_open_action(self, session_id, action, parts=None):
         if action == 'open':
-            self.open_action_guard.check(session_id, action)
+            target_url = parts[1] if parts and len(parts) > 1 else None
+            self.open_action_guard.pending_open(session_id, target_url)
+
+    def track_open_action(self, session_id, action, parts=None):
+        if action == 'open':
+            target_url = parts[1] if parts and len(parts) > 1 else None
+            self.open_action_guard.check(session_id, action, target_url)
+
+    def track_failed_open_action(self, session_id, action, parts=None):
+        if action == 'open':
+            target_url = parts[1] if parts and len(parts) > 1 else None
+            self.open_action_guard.record_failure(session_id, target_url)
 
     def track_repeat(self, session_id, action, parts):
         signature = ' '.join(parts)
@@ -3226,7 +3902,7 @@ class BrowserWorker:
             self.open_action_guard.clear(session_id)
             return result
         preflight_timeout = self.preflight_timeout_seconds()
-        self.track_open_action(session_id, action)
+        self.preview_open_action(session_id, action, parts)
         semantic_click = is_semantic_click_attempt(parts)
         page = self.pages.get(session_id)
         fallback_context = None
@@ -3237,6 +3913,9 @@ class BrowserWorker:
                     page, preflight_timeout
                 )
                 self.vision_fallback_guard.observe_context(session_id, fallback_context)
+            except asyncio.CancelledError:
+                self.track_failed_open_action(session_id, action, parts)
+                raise
             except _PreflightDeadlineExpired:
                 recovered_popup_opener = self.quarantine_session_page(
                     session_id, page
@@ -3251,6 +3930,12 @@ class BrowserWorker:
                     result = await self.close_session_page(session_id, page)
                 else:
                     result = await self._execute(command, session_id)
+            except asyncio.CancelledError:
+                self.track_failed_open_action(session_id, action, parts)
+                raise
+            except Exception:
+                self.track_failed_open_action(session_id, action, parts)
+                raise
             finally:
                 if (
                     recovered_popup_opener is not None
@@ -3295,7 +3980,9 @@ class BrowserWorker:
             'open', 'close', 'switch', 'wait-popup', 'wait-popup-close', 'vision-click'
         }:
             self.vision_fallback_guard.reset(session_id)
-        if action != 'open':
+        if action == 'open':
+            self.track_open_action(session_id, action, parts)
+        else:
             self.open_action_guard.clear(session_id)
         return result
 
@@ -3406,13 +4093,7 @@ class BrowserWorker:
         if action == 'open':
             if len(parts) != 2:
                 raise ValueError('usage: open <url>')
-            target_url = parts[1]
-            if 'momoshop.tw' in target_url and 'momoshop.com.tw' not in target_url:
-                target_url = target_url.replace('momoshop.tw', 'momoshop.com.tw')
-            if 'pchome.tw' in target_url and 'pchome.com.tw' not in target_url:
-                target_url = target_url.replace('pchome.tw', 'pchome.com.tw')
-            if 'momoshop.com.tw/mymomo/login.momo' in target_url:
-                target_url = 'https://account.momoshop.com.tw/mobile'
+            target_url = normalize_open_url(parts[1])
 
             await self.ensure_browser()
             previous = self.pages.get(session_id)
@@ -3441,7 +4122,7 @@ class BrowserWorker:
                 except Exception:
                     pass
                 elements = json.loads(await page.evaluate(SNAPSHOT_JS))
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 async with self.tab_management_lock:
                     record = next(
                         (item for item in self.tab_registry.records() if item.page is page),
@@ -3458,26 +4139,63 @@ class BrowserWorker:
             finally:
                 self.end_tab_activity(page)
 
-            self.pages[session_id] = page
-            self.switch_session_action_target(session_id, page)
-            self.touch_tab(page)
-            self.popup_openers.pop(session_id, None)
-            async with self.tab_management_lock:
-                for old_page in self.unique_pages([previous, *previous_openers]):
-                    if old_page is None or old_page is page:
-                        continue
+            previous_stack = self.unique_pages([*previous_openers, previous])
+            try:
+                async with self.tab_management_lock:
+                    for old_page in reversed(previous_stack):
+                        if old_page is None or old_page is page:
+                            continue
+                        record = next(
+                            (item for item in self.tab_registry.records() if item.page is old_page),
+                            None,
+                        )
+                        if record is not None:
+                            await self.evict_tab(record)
+                        else:
+                            await old_page.close()
+            except (Exception, asyncio.CancelledError):
+                async with self.tab_management_lock:
                     record = next(
-                        (item for item in self.tab_registry.records() if item.page is old_page),
+                        (item for item in self.tab_registry.records() if item.page is page),
                         None,
                     )
                     if record is not None:
                         await self.evict_tab(record)
                     else:
                         try:
-                            await old_page.close()
+                            await page.close()
                         except Exception:
                             pass
+                await self.browser.update_targets()
+                live_pages = list(self.browser.tabs)
+                restored = next(
+                    (candidate for candidate in reversed(previous_stack)
+                     if candidate in live_pages),
+                    None,
+                )
+                if restored is not None:
+                    self.pages[session_id] = restored
+                    restored_index = previous_stack.index(restored)
+                    live_openers = [
+                        candidate for candidate in previous_stack[:restored_index]
+                        if candidate in live_pages
+                    ]
+                    if live_openers:
+                        self.popup_openers[session_id] = live_openers
+                    else:
+                        self.popup_openers.pop(session_id, None)
+                    self.switch_session_action_target(session_id, restored)
+                    self.touch_tab(restored)
+                else:
+                    self.pages.pop(session_id, None)
+                    self.popup_openers.pop(session_id, None)
+                    self.switch_session_action_target(session_id, None)
+                raise
 
+            self.pages[session_id] = page
+            self.switch_session_action_target(session_id, page)
+            self.touch_tab(page)
+            self.popup_openers.pop(session_id, None)
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
             return {
@@ -3615,7 +4333,7 @@ class BrowserWorker:
 
         if action == 'download-info':
             if len(parts) != 2 or not parts[1].startswith('@'):
-                raise ValueError('usage: download-info <@ref>')
+                raise ValueError('usage: download-info @e1 (use the literal snapshot ref; do not include < or >)')
             page = await self.require_page(session_id)
             target = await self.resolve_click_target(page, 'ref', parts[1].removeprefix('@'), session_id)
             url = target.get('href') or ''
@@ -3642,7 +4360,7 @@ class BrowserWorker:
 
         if action == 'download':
             if len(parts) not in (2, 3) or not parts[1].startswith('@'):
-                raise ValueError('usage: download <@ref> [ms]')
+                raise ValueError('usage: download @e1 [ms] (use the literal snapshot ref; do not include < or >)')
             timeout_ms = int(parts[2]) if len(parts) == 3 else 30000
             page = await self.require_page(session_id)
             target = await self.resolve_click_target(page, 'ref', parts[1].removeprefix('@'), session_id)
@@ -3781,7 +4499,7 @@ class BrowserWorker:
                 try:
                     float(parts[1]), float(parts[2])
                 except ValueError as error:
-                    raise ValueError('usage: click <@ref>') from error
+                    raise ValueError('usage: click @e1 (use the literal snapshot ref; do not include < or >)') from error
                 raise ValueError(
                     'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Vision fallback unlocks only '
                     f'after {self.vision_fallback_guard.threshold} consecutive legitimate semantic target-resolution failures '
@@ -3791,7 +4509,7 @@ class BrowserWorker:
                     '`vision-click <preview-token>` command returned by vision-mark.'
                 )
             if len(parts) != 2 or not parts[1].startswith('@'):
-                raise ValueError('usage: click <@ref>')
+                raise ValueError('usage: click @e1 (use the literal snapshot ref; do not include < or >)')
             normalized = parts[1].removeprefix('@')
             target = await self.resolve_click_target(page, 'ref', normalized, session_id)
             self.semantic_target_resolved(session_id)
@@ -3809,6 +4527,8 @@ class BrowserWorker:
             page = await self.require_page(session_id)
             value = ' '.join(parts[1:])
             kind = 'text' if action == 'click-text' else 'css'
+            if kind == 'text' and not re.sub(r'[\s\uFEFF]+', '', value):
+                raise ValueError('click-text requires non-empty text')
             target = await self.resolve_click_target(page, kind, value)
             self.semantic_target_resolved(session_id)
             previous = page
@@ -3820,7 +4540,7 @@ class BrowserWorker:
 
         if action == 'click-js':
             if len(parts) != 2 or not parts[1].startswith('@'):
-                raise ValueError('usage: click-js <@ref>')
+                raise ValueError('usage: click-js @e1 (use the literal snapshot ref; do not include < or >)')
             page = await self.require_page(session_id)
             await self.configure_download_session(session_id, page)
             page, result = await self.perform_ref_action(session_id, parts[1], action)
@@ -3832,40 +4552,33 @@ class BrowserWorker:
 
         if action in ('fill-submit', 'fill_submit'):
             if len(parts) < 3:
-                raise ValueError(f'usage: {action} <@ref> <text>')
+                raise ValueError(f'usage: {action} @e1 "text" (use the literal snapshot ref; do not include < or >)')
             text = ' '.join(parts[2:])
             page = await self.require_page(session_id)
-            element = await page.select(f'[data-pi-ref="{parts[1].removeprefix("@")}\"]')
-            if element is not None:
-                await element.focus()
-                await element.clear_input()
-                await element.send_keys(text)
-                await page.evaluate('''(() => {
-                    const el = document.activeElement;
-                    if (!el) return false;
-                    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-                    el.dispatchEvent(new KeyboardEvent('keydown', opts));
-                    el.dispatchEvent(new KeyboardEvent('keypress', opts));
-                    el.dispatchEvent(new KeyboardEvent('keyup', opts));
-                    const form = el.closest ? el.closest('form') : (el.form || null);
-                    if (form && typeof form.requestSubmit === 'function') {
-                        try { form.requestSubmit(); return true; } catch (_) {}
-                    }
-                    const searchButton = el.parentElement?.querySelector(
-                        'button,[class*="search"],input[type="submit"]'
-                    );
-                    try { searchButton?.click(); return Boolean(searchButton); } catch (_) { return false; }
-                })()''')
+            frame_tree = await page.send(uc.cdp.page.get_frame_tree())
+            previous_loader_id = str(frame_tree.frame.loader_id)
+            previous_url = str(frame_tree.frame.url)
+            page, result = await self.perform_ref_action(
+                session_id, parts[1], 'fill-submit', text
+            )
+            if result.get('frameDepth', 0) > 0:
+                await self.wait_for_ref_frame_ready(page, parts[1])
+            elif result.get('expectsNavigation'):
+                await self.wait_for_main_document_replacement(
+                    page, previous_loader_id, previous_url
+                )
             else:
-                page, result = await self.perform_ref_action(session_id, parts[1], 'fill-submit', text)
-                if result.get('frameDepth', 0) > 0:
-                    await self.wait_for_ref_frame_ready(page, parts[1])
+                await self.wait_for_dom_settle(page)
             await self.wait_for_page_ready(page)
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
             return {
-                'text': f'Filled and submitted {parts[1]} with "{text}"\nURL: {page.url}\n\nResults / Updated Page Elements:\n{snapshot_text}',
+                'text': (
+                    f'Filled and submitted {parts[1]} with '
+                    f'{"<redacted password>" if result.get("sensitive") else json.dumps(text, ensure_ascii=False)}'
+                    f'\nURL: {page.url}\n\nResults / Updated Page Elements:\n{snapshot_text}'
+                ),
                 'action': action,
                 'url': page.url,
                 'count': len(elements or [])
@@ -3873,7 +4586,7 @@ class BrowserWorker:
 
         if action == 'upload':
             if len(parts) < 3:
-                raise ValueError('usage: upload <@ref> <filepath1> [filepath2] ...')
+                raise ValueError('usage: upload @e1 <filepath1> [filepath2] ... (use the literal snapshot ref; do not include < or >)')
             page = await self.require_page(session_id)
             target_ref = parts[1]
             raw_files = parts[2:]
@@ -3960,27 +4673,24 @@ class BrowserWorker:
 
         if action in ('fill', 'type'):
             if len(parts) < 3:
-                raise ValueError(f'usage: {action} <@ref> <text>')
+                raise ValueError(f'usage: {action} @e1 "text" (use the literal snapshot ref; do not include < or >)')
             text = ' '.join(parts[2:])
-            page = await self.require_page(session_id)
-            element = await page.select(f'[data-pi-ref="{parts[1].removeprefix("@")}\"]')
-            if element is not None:
-                await element.focus()
-                if action == 'fill':
-                    await element.clear_input()
-                await element.send_keys(text)
-                value = text
-            else:
-                _, result = await self.perform_ref_action(session_id, parts[1], action, text)
-                value = result.get('value', text)
+            _, result = await self.perform_ref_action(
+                session_id, parts[1], action, text
+            )
+            value = result.get('value', text)
+            verb = 'Filled' if action == 'fill' else 'Typed'
+            displayed = '<redacted password>' if result.get('sensitive') else json.dumps(
+                value, ensure_ascii=False
+            )
             return {
-                'text': f'{action.title()}d {parts[1]} with "{value}"',
+                'text': f'{verb} {parts[1]} with {displayed}',
                 'action': action,
             }
 
         if action == 'select':
             if len(parts) < 3 or not parts[1].startswith('@'):
-                raise ValueError('usage: select <@ref> <query|--index=N --fingerprint=HASH>')
+                raise ValueError('usage: select @e1 <query|--index=N --fingerprint=HASH> (use the literal snapshot ref; do not include < or >)')
             select_ref = parts[1]
             wanted = ' '.join(parts[2:])
             page, dropdowns = await self.inspect_dropdowns(session_id)
@@ -4061,7 +4771,10 @@ class BrowserWorker:
             if len(parts) != 2:
                 raise ValueError('usage: press <key>')
             key_map = {'enter': '\n', 'tab': '\t', 'space': ' ', 'backspace': '\b'}
-            key = key_map.get(parts[1].lower(), parts[1])
+            normalized_key = parts[1].lower()
+            if normalized_key not in key_map:
+                raise ValueError('press supports only Enter, Tab, Space, or Backspace; use fill/type for text')
+            key = key_map[normalized_key]
             page = await self.require_page(session_id)
             await self.configure_download_session(session_id, page)
             focused = await page.select(':focus') or await page.select('body')
@@ -4326,6 +5039,158 @@ class BrowserWorker:
                 'text': f'Screenshot saved: {output}.{note}',
                 'action': action,
                 'screenshotPath': str(output),
+            }
+
+        if action == 'google-search':
+            remainder = command[len('google-search'):].strip()
+            searches = parse_google_search_payload(remainder)
+            await self.ensure_browser()
+            search_slots = asyncio.Semaphore(min(4, self.available_crawl_slots()))
+
+            async def search_single(search, idx):
+                tab = None
+                t0 = asyncio.get_running_loop().time()
+                await search_slots.acquire()
+                try:
+                    async def fetch_results():
+                        nonlocal tab
+                        tab = await self.create_managed_tab(session_id, 'google-search')
+                        self.begin_tab_activity(tab)
+                        try:
+                            await tab.send(uc.cdp.emulation.set_device_metrics_override(
+                                width=1920,
+                                height=1080,
+                                device_scale_factor=1.0,
+                                mobile=False,
+                            ))
+                        except Exception:
+                            pass
+                        params = urllib.parse.urlencode({
+                            'q': search['query'],
+                            'hl': 'zh-TW',
+                            'gl': 'tw',
+                            'filter': '0',
+                        })
+                        await tab.get(f'https://www.google.com/search?{params}')
+                        await self.wait_for_page_ready(tab, timeout_sec=2.5)
+                        title = str(await tab.evaluate('document.title') or '')
+                        body_text = str(await tab.evaluate('document.body.innerText') or '')
+                        raw_results = await tab.evaluate(GOOGLE_RESULTS_JS)
+                        if isinstance(raw_results, str):
+                            raw_results = json.loads(raw_results)
+                        return title, body_text, raw_results if isinstance(raw_results, list) else []
+
+                    title, body_text, raw_results = await asyncio.wait_for(fetch_results(), timeout=5.0)
+                    lower_page = f'{title}\n{body_text}'.lower()
+                    blocked = any(marker in lower_page for marker in (
+                        'unusual traffic',
+                        'before you continue to google',
+                        'our systems have detected unusual traffic',
+                        'verify you are human',
+                    ))
+                    if blocked:
+                        raise ValueError('Google anti-bot or consent challenge detected')
+                    clean_results = [
+                        {
+                            'title': str(item.get('title') or '').strip(),
+                            'url': str(item.get('url') or '').strip(),
+                            'snippet': str(item.get('snippet') or '').strip(),
+                        }
+                        for item in raw_results
+                        if isinstance(item, dict) and item.get('title') and item.get('url')
+                    ]
+                    return {
+                        'index': idx + 1,
+                        'direction': search['direction'],
+                        'query': search['query'],
+                        'results': clean_results,
+                        'ok': bool(clean_results),
+                        'error': None if clean_results else 'No Google result links extracted',
+                        'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
+                    }
+                except Exception as error:
+                    return {
+                        'index': idx + 1,
+                        'direction': search['direction'],
+                        'query': search['query'],
+                        'results': [],
+                        'ok': False,
+                        'error': str(error),
+                        'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
+                    }
+                finally:
+                    if tab is not None:
+                        self.end_tab_activity(tab)
+                        async with self.tab_management_lock:
+                            record = next(
+                                (item for item in self.tab_registry.records() if item.page is tab),
+                                None,
+                            )
+                            if record is not None:
+                                await self.evict_tab(record)
+                            else:
+                                await tab.close()
+                    search_slots.release()
+
+            groups = await asyncio.gather(*(search_single(search, i) for i, search in enumerate(searches)))
+            raw_count = sum(len(group['results']) for group in groups)
+            unresolved_candidates = select_diverse_search_results(groups, limit=min(max(raw_count, 1), 20))
+            redirect_slots = asyncio.Semaphore(8)
+
+            async def resolve_candidate(item):
+                async with redirect_slots:
+                    resolved_url = await asyncio.to_thread(resolve_google_redirect_url, item['url'])
+                return {**item, 'url': resolved_url} if resolved_url else None
+
+            resolved_candidates = [
+                item for item in await asyncio.gather(*(resolve_candidate(item) for item in unresolved_candidates))
+                if item is not None
+            ]
+            resolved_groups = [
+                {'direction': search['direction'], 'query': search['query'], 'results': []}
+                for search in searches
+            ]
+            group_by_direction = {group['direction']: group for group in resolved_groups}
+            for item in resolved_candidates:
+                for direction in item['directions']:
+                    target_group = group_by_direction.get(direction)
+                    if target_group is not None:
+                        target_group['results'].append(item)
+            selected = select_diverse_search_results(resolved_groups, limit=10)
+            all_canonical = select_diverse_search_results(resolved_groups, limit=max(len(resolved_candidates), 1))
+            duplicate_count = max(0, len(resolved_candidates) - len(all_canonical))
+            successful_groups = sum(1 for group in groups if group['ok'])
+
+            if selected:
+                lines = [
+                    f'Google search results for {len(searches)} direction(s) '
+                    f'(Provider: Google via Nodriver Browser, region: Taiwan):'
+                ]
+                for index, item in enumerate(selected, 1):
+                    direction_text = ', '.join(item['directions'])
+                    lines.append(
+                        f"### {index}. [{item['title']}]({item['url']})\n"
+                        f"*Direction: {direction_text} | Query: {item['query']}*\n"
+                        f"{item['snippet'] or 'No snippet available.'}"
+                    )
+                text = '\n\n'.join(lines)
+            else:
+                failures = '; '.join(
+                    f"{group['direction']}: {group['error']}" for group in groups
+                )
+                text = f'No Google search results found. {failures}'
+
+            return {
+                'text': text,
+                'action': 'google-search',
+                'provider': 'google-nodriver-tw',
+                'results': selected,
+                'searches': groups,
+                'successCount': successful_groups,
+                'failedCount': len(groups) - successful_groups,
+                'totalCount': len(groups),
+                'rawResultCount': raw_count,
+                'duplicateCount': duplicate_count,
             }
 
         if action == 'crawl':

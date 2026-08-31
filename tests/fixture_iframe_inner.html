@@ -1,5 +1,6 @@
 <!doctype html>
 <html>
+<head><style>body { zoom: 0.65; }</style></head>
 <body>
 <label for="part-search">Part search</label>
 <input id="part-search" placeholder="Search components">
@@ -16,6 +17,15 @@
   <input id="iframe-submit" name="query" placeholder="Iframe submit query">
   <button type="submit">Submit iframe form</button>
 </form>
+<form id="iframe-ajax-form">
+  <input id="iframe-ajax-submit" placeholder="Iframe AJAX submit query">
+  <button type="submit">Submit iframe AJAX form</button>
+</form>
+<div id="ajax-result">Iframe AJAX idle</div>
+<form action="">
+  <input id="iframe-same-url-submit" placeholder="Iframe same URL submit query">
+  <button type="submit">Submit iframe same URL form</button>
+</form>
 <script>
   const partSearch = document.querySelector('#part-search');
   const partSearchEvents = [];
@@ -30,6 +40,13 @@
   });
   document.querySelector('#apply').addEventListener('click', event => {
     event.target.textContent = 'Iframe selection applied';
+  });
+  document.querySelector('#iframe-ajax-form').addEventListener('submit', event => {
+    event.preventDefault();
+    setTimeout(() => {
+      document.querySelector('#ajax-result').textContent = 'Iframe AJAX submitted';
+      document.querySelector('#iframe-ajax-submit').setAttribute('aria-label', 'Iframe AJAX submitted');
+    }, 200);
   });
 </script>
 </body>

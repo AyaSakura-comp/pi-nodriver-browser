@@ -721,6 +721,156 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(previous.closed)
         self.assertTrue(replacement.closed)
 
+    async def test_cancelled_open_closes_replacement_and_keeps_previous_page(self):
+        from worker import BrowserWorker
+
+        class CancelledPage(FakePage):
+            async def send(self, _command):
+                return None
+
+            async def get(self, _url):
+                raise asyncio.CancelledError()
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        previous = FakePage(worker.browser, 'tab-previous')
+        replacement = CancelledPage(worker.browser, 'tab-replacement')
+        worker.browser.tabs.extend([previous, replacement])
+        worker.pages['session-a'] = previous
+        worker.register_tab(previous, 'session-a')
+        worker.ensure_browser = AsyncMock(return_value=worker.browser)
+        worker.configure_download_session = AsyncMock()
+
+        async def create_replacement(_session_id, _kind):
+            worker.register_tab(replacement, 'session-a')
+            return replacement
+
+        worker.create_managed_tab = AsyncMock(side_effect=create_replacement)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.execute('open https://cancel.test/', session_id='session-a')
+
+        self.assertIs(worker.pages['session-a'], previous)
+        self.assertFalse(previous.closed)
+        self.assertTrue(replacement.closed)
+        self.assertEqual(
+            worker.open_action_guard._failed_counts['session-a'],
+            {'https://cancel.test': 1},
+        )
+
+    async def test_cancelled_tab_creation_closes_unreturned_new_tab(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        leaked = FakePage(worker.browser, 'tab-created-before-cancel')
+
+        async def cancelled_get(_url, new_tab=False):
+            self.assertTrue(new_tab)
+            worker.browser.tabs.append(leaked)
+            raise asyncio.CancelledError()
+
+        worker.browser.get = cancelled_get
+
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.create_managed_tab('session-a')
+
+        self.assertTrue(leaked.closed)
+        self.assertNotIn(leaked, worker.browser.tabs)
+        self.assertEqual(worker.tab_registry.records(), ())
+
+    async def test_old_page_eviction_failure_rolls_back_new_open_page(self):
+        from worker import BrowserWorker
+
+        class ReadyPage(FakePage):
+            async def send(self, _command):
+                return None
+
+            async def get(self, url):
+                self.url = url
+
+            async def evaluate(self, script):
+                return '[]' if 'JSON.stringify' in script else None
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        previous = CloseFailingPage(worker.browser, 'tab-previous')
+        replacement = ReadyPage(worker.browser, 'tab-replacement')
+        worker.browser.tabs.extend([previous, replacement])
+        worker.pages['session-a'] = previous
+        worker.register_tab(previous, 'session-a')
+        worker.ensure_browser = AsyncMock(return_value=worker.browser)
+        worker.configure_download_session = AsyncMock()
+        worker.wait_for_page_ready = AsyncMock()
+
+        async def create_replacement(_session_id, _kind):
+            worker.register_tab(replacement, 'session-a')
+            return replacement
+
+        worker.create_managed_tab = AsyncMock(side_effect=create_replacement)
+
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await worker.execute('open https://replacement.test/', session_id='session-a')
+
+        self.assertTrue(replacement.closed)
+        self.assertIs(worker.pages['session-a'], previous)
+        self.assertFalse(previous.closed)
+
+    async def test_nested_popup_rollback_restores_newest_live_opener_without_self_cycle(self):
+        from worker import BrowserWorker
+
+        class ReadyPage(FakePage):
+            async def send(self, _command):
+                return None
+
+            async def get(self, url):
+                self.url = url
+
+            async def evaluate(self, script):
+                return '[]' if 'JSON.stringify' in script else None
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        oldest = FakePage(worker.browser, 'tab-oldest')
+        newest_opener = CloseFailingPage(worker.browser, 'tab-newest-opener')
+        current_popup = FakePage(worker.browser, 'tab-current-popup')
+        replacement = ReadyPage(worker.browser, 'tab-replacement')
+        worker.browser.tabs.extend([oldest, newest_opener, current_popup, replacement])
+        worker.pages['session-a'] = current_popup
+        worker.popup_openers['session-a'] = [oldest, newest_opener]
+        for page, kind in (
+            (oldest, 'page'),
+            (newest_opener, 'popup'),
+            (current_popup, 'popup'),
+        ):
+            worker.register_tab(page, 'session-a', kind)
+        worker.ensure_browser = AsyncMock(return_value=worker.browser)
+        worker.configure_download_session = AsyncMock()
+        worker.wait_for_page_ready = AsyncMock()
+
+        async def create_replacement(_session_id, _kind):
+            worker.register_tab(replacement, 'session-a')
+            return replacement
+
+        worker.create_managed_tab = AsyncMock(side_effect=create_replacement)
+
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await worker.execute('open https://replacement.test/', session_id='session-a')
+
+        self.assertTrue(current_popup.closed)
+        self.assertTrue(replacement.closed)
+        self.assertFalse(oldest.closed)
+        self.assertFalse(newest_opener.closed)
+        self.assertIs(worker.pages['session-a'], newest_opener)
+        self.assertEqual(worker.popup_openers['session-a'], [oldest])
+        self.assertNotIn(newest_opener, worker.popup_openers['session-a'])
+
     async def test_download_routing_metadata_does_not_protect_idle_tabs(self):
         from worker import BrowserWorker
 
@@ -1379,6 +1529,57 @@ class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
             worker.track_open_action('session-a', 'open')
+
+    async def test_failed_open_does_not_replace_the_previous_origin_streak(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.track_open_action(
+            'session-a', 'open', ['open', 'https://blocked.example/a']
+        )
+        worker.track_open_action(
+            'session-a', 'open', ['open', 'https://blocked.example/b']
+        )
+        worker._execute = AsyncMock(side_effect=ValueError('invalid browser URL'))
+
+        with self.assertRaisesRegex(ValueError, 'invalid browser URL'):
+            await worker.execute('open http://4294967296/', session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            worker.track_open_action(
+                'session-a', 'open', ['open', 'https://blocked.example/c']
+            )
+
+    async def test_repeated_failed_same_origin_opens_are_blocked(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker._execute = AsyncMock(side_effect=ValueError('navigation failed'))
+        command = 'open https://failed.example/path'
+
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'navigation failed'):
+                await worker.execute(command, session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            await worker.execute(command, session_id='session-a')
+        self.assertEqual(worker._execute.await_count, 2)
+
+    async def test_preflight_cancellation_counts_as_failed_open_attempt(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.pages['session-a'] = object()
+        worker.bounded_vision_fallback_context = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+        worker._execute = AsyncMock()
+        command = 'open https://preflight-cancel.test/'
+
+        for _ in range(2):
+            with self.assertRaises(asyncio.CancelledError):
+                await worker.execute(command, session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'OPEN_LOOP_GUARD'):
+            await worker.execute(command, session_id='session-a')
+        worker._execute.assert_not_awaited()
 
     async def test_invalid_supported_command_does_not_reset_open_guard(self):
         from worker import BrowserWorker
@@ -2407,6 +2608,10 @@ class WorkerIntegrationTests(unittest.TestCase):
         fixture_url = (ROOT / 'tests/fixture_select.html').as_uri()
         self.command(f'open {fixture_url}')
 
+    def open_form_safety_fixture(self):
+        fixture_url = (ROOT / 'tests/fixture_form_safety.html').as_uri()
+        self.command(f'open {fixture_url}')
+
     def status(self):
         return self.command('get text')['text']
 
@@ -2473,6 +2678,511 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(text.count('beforeinput'), len('9800X3D'))
         self.assertGreaterEqual(text.count('input'), len('9800X3D'))
 
+    def test_fill_rejects_a_label_ref_without_mutating_the_focused_input(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        phone_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Phone number' in line
+        ).split()[0]
+        label_ref = next(
+            line for line in snapshot.splitlines()
+            if '<label>' in line and 'Profile name' in line
+        ).split()[0]
+        self.command(f'fill {phone_ref} 0000000000')
+
+        rejected = self.command_raw(f'fill {label_ref} "Pi Qwen"')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('not text-editable', rejected['error'])
+        updated = self.command('snapshot -i')['text']
+        phone_line = next(line for line in updated.splitlines() if 'Phone number' in line)
+        self.assertIn('"0000000000"', phone_line)
+        self.assertNotIn('Pi Qwen', phone_line)
+
+    def test_password_fill_and_snapshot_do_not_echo_the_secret(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        password_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'placeholder="Password"' in line
+        ).split()[0]
+        secret = 'private-test-password'
+
+        filled = self.command(f'fill {password_ref} "{secret}"')
+        updated = self.command('snapshot -i')['text']
+        clicked = self.command(f'click {password_ref}')
+        js_clicked = self.command(f'click-js {password_ref}')
+
+        self.assertNotIn(secret, filled['text'])
+        self.assertNotIn(secret, updated)
+        self.assertNotIn(secret, clicked['text'])
+        self.assertNotIn(secret, js_clicked['text'])
+        password_line = next(
+            line for line in updated.splitlines() if 'placeholder="Password"' in line
+        )
+        self.assertIn('value-set="true"', password_line)
+
+    def test_password_redaction_survives_page_changing_the_input_type(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        password_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'placeholder="Mutating password"' in line
+        ).split()[0]
+        secret = 'dynamic-private-test-password'
+
+        filled = self.command(f'fill {password_ref} "{secret}"')
+        updated = self.command('snapshot -i')['text']
+        clicked = self.command(f'click {password_ref}')
+        js_clicked = self.command(f'click-js {password_ref}')
+
+        for output in (filled['text'], updated, clicked['text'], js_clicked['text']):
+            self.assertNotIn(secret, output)
+        password_line = next(
+            line for line in updated.splitlines()
+            if 'placeholder="Mutating password"' in line
+        )
+        self.assertIn('value-set="true"', password_line)
+
+    def test_password_redaction_survives_handler_replacing_the_input_node(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        password_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'placeholder="Replacement password"' in line
+        ).split()[0]
+        secret = 'replacement-private-test-password'
+
+        filled = self.command(f'fill {password_ref} "{secret}"')
+        updated = self.command('snapshot -i')['text']
+
+        self.assertNotIn(secret, filled['text'])
+        self.assertNotIn(secret, updated)
+        replacement_line = next(
+            line for line in updated.splitlines()
+            if 'placeholder="Replacement password"' in line
+        )
+        self.assertIn('value-set="true"', replacement_line)
+
+    def test_password_redaction_survives_click_handler_changing_prefilled_input_type(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        password_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'placeholder="Click-mutating password"' in line
+        ).split()[0]
+        secret = 'prefilled-private-test-password'
+
+        clicked = self.command(f'click {password_ref}')
+        updated = self.command('snapshot -i')['text']
+
+        self.assertNotIn(secret, snapshot)
+        self.assertNotIn(secret, clicked['text'])
+        self.assertNotIn(secret, updated)
+        password_line = next(
+            line for line in updated.splitlines()
+            if 'placeholder="Click-mutating password"' in line
+        )
+        self.assertIn('value-set="true"', password_line)
+
+    def test_click_text_never_matches_a_password_value(self):
+        self.open_form_safety_fixture()
+
+        rejected = self.command_raw('click-text "prefilled-private-test-password"')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('click target not found', rejected['error'])
+        updated = self.command('snapshot -i')['text']
+        password_line = next(
+            line for line in updated.splitlines()
+            if 'placeholder="Click-mutating password"' in line
+        )
+        self.assertIn('type="password"', password_line)
+
+    def test_dynamic_editability_and_canceled_input_events_are_honored(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        refs = {
+            label: next(
+                line for line in snapshot.splitlines()
+                if '<input>' in line and label in line
+            ).split()[0]
+            for label in ('Focus-lock input', 'Keydown-block input', 'Beforeinput-block input')
+        }
+
+        focus_rejected = self.command_raw(f'fill {refs["Focus-lock input"]} mutation')
+        keydown_result = self.command(f'fill {refs["Keydown-block input"]} mutation')
+        beforeinput_result = self.command(f'fill {refs["Beforeinput-block input"]} mutation')
+
+        self.assertFalse(focus_rejected['ok'])
+        self.assertIn('not text-editable', focus_rejected['error'])
+        self.assertIn('with ""', keydown_result['text'])
+        self.assertIn('"beforeinput original"', beforeinput_result['text'])
+        self.assertNotIn('mutation', keydown_result['text'])
+        self.assertNotIn('mutation', beforeinput_result['text'])
+
+        fresh = self.command('snapshot -i')['text']
+        clear_ref = next(
+            line for line in fresh.splitlines()
+            if '<input>' in line and 'Clear-block input' in line
+        ).split()[0]
+        clear_result = self.command(f'fill {clear_ref} mutation')
+        self.assertIn('"clear original"', clear_result['text'])
+        self.assertNotIn('mutation', clear_result['text'])
+
+        fresh = self.command('snapshot -i')['text']
+        partial_ref = next(
+            line for line in fresh.splitlines()
+            if '<input>' in line and 'Partial-lock input' in line
+        ).split()[0]
+        partial = self.command_raw(f'fill {partial_ref} mutation')
+        self.assertFalse(partial['ok'])
+        self.assertIn('not text-editable', partial['error'])
+        restored = self.command('snapshot -i')['text']
+        partial_line = next(line for line in restored.splitlines() if 'Partial-lock input' in line)
+        self.assertIn('"partial original"', partial_line)
+        self.assertNotIn('mutation', partial_line)
+
+    def test_fill_submit_does_not_submit_canceled_or_partial_text(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        keydown_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Keydown-block input' in line
+        ).split()[0]
+        enter_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Enter-block input' in line
+        ).split()[0]
+        partial_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Partial-cancel input' in line
+        ).split()[0]
+        clear_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Clear-block input' in line
+        ).split()[0]
+        sanitizing_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Sanitizing input' in line
+        ).split()[0]
+        change_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Change-mutating input' in line
+        ).split()[0]
+        enter_mutating_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Enter-mutating input' in line
+        ).split()[0]
+
+        canceled_text = self.command_raw(f'fill-submit {keydown_ref} mutation')
+        canceled_enter = self.command_raw(f'fill-submit {enter_ref} accepted')
+        partial_text = self.command_raw(f'fill-submit {partial_ref} mutation')
+        clear_blocked_text = self.command_raw(f'fill-submit {clear_ref} mutation')
+        sanitized_text = self.command_raw(f'fill-submit {sanitizing_ref} mutation')
+        changed_text = self.command_raw(f'fill-submit {change_ref} accepted')
+        enter_mutated_text = self.command_raw(
+            f'fill-submit {enter_mutating_ref} accepted'
+        )
+
+        self.assertFalse(canceled_text['ok'])
+        self.assertIn('canceled', canceled_text['error'])
+        self.assertFalse(canceled_enter['ok'])
+        self.assertIn('canceled', canceled_enter['error'])
+        self.assertFalse(partial_text['ok'])
+        self.assertIn('canceled', partial_text['error'])
+        self.assertFalse(clear_blocked_text['ok'])
+        self.assertIn('canceled', clear_blocked_text['error'])
+        self.assertFalse(sanitized_text['ok'])
+        self.assertIn('not text-editable', sanitized_text['error'])
+        self.assertFalse(changed_text['ok'])
+        self.assertIn('not text-editable', changed_text['error'])
+        self.assertFalse(enter_mutated_text['ok'])
+        self.assertIn('changed before submission', enter_mutated_text['error'])
+        self.assertIn('idle', self.status())
+
+    def test_fill_submit_requires_an_associated_working_form(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        phone_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Phone number' in line
+        ).split()[0]
+        throwing_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Throwing submit input' in line
+        ).split()[0]
+
+        no_form = self.command_raw(f'fill-submit {phone_ref} accepted')
+        throwing_form = self.command_raw(f'fill-submit {throwing_ref} accepted')
+
+        self.assertFalse(no_form['ok'])
+        self.assertIn('associated form', no_form['error'])
+        self.assertFalse(throwing_form['ok'])
+        self.assertIn('requestSubmit failed', throwing_form['error'])
+        self.assertIn('idle', self.status())
+
+    def test_fill_submit_uses_authoritative_form_association_and_validates_constraints(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        override_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Override form input' in line
+        ).split()[0]
+        invalid_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Invalid form input' in line
+        ).split()[0]
+        handler_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Enter handler input' in line
+        ).split()[0]
+        unsafe_handler_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Unsafe enter handler input' in line
+        ).split()[0]
+        late_mutating_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Late-mutating input' in line
+        ).split()[0]
+        default_submitter_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Default submitter input' in line
+        ).split()[0]
+        unsupported_target_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Unsupported target input' in line
+        ).split()[0]
+        base_target_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Base target input' in line
+        ).split()[0]
+        whitespace_target_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Whitespace target input' in line
+        ).split()[0]
+        disabled_default_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Disabled default input' in line
+        ).split()[0]
+        image_default_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Image default input' in line
+        ).split()[0]
+        shadow_submit_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Shadow submit input' in line
+        ).split()[0]
+
+        submitted = self.command(f'fill-submit {override_ref} accepted')
+        override_status = self.status()
+        invalid = self.command_raw(f'fill-submit {invalid_ref} accepted')
+        handler_submitted = self.command(f'fill-submit {handler_ref} accepted')
+        handler_status = self.status()
+        unsafe_handler = self.command_raw(
+            f'fill-submit {unsafe_handler_ref} accepted'
+        )
+        late_mutating = self.command_raw(
+            f'fill-submit {late_mutating_ref} accepted'
+        )
+        default_submitted = self.command(
+            f'fill-submit {default_submitter_ref} accepted'
+        )
+        default_status = self.status()
+        unsupported_target = self.command_raw(
+            f'fill-submit {unsupported_target_ref} accepted'
+        )
+        whitespace_target = self.command_raw(
+            f'fill-submit {whitespace_target_ref} accepted'
+        )
+        disabled_default = self.command_raw(
+            f'fill-submit {disabled_default_ref} accepted'
+        )
+        image_default = self.command(
+            f'fill-submit {image_default_ref} accepted'
+        )
+        image_status = self.status()
+        shadow_submitted = self.command(
+            f'fill-submit {shadow_submit_ref} accepted'
+        )
+        shadow_status = self.status()
+        base_target = self.command_raw(
+            f'fill-submit {base_target_ref} accepted'
+        )
+
+        self.assertTrue(submitted['ok'])
+        self.assertIn('override-form-submitted', override_status)
+        self.assertFalse(invalid['ok'])
+        self.assertIn('constraint validation', invalid['error'])
+        self.assertTrue(handler_submitted['ok'])
+        self.assertIn('handler-submit-count:1', handler_status)
+        self.assertNotIn('handler-submit-count:2', handler_status)
+        self.assertFalse(unsafe_handler['ok'])
+        self.assertIn('form was not submitted', unsafe_handler['error'])
+        self.assertFalse(late_mutating['ok'])
+        self.assertIn('submission context changed', late_mutating['error'])
+        self.assertTrue(default_submitted['ok'])
+        self.assertIn('default-submitter:default-submit-button:clicks=1', default_status)
+        self.assertFalse(unsupported_target['ok'])
+        self.assertIn('unsupported form target', unsupported_target['error'])
+        self.assertFalse(whitespace_target['ok'])
+        self.assertIn('unsupported form target', whitespace_target['error'])
+        self.assertFalse(disabled_default['ok'])
+        self.assertIn('disabled default submitter', disabled_default['error'])
+        self.assertTrue(image_default['ok'])
+        self.assertIn('image-default-submitted:image-default-submitter', image_status)
+        self.assertTrue(shadow_submitted['ok'])
+        self.assertIn('shadow-submitter:shadow-default-submitter:clicks=1', shadow_status)
+        self.assertFalse(base_target['ok'])
+        self.assertIn('submission context changed', base_target['error'])
+        status = self.status()
+        self.assertNotIn('handler-submit-count:2', status)
+        self.assertNotIn('invalid-form-submitted', status)
+        self.assertNotIn('unsupported-target-submitted', status)
+
+    def test_text_entry_actions_reject_readonly_inputs_and_textareas(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        readonly_refs = [
+            next(
+                line for line in snapshot.splitlines()
+                if tag in line and label in line
+            ).split()[0]
+            for tag, label in (
+                ('<input>', 'Readonly input'),
+                ('<textarea>', 'Readonly textarea'),
+            )
+        ]
+
+        for ref in readonly_refs:
+            for action in ('fill', 'type', 'fill-submit'):
+                with self.subTest(ref=ref, action=action):
+                    rejected = self.command_raw(f'{action} {ref} mutation')
+                    self.assertFalse(rejected['ok'])
+                    self.assertIn('not text-editable', rejected['error'])
+        page_text = self.status()
+        self.assertIn('idle', page_text)
+        self.assertNotIn('mutation', page_text)
+
+    def test_snapshot_exposes_checkbox_state_through_visible_label_proxies(self):
+        self.open_form_safety_fixture()
+
+        snapshot = self.command('snapshot -i')['text']
+
+        terms_line = next(line for line in snapshot.splitlines() if 'Required terms' in line)
+        marketing_line = next(line for line in snapshot.splitlines() if 'Receive marketing email' in line)
+        self.assertIn('control="checkbox"', terms_line)
+        self.assertIn('checked="false"', terms_line)
+        self.assertIn('required="true"', terms_line)
+        self.assertIn('control="checkbox"', marketing_line)
+        self.assertIn('checked="true"', marketing_line)
+        disabled_line = next(
+            line for line in snapshot.splitlines() if 'Disabled preference' in line
+        )
+        self.assertIn('control="checkbox"', disabled_line)
+        self.assertIn('checked="true"', disabled_line)
+        self.assertIn('disabled="true"', disabled_line)
+        disabled_click = self.command_raw(f'click {disabled_line.split()[0]}')
+        self.assertFalse(disabled_click['ok'])
+        self.assertIn('disabled', disabled_click['error'])
+
+        self.command(f'click {terms_line.split()[0]}')
+        updated = self.command('snapshot -i')['text']
+        updated_terms = next(line for line in updated.splitlines() if 'Required terms' in line)
+        self.assertIn('checked="true"', updated_terms)
+
+    def test_text_entry_actions_reject_a_contenteditable_label(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        label_ref = next(
+            line for line in snapshot.splitlines()
+            if '<label>' in line and 'Editable label' in line
+        ).split()[0]
+
+        for action in ('fill', 'type', 'fill-submit'):
+            with self.subTest(action=action):
+                rejected = self.command_raw(f'{action} {label_ref} mutation')
+                self.assertFalse(rejected['ok'])
+                self.assertIn('not text-editable', rejected['error'])
+        page_text = self.status()
+        self.assertIn('Editable label', page_text)
+        self.assertNotIn('mutation', page_text)
+        self.assertIn('idle', page_text)
+
+    def test_empty_fill_dispatches_input_to_clear_framework_model_state(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        model_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Empty fill model' in line
+        ).split()[0]
+
+        cleared = self.command(f'fill {model_ref} ""')
+
+        self.assertIn('with ""', cleared['text'])
+        self.assertIn('input-events:1', self.status())
+
+    def test_type_uses_cleared_textarea_live_value_not_html_default(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        textarea_ref = next(
+            line for line in snapshot.splitlines()
+            if '<textarea>' in line and 'Default textarea' in line
+        ).split()[0]
+
+        cleared = self.command(f'fill {textarea_ref} ""')
+        typed = self.command(f'type {textarea_ref} Z')
+
+        self.assertIn('with ""', cleared['text'])
+        self.assertIn('with "Z"', typed['text'])
+        self.assertNotIn('server default', typed['text'])
+
+    def test_press_rejects_arbitrary_text_without_mutating_focus(self):
+        self.open_form_safety_fixture()
+        snapshot = self.command('snapshot -i')['text']
+        phone_ref = next(
+            line for line in snapshot.splitlines()
+            if '<input>' in line and 'Phone number' in line
+        ).split()[0]
+        self.command(f'fill {phone_ref} 0000000000')
+
+        rejected = self.command_raw('press MUTATE')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('Enter, Tab, Space, or Backspace', rejected['error'])
+        updated = self.command('snapshot -i')['text']
+        phone_line = next(line for line in updated.splitlines() if 'Phone number' in line)
+        self.assertIn('"0000000000"', phone_line)
+        self.assertNotIn('MUTATE', phone_line)
+
+    def test_short_click_text_does_not_substring_match_next(self):
+        self.open_form_safety_fixture()
+
+        rejected = self.command_raw('click-text "X"')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('click target not found', rejected['error'])
+        self.assertIn('idle', self.status())
+
+    def test_click_text_rejects_an_empty_query(self):
+        self.open_form_safety_fixture()
+
+        rejected = self.command_raw('click-text ""')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('non-empty', rejected['error'])
+        self.assertIn('idle', self.status())
+
+    def test_click_text_rejects_a_javascript_blank_bom_query(self):
+        self.open_form_safety_fixture()
+
+        rejected = self.command_raw('click-text "\ufeff"')
+
+        self.assertFalse(rejected['ok'])
+        self.assertIn('non-empty', rejected['error'])
+        self.assertIn('idle', self.status())
+
     def test_find_option_searches_dropdowns_by_fuzzy_tokens_without_opening_them(self):
         self.open_select_fixture()
         snapshot = self.command('snapshot -i')['text']
@@ -2532,6 +3242,32 @@ class WorkerIntegrationTests(unittest.TestCase):
         updated = self.command('snapshot -i')['text']
         self.assertIn('selected="AMD Ryzen 7 9800X3D"', updated)
 
+    def test_main_frame_same_url_fill_submit_waits_for_new_document(self):
+        handler = functools.partial(
+            QuietSimpleHTTPRequestHandler,
+            directory=str(ROOT / 'tests'),
+        )
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            fixture_url = (
+                f'http://127.0.0.1:{server.server_port}/fixture_main_same_url_submit.html'
+            )
+            opened = self.command(f'open {fixture_url}')['text']
+            submit_ref = next(
+                line for line in opened.splitlines()
+                if '<input>' in line and 'Main reload 1' in line
+            ).split()[0]
+
+            submitted = self.command(f'fill-submit {submit_ref} accepted')['text']
+
+            self.assertIn('Main reload 2', submitted)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
     def test_same_origin_iframe_supports_semantic_fill_select_and_click(self):
         class DelayedIframeHandler(QuietSimpleHTTPRequestHandler):
             def do_GET(self):
@@ -2578,7 +3314,26 @@ class WorkerIntegrationTests(unittest.TestCase):
             self.assertIn('selected="AMD Ryzen 7 9800X3D"', updated)
             self.assertIn('Iframe selection applied', updated)
 
-            submit_ref = next(line for line in updated.splitlines() if 'Iframe submit query' in line).split()[0]
+            ajax_ref = next(
+                line for line in updated.splitlines()
+                if 'Iframe AJAX submit query' in line
+            ).split()[0]
+            ajax_submitted = self.command(f'fill-submit {ajax_ref} ready')['text']
+            self.assertIn('Iframe AJAX submitted', ajax_submitted)
+
+            after_ajax = self.command('snapshot -i')['text']
+            same_url_ref = next(
+                line for line in after_ajax.splitlines()
+                if 'Iframe same URL submit query' in line
+            ).split()[0]
+            same_url_submitted = self.command(f'fill-submit {same_url_ref} ready')['text']
+            self.assertIn('Iframe same URL submit query', same_url_submitted)
+
+            after_same_url = self.command('snapshot -i')['text']
+            submit_ref = next(
+                line for line in after_same_url.splitlines()
+                if 'Iframe submit query' in line
+            ).split()[0]
             submitted = self.command(f'fill-submit {submit_ref} ready')['text']
             self.assertIn('Iframe submitted result', submitted)
         finally:

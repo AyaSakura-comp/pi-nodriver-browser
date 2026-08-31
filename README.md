@@ -52,7 +52,7 @@ flowchart TB
     end
 
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
-        ENGINE -->|"Interactive Mode (iPhone / 1600x1000)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Interactive Mode (iPhone / 450x1000)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
         TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
         TABS_POOL --> CHROME
@@ -167,7 +167,11 @@ sequenceDiagram
 ### 1. Fast 2-Step Interactive Pattern (`fill-submit`)
 Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
 1. **`open <url>`**: Automatically cleans overlays, waits for DOM readiness, and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
-2. **`fill-submit <@ref> <text>`**: Atomically clears the target input, dispatches keyboard and change events (`keydown`, `input`, `change`), executes `form.requestSubmit()` / click search, auto-settles the resulting results page, and returns the updated DOM snapshot in turn 2.
+2. **`fill-submit @e1 "query"`**: Atomically clears the literal target ref, dispatches cancellation-aware keyboard and change events, requires an associated form, executes `form.requestSubmit()`, auto-settles the resulting page, and returns the updated DOM snapshot in turn 2. It never guesses or clicks an unrelated fallback button.
+
+> **Literal ref syntax:** If a snapshot prints `@e16`, send exactly `click @e16`. Never send `click <@e16>`; angle brackets in generic notation are placeholders, not characters to type. The parser accepts the older wrapped form only as a compatibility fallback.
+>
+> **Form safety:** `fill`, `type`, and `fill-submit` reject `<label>` refs and non-text controls instead of typing into whichever field was previously focused. Hidden native checkbox/radio controls remain actionable through their visible label proxy, and snapshots expose `control`, `checked`, `required`, and `disabled` state so optional marketing consent can be audited before submission.
 
 #### Semantic-First Iframe Interaction
 
@@ -223,7 +227,7 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
 ### 7. Per-Session Open Loop Guard
-To prevent a runaway agent from repeatedly creating tabs, each session may attempt at most **2 consecutive `open` actions**. The 3rd and every later `open` returns `OPEN_LOOP_GUARD` without launching a tab; failed navigation attempts still count, so failures cannot create an open-retry loop. A valid non-`open` browser action resets the streak, while unsupported commands do not; for multiple independent URLs, use one batched `crawl` call instead.
+To prevent a runaway agent from repeatedly opening the same site, each session may attempt at most **2 consecutive `open` actions to the same origin**. The 3rd same-origin `open` returns `OPEN_LOOP_GUARD` without launching a tab. A valid non-`open` browser action or a different-origin `open` resets the streak, while unsupported commands do not; for multiple same-site URLs, prefer one batched `crawl` call.
 
 ### 8. Global Tab LRU
 Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Each tab stores an immutable creation time and a `time.monotonic()` last-activity timestamp. Every page operation refreshes activity; when a new tab needs capacity, the least-recently-used inactive tab is closed first. Registry and download-routing state is removed only after Chrome confirms closure, preventing failed closes from bypassing the cap or leaking stale frame ownership. A CDP target quarantined after a preflight timeout remains in the registry until Chrome confirms it has disappeared or normal LRU eviction closes it. Tabs belonging to commands currently running and sessions with in-progress downloads are protected. If every tab is protected, creation fails with `TAB_LIMIT` instead of exceeding the cap. Crawl creation uses the same registry and a bounded semaphore.
@@ -441,28 +445,42 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, only 2 consecutive opens are allowed; the 3rd and later are blocked until a valid non-open action succeeds. | Interactive Tab (1600x1000 / iPhone) |
-| **`fill-submit`** | `fill-submit <@ref> <text>` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
-| **`upload`** | `upload <@ref> <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into file input, button, or dropzone | Interactive Tab |
+| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (450x1000 / iPhone) |
+| **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
+| **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
 | **`fetch_images`** | `fetch_images({ urls: [...] })` | Fetches up to four selected direct images concurrently, preserves partial success, and returns exact delivery markers without reinjecting image bytes into the next model turn. | Session Scope |
 | **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** returning clean text plus ranked `imageCandidates`, with 3.0s circuit breaker and anti-bot challenge detection. | 1920x1080 Full-Desktop CDP Override |
-| **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` for elements in current viewport | Interactive Tab |
+| **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` plus checkbox/radio `checked`, `required`, and `disabled` state in the current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
-| **`click`** | `click <@ref>` | Clicks snapshot element; raw coordinate form is blocked | Interactive Tab |
+| **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
 | **`vision-mark`** | `vision-mark <x> <y>` | Requires three consecutive semantic click failures plus a fresh normal screenshot; then returns a marked current-viewport PNG and one-time preview token without clicking | Interactive Tab |
 | **`vision-click`** | `vision-click <preview-token>` | Consumes the latest visually confirmed marker token and clicks its stored viewport point | Interactive Tab |
-| **`fill`** | `fill <@ref> <text>` | Clears input field and types text | Interactive Tab |
-| **`type`** | `type <@ref> <text>` | Types text without clearing | Interactive Tab |
+| **`fill`** | `fill @e6 "text"` | Clears and types only into a text-editable input/textarea/contenteditable ref; `<label>` refs fail closed | Interactive Tab |
+| **`type`** | `type @e6 "text"` | Types into the literal input ref without clearing | Interactive Tab |
 | **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |
-| **`select`** | `select <@ref> <query\|--index=N --fingerprint=HASH>` | Selects a confidently ranked visible option; ambiguous queries return candidates instead of guessing, and the complete indexed command from `find-option` verifies the option has not changed | Interactive Tab |
-| **`press`** | `press <key>` | Dispatches Enter, Tab, Space, Backspace, or raw key | Interactive Tab |
+| **`select`** | `select @e43 <query\|--index=N --fingerprint=HASH>` | Selects from the literal dropdown ref; ambiguous queries return candidates instead of guessing, and the complete indexed command from `find-option` verifies the option has not changed | Interactive Tab |
+| **`press`** | `press <key>` | Dispatches only control keys such as Enter, Tab, Space, or Backspace. Enter field text with `fill @e6 "text"` or `type @e6 "text"`. | Interactive Tab |
 | **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
 | **`get`** | `get text|images|url|title [@ref]` | `get text` returns innerText plus ranked image candidates; `get images` returns only candidate metadata; URL/title behavior is unchanged. | Interactive Tab |
 | **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot; a normal viewport capture is required after semantic failures unlock `vision-mark` | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
 | **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome | Global Daemon Scope |
+
+---
+
+### Environment Variables & Display Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `PI_NODRIVER_SCREEN` | `450x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + iPhone viewport). |
+| `PI_NODRIVER_WINDOW_SIZE` | `410,950` | Chrome startup `--window-size` in Xvfb. |
+| `PI_NODRIVER_XVFB_FORWARD_CLICK` | `0` | Set `1` to enable prototype X11 native hardware mouse click forwarding via `xdotool` on Xvfb for `vision-click`. |
+| `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
+| `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
+| `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |
+| `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix domain socket path for daemon IPC. |
 
 ---
 
@@ -483,7 +501,7 @@ cd pi-nodriver-browser
 
 The installer will:
 1. Validate system dependencies (`python3`, `xvfb-run`, `google-chrome`).
-2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `Pillow==12.3.0`).
+2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `Pillow==12.3.0`, `idna==3.10`).
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
 4. Automatically disable conflicting legacy browser packages.
 
