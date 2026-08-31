@@ -3353,7 +3353,7 @@ class BrowserWorker:
         output = output_dir / 'screenshot.png'
         screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
 
-        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '0') == '1':
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             display = os.environ.get('DISPLAY')
             if display:
                 try:
@@ -3716,7 +3716,7 @@ class BrowserWorker:
         return False
 
     async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
-        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '0') == '1':
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if await self.xvfb_mouse_click(page, x, y):
                 return True
         try:
