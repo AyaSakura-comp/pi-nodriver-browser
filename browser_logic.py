@@ -539,6 +539,8 @@ class VisionFallbackGuard:
         return count, count >= self.threshold
 
     def require_unlocked(self, session_id: str, context: VisionFallbackContext) -> None:
+        if os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '0') == '1' or os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
+            return
         previous = self._failures.get(session_id)
         if previous and previous[0] != context:
             self._failures.pop(session_id, None)

@@ -4053,6 +4053,11 @@ class BrowserWorker:
                 'STALE_REF_GUARD: ref-based commands are blocked after a stale ref; '
                 'do not retry the old ref; run exactly: snapshot -i'
             )
+        if os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1' and uses_ref:
+            raise ValueError(
+                f'DOM operation {action} is disabled in Pure Vision Mode. '
+                'Use screenshot -> vision-mark <x> <y> -> vision-click.'
+            )
         if action != 'wait-popup':
             self.popup_just_switched.discard(session_id)
         if action != 'wait-popup-close':
@@ -4243,6 +4248,19 @@ class BrowserWorker:
             self.touch_tab(page)
             self.popup_openers.pop(session_id, None)
             self.snapshot_required_sessions.discard(session_id)
+            if os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
+                output = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-only-')
+                self.vision_guard.record_screenshot(session_id, await self.vision_page_state(page))
+                return {
+                    'text': (
+                        f'Opened {page.url or parts[1]} [Pure Vision Mode: DOM @refs disabled].\n'
+                        'Inspect the attached screenshot and use vision-mark <x> <y> -> vision-click.'
+                    ),
+                    'action': action,
+                    'url': page.url or parts[1],
+                    'screenshotPath': str(output),
+                    'count': 0,
+                }
             snapshot_text = format_snapshot(elements or [])
             return {
                 'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)\n\nInteractive elements on page:\n{snapshot_text}',
@@ -4279,6 +4297,15 @@ class BrowserWorker:
                     'action': 'snapshot-full-vision',
                     'count': 0,
                     'screenshotPath': str(output),
+                }
+            if os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
+                output = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-only-')
+                self.vision_guard.record_screenshot(session_id, await self.vision_page_state(page))
+                return {
+                    'text': 'DOM @refs disabled in Pure Vision Mode. Inspect the attached screenshot and use vision-mark <x> <y> -> vision-click.',
+                    'action': action,
+                    'screenshotPath': str(output),
+                    'count': 0,
                 }
             elements = json.loads(await page.evaluate(SNAPSHOT_JS))
             self.snapshot_required_sessions.discard(session_id)
