@@ -3330,6 +3330,23 @@ class BrowserWorker:
         output_dir = Path(tempfile.mkdtemp(prefix=prefix))
         output = output_dir / 'screenshot.png'
         screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
+
+        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '0') == '1':
+            display = os.environ.get('DISPLAY')
+            if display:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        'import', '-window', 'root', str(output),
+                        env=os.environ,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=screenshot_timeout)
+                    if output.is_file() and output.stat().st_size > 0:
+                        return output
+                except Exception:
+                    pass
+
         try:
             await asyncio.wait_for(
                 page.save_screenshot(output, format='png', full_page=False),
