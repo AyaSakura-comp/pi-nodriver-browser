@@ -503,6 +503,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
+| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px human-like micro-drift / pressure wobble during long press to emulate natural human touch/pointer kinematics. |
+| `PI_NODRIVER_LONG_PRESS_JITTER_PX` | `2.0` | Maximum radius (in pixels) for human micro-jitter drift during long-press holding. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
 | `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix domain socket path for daemon IPC. |

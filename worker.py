@@ -9,6 +9,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import signal
@@ -3831,6 +3832,8 @@ class BrowserWorker:
         toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
         screen_x = int(round(float(x)))
         screen_y = int(round(float(y))) + toolbar_height
+        jitter_enabled = os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER', '1') == '1'
+        max_jitter = float(os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER_PX', '2.0'))
         display = os.environ.get('DISPLAY')
         if display:
             try:
@@ -3844,7 +3847,28 @@ class BrowserWorker:
                     env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
                 )
                 await p2.wait()
-                await asyncio.sleep(max(0.05, duration_ms / 1000.0))
+                total_seconds = max(0.05, duration_ms / 1000.0)
+                if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
+                    loop = asyncio.get_running_loop()
+                    end_time = loop.time() + total_seconds
+                    curr_dx, curr_dy = 0.0, 0.0
+                    while loop.time() < end_time:
+                        remaining = end_time - loop.time()
+                        if remaining <= 0.03:
+                            break
+                        step_delay = min(max(0.04, random.uniform(0.05, 0.09)), remaining)
+                        curr_dx = max(-max_jitter, min(max_jitter, curr_dx + random.uniform(-0.8, 0.8)))
+                        curr_dy = max(-max_jitter, min(max_jitter, curr_dy + random.uniform(-0.8, 0.8)))
+                        jx = int(round(screen_x + curr_dx))
+                        jy = int(round(screen_y + curr_dy))
+                        pm = await asyncio.create_subprocess_exec(
+                            'xdotool', 'mousemove', '--sync', str(jx), str(jy),
+                            env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                        )
+                        await pm.wait()
+                        await asyncio.sleep(step_delay)
+                else:
+                    await asyncio.sleep(total_seconds)
                 p3 = await asyncio.create_subprocess_exec(
                     'xdotool', 'mouseup', '1',
                     env=os.environ, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
@@ -3862,12 +3886,32 @@ class BrowserWorker:
                 await page.sleep(0.2)
                 return True
         try:
+            jitter_enabled = os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER', '1') == '1'
+            max_jitter = float(os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER_PX', '2.0'))
+            fx, fy = float(x), float(y)
             await page.send(uc.cdp.input_.dispatch_mouse_event(
-                type_='mousePressed', x=float(x), y=float(y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+                type_='mousePressed', x=fx, y=fy, button=uc.cdp.input_.MouseButton.LEFT, click_count=1
             ))
-            await asyncio.sleep(max(0.05, duration_ms / 1000.0))
+            total_seconds = max(0.05, duration_ms / 1000.0)
+            if jitter_enabled and total_seconds >= 0.2 and max_jitter > 0:
+                loop = asyncio.get_running_loop()
+                end_time = loop.time() + total_seconds
+                curr_dx, curr_dy = 0.0, 0.0
+                while loop.time() < end_time:
+                    remaining = end_time - loop.time()
+                    if remaining <= 0.03:
+                        break
+                    step_delay = min(max(0.04, random.uniform(0.05, 0.09)), remaining)
+                    curr_dx = max(-max_jitter, min(max_jitter, curr_dx + random.uniform(-0.8, 0.8)))
+                    curr_dy = max(-max_jitter, min(max_jitter, curr_dy + random.uniform(-0.8, 0.8)))
+                    await page.send(uc.cdp.input_.dispatch_mouse_event(
+                        type_='mouseMoved', x=fx + curr_dx, y=fy + curr_dy, buttons=1
+                    ))
+                    await asyncio.sleep(step_delay)
+            else:
+                await asyncio.sleep(total_seconds)
             await page.send(uc.cdp.input_.dispatch_mouse_event(
-                type_='mouseReleased', x=float(x), y=float(y), button=uc.cdp.input_.MouseButton.LEFT, click_count=1
+                type_='mouseReleased', x=fx, y=fy, button=uc.cdp.input_.MouseButton.LEFT, click_count=1
             ))
             await page.sleep(0.2)
             return True
