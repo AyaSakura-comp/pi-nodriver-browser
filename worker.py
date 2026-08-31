@@ -5062,7 +5062,7 @@ class BrowserWorker:
                     )
                 except TimeoutError as error:
                     raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
-                note = ' Full-page overviews cannot be used for coordinate confirmation or unlock vision fallback.'
+                note = ' Full-page overview (via CDP) assists non-vision DOM browser clicks (e.g. click @ref). It cannot be used for coordinate clicks.'
             else:
                 output = await self.save_viewport_screenshot(page, 'pi-nodriver-shot-')
                 self.vision_guard.record_screenshot(
@@ -5070,7 +5070,7 @@ class BrowserWorker:
                     await self.vision_page_state(page),
                 )
                 note = (
-                    ' Current viewport was captured. vision-mark additionally requires '
+                    ' Current Xvfb window screenshot captured (500x1000). vision-mark additionally requires '
                     f'VISION_FALLBACK_UNLOCKED after {self.vision_fallback_guard.threshold} consecutive '
                     'semantic target-resolution failures on this page/document.'
                 )

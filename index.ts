@@ -34,7 +34,7 @@ Guidelines:
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
 - Incidental Image Completion: Do not finalize a concrete-subject answer as text-only when get text/crawl returned relevant representative or content candidates. Call fetch_images with 1–3 non-duplicate direct URLs even when the user did not mention images; skip only irrelevant, logo/icon/ad/tracking, or low-confidence assets.
-- One-Shot Overview: For long pages, use 'snapshot -i --full' or 'screenshot --full' to capture the entire layout in 1 step rather than scrolling up and down in loops. A full overview is visual-only: run 'snapshot -i' before interacting.
+- One-Shot Overview & DOM Semantic Assist: For long pages, use 'screenshot --full' (or 'snapshot -i --full') to capture the entire scrollable page layout in 1 step. Its primary purpose is to visually locate elements, text, and structure to assist non-vision DOM browser clicks (e.g. click @ref, fill @ref, click-text); it is NOT for coordinate clicking. When a user requests 'screenshot', always default to the current Xvfb window screenshot (500x1000 viewport with full Chrome UI).
 - Semantic-First Iframes: Controls inside same-origin iframes receive normal @refs plus frame labels. Use fill/select/click @ref, click-text, or click-css; never guess viewport coordinates for ordinary iframe controls.
 - Searchable Dropdowns: Native <select> controls show their label, selected value, option count, and option type. Do not click them open or infer their contents from the first option. Use find-option "fuzzy keywords", then copy a returned complete 'Select exactly' command; its index and fingerprint prevent stale-option mistakes.
 - Progressive Disclosure: Never crawl or get the full page merely to inspect a dropdown. find-option searches every option internally, includes control-label context, and diversifies the top candidates across dropdowns; ambiguous queries return choices instead of guessing.
@@ -77,7 +77,7 @@ Commands:
   wait-popup-close [ms] - Wait for the active popup to close and return to its opener
   switch opener - Return to the popup's opener without closing the popup
   dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
-  screenshot [--full] - Capture screenshot and return it inline
+  screenshot [--full] - Default: capture current Xvfb window (500x1000 with Chrome UI, used for visual checks & vision-mark). With --full: capture complete scrollable page via CDP to assist non-vision DOM browser clicks (e.g. click @ref).
   close - Close only the current Pi session tab
   shutdown - Close Chrome and stop the persistent browser daemon
 Use quoted text when an argument contains spaces. Re-run snapshot -i after navigation or major DOM changes. A missing/stale ref automatically returns a fresh DOM snapshot plus a viewport JPG for joint visual inspection, without performing the action; never retry the stale ref, and use only literal @eN refs from the authoritative recovery snapshot, which are available immediately.

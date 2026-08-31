@@ -463,10 +463,21 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`press`** | `press <key>` | Dispatches only control keys such as Enter, Tab, Space, or Backspace. Enter field text with `fill @e6 "text"` or `type @e6 "text"`. | Interactive Tab |
 | **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
 | **`get`** | `get text|images|url|title [@ref]` | `get text` returns innerText plus ranked image candidates; `get images` returns only candidate metadata; URL/title behavior is unchanged. | Interactive Tab |
-| **`screenshot`** | `screenshot [--full]` | Captures viewport or full-page PNG/JPG screenshot; a normal viewport capture is required after semantic failures unlock `vision-mark` | Interactive Tab |
+| **`screenshot`** | `screenshot [--full]` | **Default**: Captures current Xvfb window (`500x1000` with Chrome UI, 1:1 coordinates for visual check & `vision-mark`).<br>**`--full`**: Captures entire scrollable long page via CDP specifically to assist non-vision DOM browser clicks (`@ref`, `click-text`). | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
 | **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome | Global Daemon Scope |
+
+---
+
+### 📸 Screenshot & Interaction Guide
+
+- **預設截圖 (`screenshot`)**：
+  - **適用情境**：使用者要求截圖、檢視當前可視範圍、檢查表單狀態、或進行 `vision-mark` 座標校準。
+  - **運作機制**：直接從 Xvfb 擷取 `500x1000` 實體視窗畫面（包含 Chrome 分頁標籤、網址列與 1:1 實體像素座標）。
+- **整頁長截圖 (`screenshot --full` / `snapshot -i --full`)**：
+  - **適用情境**：**輔助 DOM 語意點擊 (Non-Vision Browser Click)**。當頁面很長且 Agent 需要一眼掌握全頁排版、尋找特定按鈕或標題以決定呼叫哪一個 `@ref` / `fill` / `click-text` 時使用。
+  - **運作機制**：透過 Chrome Blink CDP 引擎在記憶體中拼接長圖，不提供 X11 物理座標（不能用於座標點擊）。
 
 ---
 
