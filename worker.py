@@ -2200,8 +2200,14 @@ class BrowserWorker:
             profile.mkdir(parents=True, exist_ok=True)
             try:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
-                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '410,950')
-                b_args = [f'--window-size={window_size}', '--no-first-run', '--no-default-browser-check']
+                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '450,1000')
+                b_args = [
+                    '--start-maximized',
+                    '--window-position=0,0',
+                    f'--window-size={window_size}',
+                    '--no-first-run',
+                    '--no-default-browser-check',
+                ]
                 if ext_path.is_dir():
                     b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
                 self.browser = await uc.start(

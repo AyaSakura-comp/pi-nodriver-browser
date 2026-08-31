@@ -52,7 +52,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('shutdown', extension_source)
             worker_source = (extension / 'worker.py').read_text()
             self.assertIn('PI_NODRIVER_WINDOW_SIZE', worker_source)
-            self.assertIn('410,950', worker_source)
+            self.assertIn('450,1000', worker_source)
+            self.assertIn('--start-maximized', worker_source)
+            self.assertIn('--window-position=0,0', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
             self.assertIn('minimum_settle_seconds = 0.1', native_click)
             self.assertIn('maximum_settle_seconds = 0.5', native_click)

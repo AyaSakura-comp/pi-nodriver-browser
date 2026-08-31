@@ -475,7 +475,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | Variable | Default | Description |
 |---|---|---|
 | `PI_NODRIVER_SCREEN` | `450x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + iPhone viewport). |
-| `PI_NODRIVER_WINDOW_SIZE` | `410,950` | Chrome startup `--window-size` in Xvfb. |
+| `PI_NODRIVER_WINDOW_SIZE` | `450,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `0` | Set `1` to enable prototype X11 native hardware mouse click forwarding (via `xdotool`) and Xvfb screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). |
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
