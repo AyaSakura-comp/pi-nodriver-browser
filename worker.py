@@ -6014,8 +6014,40 @@ async def server_main(socket_path):
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        lock_file.close()
-        return
+        is_healthy = False
+        try:
+            test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            test_sock.settimeout(0.5)
+            test_sock.connect(str(path))
+            test_sock.close()
+            is_healthy = True
+        except Exception:
+            is_healthy = False
+        if is_healthy:
+            lock_file.close()
+            return
+        try:
+            import subprocess
+            res = subprocess.run(['lsof', '-t', str(path.with_name(path.name + '.lock'))], capture_output=True, text=True)
+            for pid_str in res.stdout.split():
+                pid = int(pid_str)
+                if pid != os.getpid():
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            time.sleep(0.2)
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            lock_file.close()
+            return
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f'{os.getpid()}\n')
+        lock_file.flush()
+    except Exception:
+        pass
     path.unlink(missing_ok=True)
 
     async def handle_client(reader, writer):
