@@ -1673,6 +1673,7 @@ class FetchImageUnitTests(unittest.IsolatedAsyncioTestCase):
         self.slow_header_started = threading.Event()
         payloads = {
             '/sample.png': self.png_bytes,
+            '/sample.webp': self.webp_bytes,
             '/large.png': self.png_bytes,
             '/truncated.jpg': self.truncated_jpeg_bytes,
             '/truncated.png': self.png_bytes[:-12],
@@ -1959,6 +1960,19 @@ class FetchImageUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['width'], 3)
         self.assertEqual(result['height'], 2)
         self.assertIn(f'[[image: {image_path}]]', result['text'])
+
+    async def test_normalizes_webp_to_png_for_multimodal_provider_compatibility(self):
+        with self.allow_private_images():
+            result = await self.worker.execute(
+                f'fetch-image {self.local_url("/sample.webp")}',
+                session_id='session-a',
+            )
+
+        image_path = Path(result['imagePath'])
+        self.assertEqual(result['mimeType'], 'image/png')
+        self.assertEqual(image_path.suffix, '.png')
+        self.assertTrue(image_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertEqual((result['width'], result['height']), (3, 2))
 
     async def test_rejects_non_image_content_without_saving_a_file(self):
         with self.allow_private_images():

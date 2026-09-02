@@ -2852,6 +2852,7 @@ class BrowserWorker:
                     frame_durations.append(image.info.get('duration', 0))
 
                 canonical = io.BytesIO()
+                output_format = 'PNG' if image_format == 'WEBP' else image_format
                 if image_format == 'JPEG':
                     image.seek(0)
                     canonical = io.BytesIO()
@@ -2865,11 +2866,9 @@ class BrowserWorker:
                             duration=frame_durations,
                             loop=animation_loop,
                         )
-                    if image_format == 'WEBP':
-                        save_options['lossless'] = True
                     canonical_frames[0].save(
                         canonical,
-                        format=image_format,
+                        format=output_format,
                         **save_options,
                     )
                 normalized_data = canonical.getvalue()
@@ -2878,7 +2877,7 @@ class BrowserWorker:
         except Exception as error:
             raise ValueError('downloaded content is not a valid image') from error
 
-        mime_type, suffix = IMAGE_FORMATS[image_format]
+        mime_type, suffix = IMAGE_FORMATS[output_format]
         width, height = frame_sizes[0]
         return mime_type, suffix, width, height, normalized_data
 
