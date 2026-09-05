@@ -504,9 +504,15 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 - **預設截圖 (`screenshot`)**：
   - **適用情境**：使用者要求截圖、檢視當前可視範圍、檢查表單狀態、或進行 `vision-mark` 座標校準。
   - **運作機制**：直接從 Xvfb 擷取 `500x1000` 實體視窗畫面（包含 Chrome 分頁標籤、網址列與 1:1 實體像素座標）。
+  - **Wayland / Ozone X11 強制隔離**：啟動時自動從環境變數過濾 `WAYLAND_DISPLAY` 並傳遞 `--ozone-platform=x11`，防止 Linux 桌面環境下 Chrome 誤連 Wayland 造成 Xvfb 擷取出未繪製的純黑空圖。
+  - **多 Session 自動聚焦 (`bring_to_front`)**：截取 Xvfb 實體畫面時，自動將發動請求的 session tab 帶至 Chrome 視窗最前景，確保截圖畫面永遠與當前 session 操作一致，避免分頁相互覆蓋。
+  - **全黑圖保護與 CDP 自動 Fallback**：透過 `is_empty_screenshot` 進行像素層級校驗，若 Xvfb 畫面為純黑未初始化狀態，自動無縫切換 CDP 記憶體渲染，保證 100% 回傳可用畫面。
 - **整頁長截圖 (`screenshot --full` / `snapshot -i --full`)**：
   - **適用情境**：**輔助 DOM 語意點擊 (Non-Vision Browser Click)**。當頁面很長且 Agent 需要一眼掌握全頁排版、尋找特定按鈕或標題以決定呼叫哪一個 `@ref` / `fill` / `click-text` 時使用。
   - **運作機制**：透過 Chrome Blink CDP 引擎在記憶體中拼接長圖，不提供 X11 物理座標（不能用於座標點擊）。
+- **原生 Chrome UI 彈窗淨化**：
+  - 預設注入 `--simulate-outdated-no-au="Tue, 31 Dec 2099 23:59:59 GMT"` 與 `--check-for-update-interval=31536000`，徹底防止 Chrome 跳出「Can't update Chrome / Relaunch to update」原生桌面氣泡彈窗遮擋右上角頁面內容與選單。
+  - 搭配 `--disable-session-crashed-bubble`、`--hide-crash-restore-bubble` 與 `--disable-features=Translate`，確保視窗畫面 100% 專注於網頁目標內容。
 
 ---
 
