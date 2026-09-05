@@ -1,29 +1,32 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from worker import BrowserWorker
 
 
 class NativeClickCloseTests(unittest.IsolatedAsyncioTestCase):
     async def test_closed_target_does_not_leave_mouse_click_waiting_forever(self):
-        worker = BrowserWorker()
-        page = SimpleNamespace()
+        with patch.dict(os.environ, {'PI_NODRIVER_XVFB_FORWARD_CLICK': '0'}):
+            worker = BrowserWorker()
+            page = SimpleNamespace()
 
-        async def hanging_click(_x, _y):
-            await asyncio.Event().wait()
+            async def hanging_click(_x, _y):
+                await asyncio.Event().wait()
 
-        async def update_targets():
-            worker.browser.tabs.clear()
+            async def update_targets():
+                worker.browser.tabs.clear()
 
-        page.mouse_click = hanging_click
-        worker.browser = SimpleNamespace(tabs=[page], update_targets=update_targets)
+            page.mouse_click = hanging_click
+            worker.browser = SimpleNamespace(tabs=[page], update_targets=update_targets)
 
-        completed = await worker.mouse_click_allowing_target_close(page, 10, 20, timeout_seconds=0.01)
+            completed = await worker.mouse_click_allowing_target_close(page, 10, 20, timeout_seconds=0.01)
 
-        self.assertFalse(completed)
+            self.assertFalse(completed)
 
 
 class DownloadSessionIsolationTests(unittest.TestCase):

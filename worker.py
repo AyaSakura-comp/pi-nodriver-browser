@@ -36,6 +36,8 @@ SUPPORTED_ACTIONS = {
     'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
+# Strip WAYLAND_DISPLAY so Ozone/Chrome and child processes bind strictly to X11 under Xvfb
+os.environ.pop('WAYLAND_DISPLAY', None)
 
 
 class StaleRefError(ValueError):
@@ -2223,12 +2225,15 @@ class BrowserWorker:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
                 window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '500,1000')
                 b_args = [
+                    '--ozone-platform=x11',
                     '--start-maximized',
                     '--window-position=0,0',
                     f'--window-size={window_size}',
                     '--disable-features=Translate',
                     '--disable-session-crashed-bubble',
                     '--hide-crash-restore-bubble',
+                    '--simulate-outdated-no-au=Tue, 31 Dec 2099 23:59:59 GMT',
+                    '--check-for-update-interval=31536000',
                     '--no-first-run',
                     '--no-default-browser-check',
                 ]
@@ -3355,7 +3360,26 @@ class BrowserWorker:
             visual_scale=rounded(css_visual.scale),
         )
 
+    @staticmethod
+    def is_empty_screenshot(path):
+        try:
+            with Image.open(path) as img:
+                colors = img.getcolors(maxcolors=2)
+                if colors and len(colors) == 1:
+                    _count, color = colors[0]
+                    if color == 0 or color == (0, 0, 0) or color == (0, 0, 0, 255):
+                        return True
+            return False
+        except Exception:
+            return False
+
     async def save_viewport_screenshot(self, page, prefix):
+        try:
+            if hasattr(page, 'bring_to_front'):
+                await page.bring_to_front()
+                await asyncio.sleep(0.05)
+        except Exception:
+            pass
         output_dir = Path(tempfile.mkdtemp(prefix=prefix))
         output = output_dir / 'screenshot.png'
         screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -3372,7 +3396,8 @@ class BrowserWorker:
                     )
                     await asyncio.wait_for(proc.wait(), timeout=screenshot_timeout)
                     if output.is_file() and output.stat().st_size > 0:
-                        return output
+                        if not self.is_empty_screenshot(output):
+                            return output
                 except Exception:
                     pass
 

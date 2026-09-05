@@ -36,7 +36,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         }
         self.proc = subprocess.Popen(
             [
-                'xvfb-run', '-a', '-s', '-screen 0 1440x1000x24',
+                'xvfb-run', '-a', '-s', '-screen 0 500x1000x24',
                 PYTHON, str(ROOT / 'worker.py'), '--server', str(self.socket_path),
             ],
             cwd=ROOT,

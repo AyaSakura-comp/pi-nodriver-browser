@@ -176,10 +176,12 @@ class NodriverWorker {
         unlinkSync(SOCKET);
       } catch {}
       const screen = process.env.PI_NODRIVER_SCREEN || "500x1000x24";
+      const env = { ...process.env };
+      delete env.WAYLAND_DISPLAY;
       child = spawn(
         "xvfb-run",
         ["-a", "-s", `-screen 0 ${screen}`, PYTHON, WORKER, "--server", SOCKET],
-        { cwd: ROOT, stdio: "ignore", detached: true },
+        { cwd: ROOT, stdio: "ignore", detached: true, env },
       );
       child.unref();
     }

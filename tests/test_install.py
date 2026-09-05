@@ -59,9 +59,12 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('500,1000', worker_source)
             self.assertIn('--start-maximized', worker_source)
             self.assertIn('--window-position=0,0', worker_source)
+            self.assertIn('--ozone-platform=x11', worker_source)
             self.assertIn('--disable-features=Translate', worker_source)
             self.assertIn('--disable-session-crashed-bubble', worker_source)
             self.assertIn('--hide-crash-restore-bubble', worker_source)
+            self.assertIn('--simulate-outdated-no-au', worker_source)
+            self.assertIn('--check-for-update-interval', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
             self.assertIn('minimum_settle_seconds = 0.1', native_click)
             self.assertIn('maximum_settle_seconds = 0.5', native_click)
