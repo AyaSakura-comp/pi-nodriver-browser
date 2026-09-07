@@ -2,13 +2,14 @@ import json
 import math
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 
 class GoogleSearchLogicTests(unittest.TestCase):
@@ -474,6 +475,35 @@ class VisionCorrectnessGuardTests(unittest.TestCase):
                 VisionCorrectnessGuard(ttl_seconds=value)
 
 
+class TouchLabGestureTests(unittest.TestCase):
+    def test_minimum_jerk_path_reaches_requested_drift(self):
+        points = generate_minimum_jerk_offsets(6, -4, steps=10)
+        self.assertEqual(points[0], (0.0, 0.0))
+        self.assertEqual(points[-1], (6.0, -4.0))
+        self.assertEqual(len(points), 11)
+        self.assertTrue(all(points[index][0] <= points[index + 1][0] for index in range(10)))
+
+    def test_touch_lab_url_is_restricted_to_owned_lab(self):
+        self.assertTrue(is_touch_lab_url('http://127.0.0.1:8766/'))
+        self.assertTrue(is_touch_lab_url('https://aya.crayfish-monitor.ts.net/touch-trace/'))
+        self.assertFalse(is_touch_lab_url('https://www.skyscanner.com/'))
+        self.assertFalse(is_touch_lab_url('https://example.com/touch-trace/'))
+
+    def test_touch_lab_url_rejects_remote_http_even_for_owned_lab(self):
+        self.assertFalse(is_touch_lab_url('http://aya.crayfish-monitor.ts.net/touch-trace'))
+        self.assertFalse(is_touch_lab_url('http://aya.crayfish-monitor.ts.net/touch-trace/child'))
+
+    def test_touch_lab_url_rejects_non_http_schemes(self):
+        for url in (
+            'file://localhost/touch-trace/',
+            'data://127.0.0.1/touch-trace/',
+            'ftp://aya.crayfish-monitor.ts.net/touch-trace/',
+            'javascript://localhost/touch-trace/',
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_touch_lab_url(url))
+
+
 class BrowserExecutableTests(unittest.TestCase):
     def test_prefers_explicit_profile_directory(self):
         with patch.dict(os.environ, {'PI_NODRIVER_PROFILE': '/tmp/custom-profile'}):
@@ -494,6 +524,32 @@ class BrowserExecutableTests(unittest.TestCase):
         which.side_effect = lambda command: '/usr/bin/google-chrome' if command == 'google-chrome' else None
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_browser_executable(), '/usr/bin/google-chrome')
+
+
+class ProfilePreferencesTests(unittest.TestCase):
+    def test_configure_profile_preferences_disables_password_and_autofill(self):
+        prefs = configure_profile_preferences()
+        self.assertFalse(prefs['credentials_enable_service'])
+        self.assertFalse(prefs['profile']['password_manager_enabled'])
+        self.assertFalse(prefs['profile']['password_manager_leak_detection'])
+        self.assertFalse(prefs['password_manager']['enabled'])
+        self.assertFalse(prefs['autofill']['profile_enabled'])
+        self.assertFalse(prefs['autofill']['credit_card_enabled'])
+        self.assertFalse(prefs['autofill']['address_enabled'])
+        self.assertFalse(prefs['autofill']['payment_methods_mandatory_reauth'])
+        self.assertEqual(prefs['profile']['default_content_setting_values']['notifications'], 2)
+        self.assertEqual(prefs['profile']['default_content_setting_values']['geolocation'], 2)
+        self.assertFalse(prefs['signin']['allowed'])
+        self.assertFalse(prefs['translate']['enabled'])
+
+    def test_ensure_profile_preferences_writes_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir)
+            prefs_file = ensure_profile_preferences(profile)
+            self.assertTrue(prefs_file.is_file())
+            data = json.loads(prefs_file.read_text())
+            self.assertFalse(data['credentials_enable_service'])
+            self.assertFalse(data['profile']['password_manager_enabled'])
 
 
 class OpenUrlNormalizationTests(unittest.TestCase):

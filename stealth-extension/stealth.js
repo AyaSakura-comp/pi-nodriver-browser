@@ -46,49 +46,12 @@
     };
   }
 
-  // 3. WebGL Vendor & Renderer Spoofing (Desktop NVIDIA GPU)
-  const patchWebGL = (proto) => {
-    if (!proto) return;
-    const origGetParam = proto.getParameter;
-    proto.getParameter = function(param) {
-      // UNMASKED_VENDOR_WEBGL (0x9245)
-      if (param === 37445) {
-        return 'Google Inc. (NVIDIA)';
-      }
-      // UNMASKED_RENDERER_WEBGL (0x9246)
-      if (param === 37446) {
-        return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-      }
-      // VENDOR (0x1F00)
-      if (param === 7936) {
-        return 'WebKit';
-      }
-      // RENDERER (0x1F01)
-      if (param === 7937) {
-        return 'WebKit WebGL';
-      }
-      return origGetParam.apply(this, arguments);
-    };
-  };
+  // 3. Preserve native WebGL and plugin fingerprints. Spoofing a desktop
+  // NVIDIA/Windows renderer or legacy desktop plugins creates contradictions
+  // that are easier to detect than Chrome's real Linux values.
 
-  if (typeof WebGLRenderingContext !== 'undefined') {
-    patchWebGL(WebGLRenderingContext.prototype);
-  }
-  if (typeof WebGL2RenderingContext !== 'undefined') {
-    patchWebGL(WebGL2RenderingContext.prototype);
-  }
-
-  // 4. Navigator Plugins & MimeTypes
+  // 4. Preferred languages
   try {
-    const fakePlugins = [
-      { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-      { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-      { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-    ];
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => fakePlugins,
-      configurable: true
-    });
     Object.defineProperty(navigator, 'languages', {
       get: () => ['zh-TW', 'zh', 'en-US', 'en'],
       configurable: true

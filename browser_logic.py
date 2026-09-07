@@ -19,6 +19,42 @@ from typing import Callable
 
 
 GOOGLE_REDIRECT_PATHS = {'/url', '/goto'}
+TOUCH_LAB_HOST = 'aya.crayfish-monitor.ts.net'
+TOUCH_LAB_PATH_PREFIX = '/touch-trace'
+
+
+def generate_minimum_jerk_offsets(delta_x: float, delta_y: float, steps: int = 20) -> list[tuple[float, float]]:
+    """Return a deterministic minimum-jerk path from zero to the requested drift."""
+    if steps < 1:
+        raise ValueError('touch drift steps must be at least 1')
+    if not all(math.isfinite(value) for value in (delta_x, delta_y)):
+        raise ValueError('touch drift must be finite')
+    points = []
+    for index in range(steps + 1):
+        t = index / steps
+        blend = 10 * t**3 - 15 * t**4 + 6 * t**5
+        points.append((round(delta_x * blend, 6), round(delta_y * blend, 6)))
+    return points
+
+
+def is_touch_lab_url(url: str) -> bool:
+    """Restrict synthetic touch traces to the owned diagnostic lab."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {'http', 'https'}:
+        return False
+    host = (parsed.hostname or '').lower()
+    if host in {'127.0.0.1', 'localhost', '::1'}:
+        return True
+    return (
+        parsed.scheme.lower() == 'https'
+        and host == TOUCH_LAB_HOST
+        and (parsed.path == TOUCH_LAB_PATH_PREFIX or parsed.path.startswith(f'{TOUCH_LAB_PATH_PREFIX}/'))
+    )
+
+
 SEARCH_TRACKING_PARAMETERS = {
     'fbclid', 'gclid', 'gbraid', 'msclkid', 'sa', 'source', 'ved', 'wbraid',
 }
@@ -865,6 +901,47 @@ def should_disable_sandbox() -> bool:
 def resolve_profile_dir() -> Path:
     configured = os.environ.get('PI_NODRIVER_PROFILE')
     return Path(configured).expanduser() if configured else Path.home() / '.pi' / 'agent' / 'nodriver-profile'
+
+
+def configure_profile_preferences(prefs: dict | None = None) -> dict:
+    prefs = {} if prefs is None else dict(prefs)
+    p_prof = prefs.setdefault('profile', {})
+    p_prof['exit_type'] = 'Normal'
+    p_prof['exited_cleanly'] = True
+    p_prof['password_manager_enabled'] = False
+    p_prof['password_manager_leak_detection'] = False
+    prefs['exit_type'] = 'Normal'
+    prefs['exited_cleanly'] = True
+    prefs['credentials_enable_service'] = False
+    prefs.setdefault('password_manager', {})['enabled'] = False
+    autofill = prefs.setdefault('autofill', {})
+    autofill['profile_enabled'] = False
+    autofill['credit_card_enabled'] = False
+    autofill['address_enabled'] = False
+    autofill['payment_methods_mandatory_reauth'] = False
+    p_content = p_prof.setdefault('default_content_setting_values', {})
+    p_content['notifications'] = 2
+    p_content['geolocation'] = 2
+    prefs.setdefault('signin', {})['allowed'] = False
+    prefs['signin']['allowed_on_next_startup'] = False
+    prefs.setdefault('translate', {})['enabled'] = False
+    prefs['translate_blocked_languages'] = ['en', 'zh-TW', 'zh-CN', 'zh', 'ja']
+    return prefs
+
+
+def ensure_profile_preferences(profile_dir: Path) -> Path:
+    default_dir = Path(profile_dir) / 'Default'
+    default_dir.mkdir(parents=True, exist_ok=True)
+    prefs_file = default_dir / 'Preferences'
+    prefs = {}
+    if prefs_file.is_file():
+        try:
+            prefs = json.loads(prefs_file.read_text())
+        except Exception:
+            pass
+    configured = configure_profile_preferences(prefs)
+    prefs_file.write_text(json.dumps(configured))
+    return prefs_file
 
 
 def resolve_browser_executable() -> str:

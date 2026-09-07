@@ -7,6 +7,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
@@ -25,14 +26,14 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, format_snapshot, is_confident_option_match, is_semantic_click_attempt, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'open', 'press', 'press-hold', 'screenshot',
-    'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'type', 'upload',
+    'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'touch-drift', 'type', 'upload',
     'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
@@ -74,6 +75,9 @@ IMAGE_MAX_HEADERS = 100
 IMAGE_CHUNK_LINE_MAX_BYTES = 1024
 IMAGE_WRITE_CLEANUP_TIMEOUT = 1.0
 IMAGE_DISCOVERY_TIMEOUT_SECONDS = 0.25
+TOUCH_OPERATION_TIMEOUT_SECONDS = 0.25
+TOUCH_GESTURE_OVERHEAD_TIMEOUT_SECONDS = 0.75
+TOUCH_END_CLEANUP_TIMEOUT_SECONDS = 0.25
 IMAGE_FETCH_MAX_CONCURRENCY = 4
 IMAGE_CANDIDATE_TEXT_MAX_BYTES = 6000
 CRAWL_IMAGE_SIDECAR_MAX_BYTES = 12000
@@ -955,14 +959,49 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
     passwordNow || knownSensitiveValue || match.el.__piSensitiveValue === true ||
     match.el.getAttribute('data-pi-sensitive') === 'true'
   );
+  const stableFingerprint = (object, property, prefix) => {
+    try {
+      if (Object.prototype.hasOwnProperty.call(object, property) && object[property]) {
+        return String(object[property]);
+      }
+      const random = object.ownerDocument?.defaultView?.crypto?.randomUUID?.() ||
+        object.defaultView?.crypto?.randomUUID?.() ||
+        `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+      const value = `${prefix}-${random}`;
+      Object.defineProperty(object, property, {
+        value, writable: false, configurable: false, enumerable: false
+      });
+      return String(object[property] || '');
+    } catch (_) {
+      return '';
+    }
+  };
+  const text = sensitive ? '' :
+    (match.el.innerText || match.el.textContent || match.el.value || '').trim();
+  const href = match.el.href || match.el.closest?.('a')?.href || '';
+  const download = match.el.getAttribute?.('download') ||
+    match.el.closest?.('a')?.getAttribute?.('download') || '';
+  const identity = stableFingerprint(match.el, '__piClickTargetFingerprint', 'element');
+  const fingerprintInput = JSON.stringify([
+    identity, match.el.tagName, match.el.id || '', match.el.getAttribute?.('name') || '',
+    match.el.getAttribute?.('type') || '', match.el.getAttribute?.('role') || '',
+    match.el.getAttribute?.('aria-label') || '', labelText(match.el), href, download
+  ]);
+  let fingerprintHash = 2166136261;
+  for (let index = 0; index < fingerprintInput.length; index += 1) {
+    fingerprintHash ^= fingerprintInput.charCodeAt(index);
+    fingerprintHash = Math.imul(fingerprintHash, 16777619);
+  }
   return {
     found: true,
     x: currentOffset.x + rect.left + rect.width / 2,
     y: currentOffset.y + rect.top + rect.height / 2,
     tag: match.el.tagName.toLowerCase(),
-    text: sensitive ? '' : (match.el.innerText || match.el.textContent || match.el.value || '').trim(),
-    href: match.el.href || match.el.closest?.('a')?.href || '',
-    download: match.el.getAttribute?.('download') || match.el.closest?.('a')?.getAttribute?.('download') || ''
+    text,
+    href,
+    download,
+    fingerprint: `${identity}:${fingerprintHash >>> 0}`,
+    documentFingerprint: stableFingerprint(document, '__piDocumentFingerprint', 'document')
   };
 })(__PI_CLICK_REQUEST__))'''
 
@@ -2202,23 +2241,7 @@ class BrowserWorker:
             profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
             try:
-                default_dir = profile / 'Default'
-                default_dir.mkdir(parents=True, exist_ok=True)
-                prefs_file = default_dir / 'Preferences'
-                prefs = {}
-                if prefs_file.is_file():
-                    try:
-                        prefs = json.loads(prefs_file.read_text())
-                    except Exception:
-                        pass
-                p_prof = prefs.setdefault('profile', {})
-                p_prof['exit_type'] = 'Normal'
-                p_prof['exited_cleanly'] = True
-                prefs['exit_type'] = 'Normal'
-                prefs['exited_cleanly'] = True
-                prefs.setdefault('translate', {})['enabled'] = False
-                prefs['translate_blocked_languages'] = ['en', 'zh-TW', 'zh-CN', 'zh', 'ja']
-                prefs_file.write_text(json.dumps(prefs))
+                ensure_profile_preferences(profile)
             except Exception:
                 pass
             try:
@@ -2229,13 +2252,18 @@ class BrowserWorker:
                     '--start-maximized',
                     '--window-position=0,0',
                     f'--window-size={window_size}',
-                    '--disable-features=Translate',
+                    '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,PasswordLeakDetection',
                     '--disable-session-crashed-bubble',
                     '--hide-crash-restore-bubble',
                     '--simulate-outdated-no-au=Tue, 31 Dec 2099 23:59:59 GMT',
                     '--check-for-update-interval=31536000',
                     '--no-first-run',
                     '--no-default-browser-check',
+                    '--password-store=basic',
+                    '--disable-save-password-bubble',
+                    '--disable-single-click-autofill',
+                    '--disable-search-engine-choice-screen',
+                    '--deny-permission-prompts',
                 ]
                 if ext_path.is_dir():
                     b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
@@ -3852,6 +3880,181 @@ class BrowserWorker:
         except Exception:
             return False
 
+    async def native_touch_drift(
+        self, page, x, y, duration_ms, delta_x, delta_y, steps=20, capture_midway=False,
+        before_dispatch=None,
+    ):
+        """Dispatch a deterministic touch-only minimum-jerk hold and drift."""
+        loop = asyncio.get_running_loop()
+        invoked_at = loop.time()
+        duration_seconds = duration_ms / 1000.0
+        setup_deadline = invoked_at + TOUCH_GESTURE_OVERHEAD_TIMEOUT_SECONDS
+        overall_deadline = setup_deadline + duration_seconds
+
+        async def await_bounded_operation(awaitable, operation, deadline):
+            """Bound an await without waiting indefinitely for cancellation-resistant work."""
+            task = asyncio.create_task(awaitable)
+            timeout = min(
+                TOUCH_OPERATION_TIMEOUT_SECONDS,
+                max(0.0, deadline - loop.time()),
+            )
+            try:
+                _done, pending = await asyncio.wait({task}, timeout=timeout)
+            except BaseException:
+                task.cancel()
+                if task.done():
+                    try:
+                        task.result()
+                    except BaseException:
+                        pass
+                else:
+                    task.add_done_callback(self.consume_background_image_task)
+                raise
+            if pending:
+                task.cancel()
+                # Give cancellation-aware work one turn to settle, but never let
+                # cancellation-resistant setup or CDP work extend the deadline.
+                await asyncio.sleep(0)
+                if task.done():
+                    try:
+                        task.result()
+                    except BaseException:
+                        pass
+                else:
+                    task.add_done_callback(self.consume_background_image_task)
+                raise asyncio.TimeoutError(f'{operation} timed out')
+            return task.result()
+
+        # Setup has its own cumulative deadline and is deliberately outside the
+        # touch cleanup region: no touchEnd is sent unless touchStart is attempted.
+        await await_bounded_operation(page.bring_to_front(), 'bring-to-front setup', setup_deadline)
+        viewport = await await_bounded_operation(
+            self.vision_page_state(page), 'viewport lookup setup', setup_deadline
+        )
+        viewport_width = float(viewport.visual_width or viewport.width)
+        viewport_height = float(viewport.visual_height or viewport.height)
+        if not all(math.isfinite(value) and value > 0 for value in (viewport_width, viewport_height)):
+            raise ValueError('touch drift requires a finite, positive visual viewport')
+
+        def clamp_point(point_x, point_y):
+            return (
+                min(max(float(point_x), 0.0), max(0.0, viewport_width - 1.0)),
+                min(max(float(point_y), 0.0), max(0.0, viewport_height - 1.0)),
+            )
+
+        offsets = generate_minimum_jerk_offsets(delta_x, delta_y, steps)
+        midway_path = None
+        midway_attempted = False
+        midway_step = max(1, math.ceil(steps * 0.5))
+        origin_x, origin_y = float(x), float(y)
+        if before_dispatch is not None:
+            fresh_target = await await_bounded_operation(
+                before_dispatch(), 'before-dispatch revalidation setup', setup_deadline
+            )
+            if fresh_target is not None:
+                try:
+                    origin_x = float(fresh_target['x'])
+                    origin_y = float(fresh_target['y'])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError('touch drift revalidation returned invalid coordinates') from error
+                if not all(math.isfinite(value) for value in (origin_x, origin_y)):
+                    raise ValueError('touch drift revalidation returned invalid coordinates')
+                if clamp_point(origin_x, origin_y) != (origin_x, origin_y):
+                    raise ValueError('touch drift revalidation returned out-of-viewport coordinates')
+        start_x, start_y = clamp_point(origin_x, origin_y)
+        start = uc.cdp.input_.TouchPoint(
+            x=start_x, y=start_y, radius_x=8, radius_y=8, force=0.5, id_=1
+        )
+
+        async def await_touch_operation(awaitable, operation):
+            """Bound one gesture await by both its own and the end-to-end deadline."""
+            return await await_bounded_operation(awaitable, operation, overall_deadline)
+
+        async def finish_touch(*, suppress_failure):
+            cleanup = asyncio.create_task(page.send(
+                uc.cdp.input_.dispatch_touch_event(type_='touchEnd', touch_points=[])
+            ))
+            deadline = asyncio.create_task(asyncio.wait(
+                {cleanup}, timeout=TOUCH_END_CLEANUP_TIMEOUT_SECONDS
+            ))
+            pending_cancellation = None
+            while not deadline.done():
+                try:
+                    await asyncio.shield(deadline)
+                except asyncio.CancelledError as error:
+                    pending_cancellation = error
+
+            _done, pending = deadline.result()
+            cleanup_failure = None
+            if pending:
+                cleanup.cancel()
+                try:
+                    # Give a cancellation-aware CDP send one turn to settle, without
+                    # allowing a cancellation-resistant send to extend the deadline.
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError as error:
+                    pending_cancellation = error
+                if cleanup.done():
+                    try:
+                        cleanup.result()
+                    except BaseException:
+                        pass
+                else:
+                    cleanup.add_done_callback(self.consume_background_image_task)
+                cleanup_failure = asyncio.TimeoutError('touchEnd cleanup timed out')
+            else:
+                try:
+                    cleanup.result()
+                except BaseException as error:
+                    cleanup_failure = error
+
+            if pending_cancellation is not None:
+                raise pending_cancellation
+            if cleanup_failure is not None and not suppress_failure:
+                raise cleanup_failure
+
+        try:
+            touch_started_at = loop.time()
+            await await_touch_operation(
+                page.send(uc.cdp.input_.dispatch_touch_event(
+                    type_='touchStart', touch_points=[start]
+                )),
+                'touchStart',
+            )
+            for step, (offset_x, offset_y) in enumerate(offsets[1:], start=1):
+                remaining = touch_started_at + duration_seconds * step / steps - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                point_x, point_y = clamp_point(origin_x + offset_x, origin_y + offset_y)
+                point = uc.cdp.input_.TouchPoint(
+                    x=point_x, y=point_y,
+                    radius_x=8, radius_y=8, force=0.5, id_=1,
+                )
+                await await_touch_operation(
+                    page.send(uc.cdp.input_.dispatch_touch_event(
+                        type_='touchMove', touch_points=[point]
+                    )),
+                    'touchMove',
+                )
+                if capture_midway and not midway_attempted and step >= midway_step:
+                    midway_attempted = True
+                    try:
+                        midway_path = await await_touch_operation(
+                            self.save_viewport_screenshot(
+                                page, 'pi-nodriver-longpress-midway-'
+                            ),
+                            'midway screenshot',
+                        )
+                    except Exception:
+                        pass
+        except BaseException:
+            await finish_touch(suppress_failure=True)
+            raise
+        else:
+            await finish_touch(suppress_failure=False)
+        await page.sleep(0.25)
+        return {'offsets': offsets, 'midwayPath': midway_path}
+
     async def xvfb_mouse_long_press(self, page, x, y, duration_ms=1000, capture_midway=True):
         toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
         screen_x = int(round(float(x)))
@@ -4299,6 +4502,7 @@ class BrowserWorker:
             (action in {'click', 'click-js', 'download', 'download-info'} and len(parts) > 1 and parts[1].startswith('@'))
             or (action in {'fill', 'type', 'select', 'upload'} and len(parts) > 1)
             or (action in {'fill-submit', 'fill_submit'} and len(parts) > 1 and parts[1].startswith('@'))
+            or (action == 'touch-drift' and len(parts) > 1 and parts[1].startswith('@'))
             or (action == 'get' and len(parts) > 2 and parts[2].startswith('@'))
             or (action == 'wait' and len(parts) > 1 and parts[1].startswith('@'))
             or action == 'find-option'
@@ -4409,10 +4613,9 @@ class BrowserWorker:
             self.begin_tab_activity(page)
 
             try:
-                # Enforce iPhone Mobile Mode (Portrait 390x844 with Touch Emulation)
-                ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+                # Keep Chrome's native identity coherent while using a compact touch viewport.
+                # In particular, do not advertise iPhone Safari from a Linux Chromium engine.
                 w, h = 390, 844
-                await page.send(uc.cdp.network.set_user_agent_override(user_agent=ua))
                 await page.send(uc.cdp.emulation.set_device_metrics_override(
                     width=w, height=h, device_scale_factor=3.0, mobile=True
                 ))
@@ -4518,7 +4721,7 @@ class BrowserWorker:
                 }
             snapshot_text = format_snapshot(elements or [])
             return {
-                'text': f'Opened {page.url or parts[1]} (iPhone Mobile Mode 390x844)\n\nInteractive elements on page:\n{snapshot_text}',
+                'text': f'Opened {page.url or parts[1]} (touch-enabled Chrome viewport 390x844)\n\nInteractive elements on page:\n{snapshot_text}',
                 'action': action,
                 'url': page.url or parts[1],
                 'count': len(elements or [])
@@ -5003,21 +5206,32 @@ class BrowserWorker:
                     if current is not None:
                         current.unlink(missing_ok=True)
 
+            delta_x, delta_y, steps = 6.0, -4.0, 24
             try:
-                await verify_preview_immediately_before_long_press()
-            except Exception:
+                touch_result = await self.native_touch_drift(
+                    page,
+                    marker.click_x,
+                    marker.click_y,
+                    duration_ms,
+                    delta_x,
+                    delta_y,
+                    steps,
+                    capture_midway=True,
+                    before_dispatch=verify_preview_immediately_before_long_press,
+                )
+            except (Exception, asyncio.CancelledError):
                 self.vision_guard.invalidate(session_id)
                 raise
-            midway_path = await self.native_long_press(
-                page, marker.click_x, marker.click_y, duration_ms=duration_ms, capture_midway=True
-            )
+            midway_path = touch_result['midwayPath']
+            offsets = touch_result['offsets']
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             midway_info = f'\n📸 Captured live midway snapshot while held down at 50% ({int(duration_ms*0.5)}ms).' if midway_path else ''
             resp = {
                 'text': (
-                    f'Vision-confirmed long press executed at ({marker.x:g}, {marker.y:g}) '
-                    f'for {duration_ms}ms (isTrusted: true).{midway_info}\n'
+                    f'Vision-confirmed touch long press executed at ({marker.x:g}, {marker.y:g}) '
+                    f'for {duration_ms}ms with minimum-jerk drift ΔX={delta_x:g}px, '
+                    f'ΔY={delta_y:g}px over {steps} steps (isTrusted: true).{midway_info}\n'
                     f'URL: {page.url}'
                 ),
                 'action': action,
@@ -5025,6 +5239,11 @@ class BrowserWorker:
                 'x': marker.x,
                 'y': marker.y,
                 'durationMs': duration_ms,
+                'inputType': 'touch',
+                'deltaX': delta_x,
+                'deltaY': delta_y,
+                'steps': steps,
+                'plannedPoints': len(offsets),
             }
             if midway_path:
                 resp['screenshotPath'] = str(midway_path)
@@ -5058,6 +5277,69 @@ class BrowserWorker:
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             return {'text': f'Clicked {parts[1]} ({target.get("tag", "element")}: {target.get("text", "")[:120]})\nURL: {page.url}', 'action': action, 'url': page.url}
+
+        if action == 'touch-drift':
+            page = await self.require_page(session_id)
+            if not is_touch_lab_url(page.url):
+                raise ValueError('TOUCH_LAB_ONLY: touch-drift is restricted to localhost or the owned /touch-trace lab')
+            if len(parts) not in (5, 6) or not parts[1].startswith('@'):
+                raise ValueError('usage: touch-drift @ref <duration> <delta_x_px> <delta_y_px> [steps]')
+            ref = parts[1]
+            duration_ms = parse_duration_ms(parts[2], default_ms=1000)
+            try:
+                delta_x = float(parts[3])
+                delta_y = float(parts[4])
+                steps = int(parts[5]) if len(parts) == 6 else 20
+            except ValueError as error:
+                raise ValueError('touch-drift delta coordinates and steps must be numeric') from error
+            if not all(map(math.isfinite, (delta_x, delta_y))) or abs(delta_x) > 100 or abs(delta_y) > 100:
+                raise ValueError('touch-drift delta must be finite and within ±100px')
+            if steps < 2 or steps > 120:
+                raise ValueError('touch-drift steps must be between 2 and 120')
+            target = await self.resolve_click_target(page, 'ref', ref.removeprefix('@'), session_id)
+            self.semantic_target_resolved(session_id)
+            self.vision_guard.invalidate(session_id)
+            expected_fingerprint = target.get('fingerprint')
+            expected_document = target.get('documentFingerprint')
+            if not expected_fingerprint or not expected_document:
+                raise ValueError('TOUCH_TARGET_CHANGED: initial target identity could not be validated')
+
+            async def revalidate_touch_target_immediately_before_dispatch():
+                fresh_target = await self.resolve_click_target(
+                    page, 'ref', ref.removeprefix('@'), session_id
+                )
+                if not is_touch_lab_url(page.url):
+                    raise ValueError(
+                        'TOUCH_LAB_ONLY: page left the permitted touch-drift lab before dispatch'
+                    )
+                if fresh_target.get('documentFingerprint') != expected_document:
+                    raise ValueError(
+                        'TOUCH_TARGET_CHANGED: page document changed before touch dispatch'
+                    )
+                if fresh_target.get('fingerprint') != expected_fingerprint:
+                    raise ValueError(
+                        'TOUCH_TARGET_CHANGED: target changed before touch dispatch'
+                    )
+                return fresh_target
+
+            touch_result = await self.native_touch_drift(
+                page, target['x'], target['y'], duration_ms, delta_x, delta_y, steps,
+                before_dispatch=revalidate_touch_target_immediately_before_dispatch,
+            )
+            return {
+                'text': (
+                    f'Lab-only touch drift executed on {ref}: requested ΔX={delta_x:g}px, '
+                    f'ΔY={delta_y:g}px over {duration_ms}ms with {steps} minimum-jerk steps.\nURL: {page.url}'
+                ),
+                'action': action,
+                'url': page.url,
+                'ref': ref,
+                'durationMs': duration_ms,
+                'deltaX': delta_x,
+                'deltaY': delta_y,
+                'steps': steps,
+                'plannedPoints': len(touch_result['offsets']),
+            }
 
         if action in ('long-press', 'longpress', 'press-hold'):
             page = await self.require_page(session_id)
@@ -5569,7 +5851,7 @@ class BrowserWorker:
 
 
         if action == 'mobile':
-            raise ValueError("Browser is permanently fixed in iPhone mobile mode (390x844). 'mobile off' is disabled.")
+            raise ValueError("Browser is permanently fixed in touch-enabled compact mode (390x844). 'mobile off' is disabled.")
 
         if action == 'screenshot':
             page = await self.require_page(session_id)

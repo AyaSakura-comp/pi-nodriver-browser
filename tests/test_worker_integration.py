@@ -13,6 +13,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -443,6 +444,924 @@ class VisionScreenshotFailureUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, 'current marked preview'):
             worker.vision_guard.current_marker('session-a', token)
+
+
+class NativeTouchDriftUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def _assert_stalled_setup_times_out_without_touch_end(self, stalled_stage):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        events = []
+        active_stage = None
+
+        class TouchPage:
+            async def bring_to_front(self):
+                nonlocal active_stage
+                active_stage = 'bring_to_front'
+                if stalled_stage == active_stage:
+                    await asyncio.Future()
+                active_stage = None
+
+            async def send(self, event):
+                events.append(event['type_'])
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+
+        async def viewport_state(_page):
+            nonlocal active_stage
+            active_stage = 'vision_page_state'
+            if stalled_stage == active_stage:
+                await asyncio.Future()
+            active_stage = None
+            return VisionPageState(
+                target_id='touch', url='http://localhost/', width=100, height=50,
+                visual_width=100, visual_height=50,
+            )
+
+        async def before_dispatch():
+            nonlocal active_stage
+            active_stage = 'before_dispatch'
+            if stalled_stage == active_stage:
+                await asyncio.Future()
+            active_stage = None
+
+        real_sleep = asyncio.sleep
+
+        async def expire_stalled_stage_immediately(awaitables, *, timeout):
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if active_stage == stalled_stage and not task.done():
+                self.assertGreater(timeout, 0)
+                return set(), {task}
+            await task
+            return {task}, set()
+
+        worker.vision_page_state = AsyncMock(side_effect=viewport_state)
+        expected_operation = {
+            'bring_to_front': 'bring-to-front',
+            'vision_page_state': 'viewport lookup',
+            'before_dispatch': 'before-dispatch revalidation',
+        }[stalled_stage]
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.wait', side_effect=expire_stalled_stage_immediately):
+            with self.assertRaisesRegex(asyncio.TimeoutError, expected_operation):
+                await worker.native_touch_drift(
+                    TouchPage(), 10, 10, 100, 2, 2, steps=2,
+                    before_dispatch=before_dispatch,
+                )
+
+        self.assertEqual(events, [])
+
+    async def test_stalled_bring_to_front_hits_setup_deadline_without_touch_end(self):
+        await self._assert_stalled_setup_times_out_without_touch_end('bring_to_front')
+
+    async def test_stalled_vision_page_state_hits_setup_deadline_without_touch_end(self):
+        await self._assert_stalled_setup_times_out_without_touch_end('vision_page_state')
+
+    async def test_stalled_before_dispatch_hits_setup_deadline_without_touch_end(self):
+        await self._assert_stalled_setup_times_out_without_touch_end('before_dispatch')
+
+    async def test_deadline_absorbs_dispatch_and_screenshot_latency_and_clamps_points(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        clock = [0.0]
+        sleeps = []
+        events = []
+        dispatch_times = []
+        setup = []
+
+        class TouchPage:
+            async def bring_to_front(self):
+                setup.append('front')
+                clock[0] += 0.01
+
+            async def send(self, event):
+                events.append(event)
+                dispatch_times.append((event['type_'], clock[0]))
+                clock[0] += 0.005
+
+            async def sleep(self, _seconds):
+                return None
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        worker = BrowserWorker()
+
+        async def viewport_state(_page):
+            setup.append('viewport')
+            clock[0] += 0.01
+            return VisionPageState(
+                target_id='touch', url='http://localhost/', width=100, height=50,
+                visual_width=100, visual_height=50,
+            )
+
+        worker.vision_page_state = AsyncMock(side_effect=viewport_state)
+
+        async def before_dispatch():
+            setup.append('consume')
+            clock[0] += 0.01
+
+        async def capture_midway(_page, _prefix):
+            clock[0] += 0.03
+            return Path('/tmp/midway.png')
+
+        worker.save_viewport_screenshot = capture_midway
+
+        def touch_point(**kwargs):
+            return kwargs
+
+        def dispatch_touch_event(**kwargs):
+            return kwargs
+
+        fake_loop = SimpleNamespace(time=lambda: clock[0])
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=touch_point), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=dispatch_touch_event), \
+                patch('worker.asyncio.get_running_loop', return_value=fake_loop), \
+                patch('worker.asyncio.sleep', side_effect=fake_sleep):
+            await worker.native_touch_drift(
+                TouchPage(), -2, 49, 100, 106, -100, steps=4,
+                capture_midway=True, before_dispatch=before_dispatch,
+            )
+
+        # Setup and marker consumption finish before the authoritative touchStart.
+        self.assertEqual(setup, ['front', 'viewport', 'consume'])
+        # Every move is sent only after its absolute deadline: midpoint at 50%, endpoint at 100%.
+        move_times = [timestamp for kind, timestamp in dispatch_times if kind == 'touchMove']
+        for actual, expected in zip(move_times, [0.055, 0.08, 0.115, 0.13], strict=True):
+            self.assertAlmostEqual(actual, expected)
+        # Setup time is excluded: the requested hold ends 100ms after touchStart.
+        touch_start_time = next(
+            timestamp for kind, timestamp in dispatch_times if kind == 'touchStart'
+        )
+        self.assertAlmostEqual(move_times[-1] - touch_start_time, 0.1)
+        # Fixed per-step sleeps would add the dispatch/screenshot work to the hold.
+        self.assertLess(sum(sleeps), 0.1)
+        self.assertAlmostEqual(clock[0], 0.14, places=6)
+        touch_events = [event for event in events if event['type_'] != 'touchEnd']
+        points = [event['touch_points'][0] for event in touch_events]
+        self.assertTrue(all(0.0 <= point['x'] <= 99.0 for point in points))
+        self.assertTrue(all(0.0 <= point['y'] <= 49.0 for point in points))
+        self.assertEqual(points[0]['x'], 0.0)
+        self.assertEqual(points[-1]['x'], 99.0)
+        self.assertEqual(points[-1]['y'], 0.0)
+        self.assertEqual(events[-1], {'type_': 'touchEnd', 'touch_points': []})
+
+    async def test_stalled_touch_start_times_out_and_runs_touch_end_cleanup(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker, TOUCH_OPERATION_TIMEOUT_SECONDS
+
+        events = []
+        timed_out = set()
+
+        class StalledStartPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event['type_'])
+                if event['type_'] == 'touchStart':
+                    await asyncio.Future()
+
+            async def sleep(self, _seconds):
+                return None
+
+        real_sleep = asyncio.sleep
+
+        async def deterministic_wait(awaitables, *, timeout):
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if events and events[-1] == 'touchStart' and not task.done() and 'touchStart' not in timed_out:
+                timed_out.add('touchStart')
+                self.assertLessEqual(timeout, TOUCH_OPERATION_TIMEOUT_SECONDS)
+                return set(), {task}
+            await task
+            return {task}, set()
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.wait', side_effect=deterministic_wait):
+            with self.assertRaisesRegex(asyncio.TimeoutError, 'touchStart'):
+                await worker.native_touch_drift(StalledStartPage(), 10, 10, 0, 2, 2, steps=1)
+
+        self.assertEqual(events, ['touchStart', 'touchEnd'])
+
+    async def test_stalled_touch_move_times_out_and_runs_touch_end_cleanup(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker, TOUCH_OPERATION_TIMEOUT_SECONDS
+
+        events = []
+        timed_out = False
+
+        class StalledMovePage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event['type_'])
+                if event['type_'] == 'touchMove':
+                    await asyncio.Future()
+
+            async def sleep(self, _seconds):
+                return None
+
+        real_sleep = asyncio.sleep
+
+        async def deterministic_wait(awaitables, *, timeout):
+            nonlocal timed_out
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if events and events[-1] == 'touchMove' and not task.done() and not timed_out:
+                timed_out = True
+                self.assertLessEqual(timeout, TOUCH_OPERATION_TIMEOUT_SECONDS)
+                return set(), {task}
+            await task
+            return {task}, set()
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.wait', side_effect=deterministic_wait):
+            with self.assertRaisesRegex(asyncio.TimeoutError, 'touchMove'):
+                await worker.native_touch_drift(StalledMovePage(), 10, 10, 0, 2, 2, steps=1)
+
+        self.assertEqual(events, ['touchStart', 'touchMove', 'touchEnd'])
+
+    async def test_overall_deadline_caps_later_touch_operations(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        clock = [0.0]
+        events = []
+        operation_timeouts = []
+
+        class StalledMovePage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event['type_'])
+                if event['type_'] == 'touchMove':
+                    await asyncio.Future()
+
+            async def sleep(self, _seconds):
+                return None
+
+        real_sleep = asyncio.sleep
+
+        async def deterministic_wait(awaitables, *, timeout):
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if not events:
+                await task
+                return {task}, set()
+            if events[-1] == 'touchStart':
+                operation_timeouts.append(timeout)
+                clock[0] = 0.1
+                return {task}, set()
+            if events[-1] == 'touchMove' and not task.done():
+                operation_timeouts.append(timeout)
+                return set(), {task}
+            await task
+            return {task}, set()
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        fake_loop = SimpleNamespace(time=lambda: clock[0])
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.get_running_loop', return_value=fake_loop), \
+                patch('worker.asyncio.wait', side_effect=deterministic_wait), \
+                patch('worker.TOUCH_GESTURE_OVERHEAD_TIMEOUT_SECONDS', 0.1):
+            with self.assertRaisesRegex(asyncio.TimeoutError, 'touchMove'):
+                await worker.native_touch_drift(StalledMovePage(), 10, 10, 0, 2, 2, steps=1)
+
+        self.assertEqual(operation_timeouts, [0.1, 0.0])
+        self.assertEqual(events, ['touchStart', 'touchMove', 'touchEnd'])
+
+    async def test_stalled_midway_screenshot_times_out_and_gesture_continues(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker, TOUCH_OPERATION_TIMEOUT_SECONDS
+
+        events = []
+        screenshot_started = False
+        screenshot_timed_out = False
+
+        class TouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event['type_'])
+
+            async def sleep(self, _seconds):
+                return None
+
+        async def stalled_screenshot(_page, _prefix):
+            nonlocal screenshot_started
+            screenshot_started = True
+            await asyncio.Future()
+
+        real_sleep = asyncio.sleep
+
+        async def deterministic_wait(awaitables, *, timeout):
+            nonlocal screenshot_timed_out
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if screenshot_started and not task.done() and not screenshot_timed_out:
+                screenshot_timed_out = True
+                self.assertLessEqual(timeout, TOUCH_OPERATION_TIMEOUT_SECONDS)
+                return set(), {task}
+            await task
+            return {task}, set()
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        worker.save_viewport_screenshot = stalled_screenshot
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.wait', side_effect=deterministic_wait):
+            result = await worker.native_touch_drift(
+                TouchPage(), 10, 10, 0, 2, 2, steps=2, capture_midway=True
+            )
+
+        self.assertTrue(screenshot_timed_out)
+        self.assertIsNone(result['midwayPath'])
+        self.assertEqual(events, ['touchStart', 'touchMove', 'touchMove', 'touchEnd'])
+
+    async def test_touch_start_failure_preserves_original_exception(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        events = []
+        original = RuntimeError('touchStart failed')
+
+        class FailingStartPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event)
+                if event['type_'] == 'touchStart':
+                    raise original
+                if event['type_'] == 'touchEnd':
+                    raise RuntimeError('touchEnd also failed')
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            with self.assertRaises(RuntimeError) as raised:
+                await worker.native_touch_drift(FailingStartPage(), 10, 10, 100, 2, 2, steps=2)
+
+        self.assertIs(raised.exception, original)
+        self.assertEqual([event['type_'] for event in events], ['touchStart', 'touchEnd'])
+
+    async def test_successful_gesture_propagates_touch_end_failure(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        class FailingEndPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                if event['type_'] == 'touchEnd':
+                    raise RuntimeError('touchEnd failed')
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            with self.assertRaisesRegex(RuntimeError, 'touchEnd failed'):
+                await worker.native_touch_drift(FailingEndPage(), 10, 10, 1, 2, 2, steps=2)
+
+    async def test_before_dispatch_fresh_coordinates_are_used_for_touch_events(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        events = []
+
+        class TouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event)
+
+            async def sleep(self, _seconds):
+                return None
+
+        async def fresh_target():
+            return {'x': 30.0, 'y': 40.0}
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=80,
+            visual_width=100, visual_height=80,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            await worker.native_touch_drift(
+                TouchPage(), 10, 20, 1, 2, 3, steps=2, before_dispatch=fresh_target
+            )
+
+        dispatched = [event for event in events if event['type_'] != 'touchEnd']
+        self.assertEqual(dispatched[0]['touch_points'][0]['x'], 30.0)
+        self.assertEqual(dispatched[0]['touch_points'][0]['y'], 40.0)
+        self.assertEqual(dispatched[-1]['touch_points'][0]['x'], 32.0)
+        self.assertEqual(dispatched[-1]['touch_points'][0]['y'], 43.0)
+
+    async def test_touch_end_is_dispatched_when_a_move_fails(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        events = []
+
+        class FailingTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                events.append(event)
+                if event['type_'] == 'touchMove':
+                    raise RuntimeError('move failed')
+                if event['type_'] == 'touchEnd':
+                    raise RuntimeError('cleanup failed')
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            with self.assertRaisesRegex(RuntimeError, 'move failed'):
+                await worker.native_touch_drift(FailingTouchPage(), 10, 10, 100, 2, 2, steps=2)
+
+        self.assertEqual(events[-1], {'type_': 'touchEnd', 'touch_points': []})
+
+    async def test_task_cancellation_waits_for_touch_end_then_propagates(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        move_started = asyncio.Event()
+        end_started = asyncio.Event()
+        release_end = asyncio.Event()
+
+        class BlockingTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                if event['type_'] == 'touchMove':
+                    move_started.set()
+                    await asyncio.Future()
+                if event['type_'] == 'touchEnd':
+                    end_started.set()
+                    await release_end.wait()
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            gesture = asyncio.create_task(
+                worker.native_touch_drift(BlockingTouchPage(), 10, 10, 1, 2, 2, steps=2)
+            )
+            await move_started.wait()
+            gesture.cancel()
+            await end_started.wait()
+            self.assertFalse(gesture.done())
+            release_end.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await gesture
+
+    async def test_cancellation_during_delivered_touch_start_waits_for_touch_end(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        start_delivered = asyncio.Event()
+        end_started = asyncio.Event()
+        release_end = asyncio.Event()
+        end_completed = False
+
+        class BlockingStartTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                nonlocal end_completed
+                if event['type_'] == 'touchStart':
+                    start_delivered.set()
+                    await asyncio.Future()
+                if event['type_'] == 'touchEnd':
+                    end_started.set()
+                    await release_end.wait()
+                    end_completed = True
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            gesture = asyncio.create_task(
+                worker.native_touch_drift(BlockingStartTouchPage(), 10, 10, 1, 2, 2, steps=2)
+            )
+            await start_delivered.wait()
+            gesture.cancel()
+            try:
+                await asyncio.wait_for(end_started.wait(), timeout=0.5)
+                self.assertFalse(gesture.done())
+            finally:
+                release_end.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await gesture
+            self.assertTrue(end_completed)
+
+    async def test_permanently_blocked_touch_end_stops_at_cleanup_deadline(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker, TOUCH_END_CLEANUP_TIMEOUT_SECONDS
+
+        wait_timeouts = []
+        cleanup_cancelled = asyncio.Event()
+
+        class BlockingEndTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                if event['type_'] == 'touchEnd':
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        cleanup_cancelled.set()
+
+            async def sleep(self, _seconds):
+                return None
+
+        real_sleep = asyncio.sleep
+
+        async def expire_blocked_cleanup_immediately(awaitables, *, timeout):
+            task = next(iter(awaitables))
+            await real_sleep(0)
+            if task.done():
+                return {task}, set()
+            wait_timeouts.append(timeout)
+            return set(), {task}
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.asyncio.wait', side_effect=expire_blocked_cleanup_immediately):
+            with self.assertRaises(asyncio.TimeoutError):
+                await worker.native_touch_drift(BlockingEndTouchPage(), 10, 10, 1, 2, 2, steps=1)
+
+        self.assertEqual(wait_timeouts, [TOUCH_END_CLEANUP_TIMEOUT_SECONDS])
+        self.assertTrue(cleanup_cancelled.is_set())
+
+    async def test_cancellation_during_cleanup_wins_over_prior_gesture_error(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class FailingThenBlockingTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                if event['type_'] == 'touchMove':
+                    raise RuntimeError('move failed')
+                if event['type_'] == 'touchEnd':
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            gesture = asyncio.create_task(
+                worker.native_touch_drift(
+                    FailingThenBlockingTouchPage(), 10, 10, 1, 2, 2, steps=1
+                )
+            )
+            await cleanup_started.wait()
+            gesture.cancel()
+            release_cleanup.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await gesture
+
+    async def test_touch_end_failure_does_not_mask_original_cancellation(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        class CancellingTouchPage:
+            async def bring_to_front(self):
+                return None
+
+            async def send(self, event):
+                if event['type_'] == 'touchMove':
+                    raise asyncio.CancelledError()
+                if event['type_'] == 'touchEnd':
+                    raise RuntimeError('cleanup failed')
+
+            async def sleep(self, _seconds):
+                return None
+
+        worker = BrowserWorker()
+        worker.vision_page_state = AsyncMock(return_value=VisionPageState(
+            target_id='touch', url='http://localhost/', width=100, height=50,
+            visual_width=100, visual_height=50,
+        ))
+        with patch('worker.uc.cdp.input_.TouchPoint', side_effect=lambda **kwargs: kwargs), \
+                patch('worker.uc.cdp.input_.dispatch_touch_event', side_effect=lambda **kwargs: kwargs):
+            with self.assertRaises(asyncio.CancelledError):
+                await worker.native_touch_drift(CancellingTouchPage(), 10, 10, 100, 2, 2, steps=2)
+
+
+class TouchDriftCommandUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revalidates_lab_url_after_resolution_before_dispatch(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'touch')
+        page.url = 'http://localhost/touch-trace'
+        worker.pages['session-a'] = page
+
+        async def resolve_target(*_args):
+            page.url = 'https://evil.example/'
+            return {
+                'x': 10.0, 'y': 20.0,
+                'fingerprint': 'element-a', 'documentFingerprint': 'document-a',
+            }
+
+        async def run_native(*_args, before_dispatch=None, **_kwargs):
+            await before_dispatch()
+            self.fail('touch dispatch should have been blocked')
+
+        worker.resolve_click_target = AsyncMock(side_effect=resolve_target)
+        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+        worker.semantic_target_resolved = Mock()
+        worker.vision_guard.invalidate = Mock()
+
+        with self.assertRaisesRegex(ValueError, 'page left the permitted touch-drift lab'):
+            await worker._execute('touch-drift @e1 100ms 2 3 4', session_id='session-a')
+
+        worker.semantic_target_resolved.assert_called_once_with('session-a')
+        worker.vision_guard.invalidate.assert_called_once_with('session-a')
+
+    async def test_same_url_document_replacement_before_dispatch_is_rejected(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'touch')
+        page.url = 'http://localhost/touch-trace'
+        worker.pages['session-a'] = page
+        targets = [
+            {'x': 10.0, 'y': 20.0, 'fingerprint': 'element-a', 'documentFingerprint': 'document-a'},
+            {'x': 10.0, 'y': 20.0, 'fingerprint': 'element-a', 'documentFingerprint': 'document-b'},
+        ]
+        worker.resolve_click_target = AsyncMock(side_effect=targets)
+
+        async def run_native(*_args, before_dispatch=None, **_kwargs):
+            await before_dispatch()
+            self.fail('touch dispatch should have been blocked')
+
+        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+        worker.semantic_target_resolved = Mock()
+        worker.vision_guard.invalidate = Mock()
+
+        with self.assertRaisesRegex(ValueError, 'document changed'):
+            await worker._execute('touch-drift @e1 100ms 2 3 4', session_id='session-a')
+
+        self.assertEqual(worker.resolve_click_target.await_count, 2)
+        worker.semantic_target_resolved.assert_called_once_with('session-a')
+        worker.vision_guard.invalidate.assert_called_once_with('session-a')
+
+    async def test_ref_removed_before_dispatch_uses_stale_ref_guard(self):
+        from worker import BrowserWorker, StaleRefError
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'touch')
+        page.url = 'http://localhost/touch-trace'
+        worker.pages['session-a'] = page
+        initial = {
+            'x': 10.0, 'y': 20.0,
+            'fingerprint': 'element-a', 'documentFingerprint': 'document-a',
+        }
+
+        async def resolve_target(*_args):
+            if worker.resolve_click_target.await_count == 1:
+                return initial
+            raise worker.stale_ref_error('session-a', '@e1')
+
+        worker.resolve_click_target = AsyncMock(side_effect=resolve_target)
+
+        async def run_native(*_args, before_dispatch=None, **_kwargs):
+            await before_dispatch()
+            self.fail('touch dispatch should have been blocked')
+
+        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+        worker.semantic_target_resolved = Mock()
+        worker.vision_guard.invalidate = Mock()
+
+        with self.assertRaisesRegex(StaleRefError, '@e1'):
+            await worker._execute('touch-drift @e1 100ms 2 3 4', session_id='session-a')
+
+        self.assertIn('session-a', worker.snapshot_required_sessions)
+        worker.semantic_target_resolved.assert_called_once_with('session-a')
+        worker.vision_guard.invalidate.assert_called_once_with('session-a')
+
+    async def test_same_ref_reassigned_before_dispatch_is_rejected(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'touch')
+        page.url = 'http://localhost/touch-trace'
+        worker.pages['session-a'] = page
+        targets = [
+            {'x': 10.0, 'y': 20.0, 'fingerprint': 'element-a', 'documentFingerprint': 'document-a'},
+            {'x': 10.0, 'y': 20.0, 'fingerprint': 'element-b', 'documentFingerprint': 'document-a'},
+        ]
+        worker.resolve_click_target = AsyncMock(side_effect=targets)
+
+        async def run_native(*_args, before_dispatch=None, **_kwargs):
+            await before_dispatch()
+            self.fail('touch dispatch should have been blocked')
+
+        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+        worker.semantic_target_resolved = Mock()
+        worker.vision_guard.invalidate = Mock()
+
+        with self.assertRaisesRegex(ValueError, 'target changed'):
+            await worker._execute('touch-drift @e1 100ms 2 3 4', session_id='session-a')
+
+        self.assertEqual(worker.resolve_click_target.await_count, 2)
+        worker.semantic_target_resolved.assert_called_once_with('session-a')
+        worker.vision_guard.invalidate.assert_called_once_with('session-a')
+
+    async def test_touch_drift_is_blocked_by_stale_ref_and_pure_vision_guards(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.snapshot_required_sessions.add('session-a')
+        with self.assertRaisesRegex(ValueError, 'STALE_REF_GUARD'):
+            await worker._execute('touch-drift @e1 100ms 2 3', session_id='session-a')
+
+        worker.snapshot_required_sessions.clear()
+        with patch.dict(os.environ, {'PI_NODRIVER_VISION_ONLY': '1'}):
+            with self.assertRaisesRegex(ValueError, 'Pure Vision Mode'):
+                await worker._execute('touch-drift @e1 100ms 2 3', session_id='session-a')
+
+
+class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vision_long_press_uses_minimum_jerk_touch_drift(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'vision-touch')
+        worker.pages['session-a'] = page
+        marker = SimpleNamespace(
+            token='0123456789abcdef01234567',
+            x=120.0,
+            y=240.0,
+            click_x=118.0,
+            click_y=164.0,
+        )
+        state = VisionPageState(
+            target_id='vision-touch',
+            url=page.url,
+            width=390,
+            height=844,
+            visual_width=390,
+            visual_height=844,
+        )
+
+        worker.vision_guard.current_marker = Mock(return_value=marker)
+        worker.vision_guard.consume_marker = Mock()
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.configure_download_session = AsyncMock()
+        worker.track_clicked_page = AsyncMock(return_value=page)
+        async def run_native(*_args, before_dispatch=None, **_kwargs):
+            self.assertIsNotNone(before_dispatch)
+            worker.vision_guard.consume_marker.assert_not_called()
+            await before_dispatch()
+            return {
+                'offsets': [(0.0, 0.0), (6.0, -4.0)],
+                'midwayPath': None,
+            }
+
+        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            screenshot = Path(temp_dir) / 'verify.png'
+            screenshot.write_bytes(b'verified-frame')
+            worker.save_viewport_screenshot = AsyncMock(return_value=screenshot)
+            result = await worker._execute(
+                f'vision-long-press {marker.token} 1200ms',
+                session_id='session-a',
+            )
+
+        worker.native_touch_drift.assert_awaited_once_with(
+            page,
+            marker.click_x,
+            marker.click_y,
+            1200,
+            6.0,
+            -4.0,
+            24,
+            capture_midway=True,
+            before_dispatch=worker.native_touch_drift.await_args.kwargs['before_dispatch'],
+        )
+        worker.vision_guard.consume_marker.assert_called_once()
+        self.assertEqual(result['inputType'], 'touch')
+        self.assertEqual(result['deltaX'], 6.0)
+        self.assertEqual(result['deltaY'], -4.0)
+        self.assertEqual(result['steps'], 24)
+        self.assertEqual(result['plannedPoints'], 2)
+
+    async def test_setup_failure_invalidates_marker_without_consuming_it(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'vision-touch')
+        worker.pages['session-a'] = page
+        marker = SimpleNamespace(
+            token='0123456789abcdef01234567', x=120.0, y=240.0,
+            click_x=118.0, click_y=164.0,
+        )
+        worker.vision_guard.current_marker = Mock(return_value=marker)
+        worker.vision_guard.consume_marker = Mock()
+        worker.vision_guard.invalidate = Mock()
+        worker.configure_download_session = AsyncMock()
+        worker.native_touch_drift = AsyncMock(side_effect=RuntimeError('viewport setup failed'))
+
+        with self.assertRaisesRegex(RuntimeError, 'viewport setup failed'):
+            await worker._execute(
+                f'vision-long-press {marker.token} 1200ms', session_id='session-a'
+            )
+
+        worker.vision_guard.consume_marker.assert_not_called()
+        worker.vision_guard.invalidate.assert_called_with('session-a')
 
 
 class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):

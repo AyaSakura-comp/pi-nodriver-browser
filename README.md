@@ -48,12 +48,12 @@ flowchart TB
 
     subgraph StealthLayer["4. Stealth & Anti-Bot Subsystem"]
         ENGINE --> STEALTH_EXT["stealth-extension (Chrome Manifest V3)"]
-        STEALTH_EXT --> S_STEALTH["stealth.js\n- WebGL NVIDIA RTX 4070 Spoof\n- navigator.webdriver Removal\n- window.chrome Runtime Mock\n- Plugins & Permissions Injections"]
+        STEALTH_EXT --> S_STEALTH["stealth.js\n- Native WebGL & Plugin Fingerprints\n- navigator.webdriver Removal\n- window.chrome Runtime Mock\n- Language & Permissions Normalization"]
         STEALTH_EXT --> S_SOLVER["turnstile_solver.js\n- Shadow DOM Inspection\n- Cloudflare Turnstile Auto-Click\n- Human-like Bezier Pointer Events"]
     end
 
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
-        ENGINE -->|"Interactive Mode (iPhone / 500x1000)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Interactive Mode (390x844 touch viewport / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
         TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
         TABS_POOL --> CHROME
@@ -72,7 +72,7 @@ flowchart TB
 #### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
 Integrated directly into Chrome via `--load-extension` to reduce common automation fingerprints and detect challenge widgets. It does not solve visual hCaptcha challenges or use third-party CAPTCHA bypass services; unresolved challenges require human completion before the agent resumes.
 * **`stealth.js`**:
-  * **WebGL Hardware Spoofing**: Overrides WebGL `UNMASKED_VENDOR_WEBGL` and `UNMASKED_RENDERER_WEBGL` from software/Mesa drivers to `Google Inc. (NVIDIA)` / `NVIDIA GeForce RTX 4070 Direct3D11`.
+  * **Coherent Native Fingerprints**: Preserves Chrome's real WebGL renderer, plugin list, and user agent rather than mixing an iPhone Safari identity with desktop NVIDIA/Windows values.
   * **Bot Flag Erasure**: Completely removes `navigator.webdriver` and normalizes `navigator.plugins`, `navigator.languages` (`zh-TW`, `en-US`), and `Notification.permission`.
   * **Runtime Consistency**: Injects authentic `window.chrome.runtime`, `window.chrome.csi`, and `window.chrome.loadTimes` structures.
 * **`turnstile_solver.js`**:
@@ -247,7 +247,7 @@ Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Ea
 * **Multi-Directional Queries**: Dispatches up to **4 directional queries in parallel** (e.g. official docs, troubleshooting, benchmark comparisons) in a single turn via `google-search <json>`.
 * **Zero External API Cost & Ultra-Low Latency**: Directly leverages persistent Chromium inside Xvfb with hardware stealth, achieving **~0.82s median latency**.
 * **Clean DOM Card Extraction**: Evaluates `GOOGLE_RESULTS_JS` directly on the rendered Google SERP to extract un-redirected URLs, `h3` titles, and clean snippets (`[data-sncf="1"], .VwiC3b`).
-* **Stealth & Anti-Bot Protection**: Backed by `stealth.js` (WebGL RTX 4070 spoofing, bot flag removal) with automated interception of `unusual traffic` / `verify you are human` challenges.
+* **Stealth & Anti-Bot Protection**: Backed by `stealth.js` (coherent native WebGL/plugins, bot flag removal) with automated interception of `unusual traffic` / `verify you are human` challenges.
 * **Balanced Diversity Re-ranking**: Uses `select_diverse_search_results` to interleave multi-direction results and deliver a balanced Top 10 to the agent context.
 
 ---
@@ -408,7 +408,7 @@ gantt
 | # | Use Case & Task Scenario | `pi-nodriver-browser` | `Firecrawl API` | `Gemini / Cloud Browser` | Key Architectural Advantage |
 |---|---|---|---|---|---|
 | 1 | **PChome 24h Cart Addition** (Search '牙膏' -> Add to Cart -> Verify) | **75.8s (100% Success)** | ❌ Unsupported (Read-only) | ⚠️ 145.2s (Slow click loops) | Atomic `fill-submit` & Smart Cart Resolution |
-| 2 | **Cloudflare Turnstile Protected Site** (Bypass & Extract Data) | **0.82s (100% Success)** | ⚠️ 8.90s (50% block rate) | ❌ Stalled on Cloudflare Challenge | Integrated `stealth-extension` + WebGL Spoofing |
+| 2 | **Cloudflare Turnstile Protected Site** (Bypass & Extract Data) | **0.82s (100% Success)** | ⚠️ 8.90s (50% block rate) | ❌ Stalled on Cloudflare Challenge | Integrated `stealth-extension` + coherent browser fingerprint |
 | 3 | **Postimages Direct Image Upload** (Local PNG -> CDN Link) | **1.85s (100% Success)** | ❌ Unsupported (No local upload) | ❌ Unsupported | Native CDP `DOM.setFileInputFiles` Injection |
 | 4 | **Multi-File Batch Attachment** (Upload 2 PDFs simultaneously) | **1.20s (100% Success)** | ❌ Unsupported | ❌ Unsupported | Batch multi-path file input resolver |
 | 5 | **Gemini / Chat SPA Nested Scroll** (Scroll fixed overflow-y container) | **0.42s (100% Success)** | ❌ Truncated content | ⚠️ Stalled (Window scroll deadlocks) | Smart Nested Container Penetration + 100% Boundary |
@@ -420,7 +420,7 @@ gantt
 | 11 | **Infinite Scroll Long Article** (Load lazy images and deep text) | **0.65s (100% Success)** | ⚠️ Truncated to first viewport | 14.2s (Repeated manual scrolls) | `scroll bottom` instant container teleportation |
 | 12 | **PDF File Direct Download & Text Read** (Trigger download -> Extract) | **0.90s (100% Success)** | ⚠️ Raw binary URL | ❌ Download prompt block | CDP `DownloadWillBegin` + local `pdftotext` |
 | 13 | **Dropdown Selection & Filtering** (Select region / product spec) | **0.25s (100% Success)** | ❌ Unsupported | 7.50s | Synthetic `change` + `input` event dispatch |
-| 14 | **Anti-Bot Fingerprint Scanner** (BrowserScan / Incolumitas Test) | **100/100 (Pass)** | 62/100 (Headless flags) | 70/100 (Datacenter IP flagged) | RTX 4070 WebGL Spoof & `navigator.webdriver` removal |
+| 14 | **Anti-Bot Fingerprint Scanner** (BrowserScan / Incolumitas Test) | **100/100 (Pass)** | 62/100 (Headless flags) | 70/100 (Datacenter IP flagged) | Native WebGL/plugins & `navigator.webdriver` removal |
 | 15 | **Dense Technical Article Crawl** (Wikipedia / Arxiv markdown) | **0.32s (100% Success)** | 2.80s | 6.40s | Direct `innerText` high-density token extraction |
 | 16 | **High Speed Rail Ticket Search** (Form fill with dates -> View seats)| **1.40s (100% Success)** | ❌ Unsupported (Dynamic form) | ⚠️ 32.0s (Timeout on calendar) | Atomic input typing & fast keyboard event dispatch |
 
@@ -457,7 +457,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (500x1000 / iPhone) |
+| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (500x1000 / 390x844 touch viewport) |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
@@ -469,7 +469,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
 | **`vision-mark`** | `vision-mark <x> <y>` | Draws a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; returns a one-time preview token | Interactive Tab |
 | **`vision-click`** | `vision-click [preview-token]` | Consumes the visually confirmed marker token and clicks its stored viewport point (hardware click via Xvfb `xdotool`, `isTrusted: true`) | Interactive Tab |
-| **`vision-long-press`** | `vision-long-press [preview-token] [duration]` | **Vision Long Press**: Executes hardware long press at visually confirmed point for `duration` (e.g. `2s`, `1500ms`, `1.5`, default `1000ms`) with micro-drift and live midway snapshot (`isTrusted: true`). | Interactive Tab |
+| **`vision-long-press`** | `vision-long-press [preview-token] [duration]` | **Vision Touch Long Press**: Dispatches a trusted touch hold at the visually confirmed point for `duration` (e.g. `2s`, `1500ms`, `1.5`, default `1000ms`) while following a deterministic minimum-jerk drift of ΔX `+6px` / ΔY `-4px` over 24 steps, with a live midway snapshot. | Interactive Tab |
 | **`vision-mark-drag`** | `vision-mark-drag <start_x> <start_y> <end_x> <end_y>` | Draws a visual drag trajectory (Green start circle ➔ Blue arrow ➔ Red end target) on screenshot for inspection and calibration without executing drag | Interactive Tab |
 | **`vision-drag`** | `vision-drag [preview-token] [duration_ms]` | Executes smooth hardware drag on Xvfb along the visually confirmed trajectory (via `xdotool` interpolation, `isTrusted: true`) | Interactive Tab |
 | **`fill`** | `fill @e6 "text"` | Clears and types only into a text-editable input/textarea/contenteditable ref; `<label>` refs fail closed | Interactive Tab |
@@ -490,8 +490,9 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 1. **Flexible Duration Formats**:
    - Supports seconds (`2s`, `1.5s`, `3.5`), milliseconds (`1500ms`, `2500`), or numeric inputs (values `< 50` are automatically interpreted as seconds, while `>= 50` are milliseconds).
-2. **Human Kinematic Micro-Jitter Drift ($\pm 2$px)**:
-   - During continuous mouse press (`mousedown` active state), the cursor performs natural micro-movements within a $\pm 2$px radius every 50–90ms. This prevents anti-bot heuristics (Cloudflare Turnstile, DataDome) from detecting robotic static holds without leaving the target button area.
+2. **Human Kinematic Drift**:
+   - DOM `long-press` retains subtle random mouse micro-movements within a $\pm 2$px radius.
+   - `vision-long-press` uses native trusted touch events and a deterministic minimum-jerk path from the marked point to ΔX `+6px` / ΔY `-4px` over 24 steps, matching the validated touch trace.
 3. **Live Midway Snapshot Capture (50% Checkpoint)**:
    - Captures an instant non-intrusive X11 snapshot exactly halfway through the hold duration while `mousedown` remains active. The screenshot is automatically attached to the tool response (`screenshotPath`), enabling the Agent to visually verify charging bars, hold-to-reveal modals, or radial menus.
 4. **Daemon Self-Healing & Transparent Reconnection**:
@@ -512,7 +513,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
   - **運作機制**：透過 Chrome Blink CDP 引擎在記憶體中拼接長圖，不提供 X11 物理座標（不能用於座標點擊）。
 - **原生 Chrome UI 彈窗淨化**：
   - 預設注入 `--simulate-outdated-no-au="Tue, 31 Dec 2099 23:59:59 GMT"` 與 `--check-for-update-interval=31536000`，徹底防止 Chrome 跳出「Can't update Chrome / Relaunch to update」原生桌面氣泡彈窗遮擋右上角頁面內容與選單。
-  - 搭配 `--disable-session-crashed-bubble`、`--hide-crash-restore-bubble` 與 `--disable-features=Translate`，確保視窗畫面 100% 專注於網頁目標內容。
+  - **全面抑制儲存密碼與自動填入彈窗**：透過 profile Preferences 預先寫入 `credentials_enable_service: false`、`password_manager_enabled: false`、`password_manager_leak_detection: false`、以及關閉 `autofill`（表單、地址、信用卡），並搭配啟動參數 `--password-store=basic`、`--disable-save-password-bubble`、`--disable-single-click-autofill`，杜絕登入或填表時出現「Save password?」或自動填入下拉選單遮擋網頁畫面。
+  - **封鎖系統與權限提示**：搭配 `--deny-permission-prompts`（自動拒絕通知與地理位置請求）、`--disable-search-engine-choice-screen`、`--disable-session-crashed-bubble`、`--hide-crash-restore-bubble` 與 `--disable-features=Translate`，確保視窗畫面 100% 專注於網頁目標內容。
 
 ---
 
@@ -520,13 +522,13 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Variable | Default | Description |
 |---|---|---|
-| `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + iPhone viewport without clipping). |
+| `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + 390x844 touch viewport without clipping). |
 | `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
-| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px human-like micro-drift / pressure wobble during long press to emulate natural human touch/pointer kinematics. |
+| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM `long-press`; `vision-long-press` instead uses its fixed 24-step native-touch minimum-jerk path. |
 | `PI_NODRIVER_LONG_PRESS_JITTER_PX` | `2.0` | Maximum radius (in pixels) for human micro-jitter drift during long-press holding. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
 | `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |

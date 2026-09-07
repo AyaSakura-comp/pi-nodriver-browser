@@ -65,6 +65,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('--hide-crash-restore-bubble', worker_source)
             self.assertIn('--simulate-outdated-no-au', worker_source)
             self.assertIn('--check-for-update-interval', worker_source)
+            self.assertIn('--password-store=basic', worker_source)
+            self.assertIn('--disable-save-password-bubble', worker_source)
+            self.assertIn('--deny-permission-prompts', worker_source)
+            self.assertIn('ensure_profile_preferences', worker_source)
             native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
             self.assertIn('minimum_settle_seconds = 0.1', native_click)
             self.assertIn('maximum_settle_seconds = 0.5', native_click)
@@ -73,6 +77,16 @@ class InstallerTests(unittest.TestCase):
             updated = json.loads(settings.read_text())
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
+
+    def test_mobile_profile_does_not_mix_iphone_safari_with_desktop_spoofs(self):
+        worker_source = (ROOT / 'worker.py').read_text()
+        stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()
+        open_action = worker_source.split("        if action == 'open':", 1)[1].split("        if action == 'mobile':", 1)[0]
+
+        self.assertNotIn('iPhone OS', open_action)
+        self.assertNotIn('set_user_agent_override', open_action)
+        self.assertNotIn('NVIDIA GeForce RTX 4070', stealth_source)
+        self.assertNotIn('fakePlugins', stealth_source)
 
     def test_ref_guidance_uses_literal_examples_and_never_teaches_angle_wrapped_refs(self):
         extension_source = (ROOT / 'index.ts').read_text()
