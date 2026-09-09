@@ -25,7 +25,7 @@ function parseGettimeValue(value: string): number | undefined {
   return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
-const DESCRIPTION = `Autonomous live browser automation (compact touch-enabled Chrome viewport 390x844).
+const DESCRIPTION = `Autonomous live browser automation (Android Chrome mobile viewport 390x844; touch emulation off by default). Strong CAPTCHA, challenge, access-denied, or 429 signals trigger one automatic retry in a fresh native Linux Chrome target.
 ROUTING GUIDELINES:
 - WHEN TO USE BROWSER: Automatically invoke this tool when the user request requires live web data, real-time e-commerce pricing/promotions (MOMO, PChome, Amazon, Shopee), current stock availability, real-time exchange rates/schedules, dynamic web portals, interactive form submissions, UI flows, or login/OAuth authentication. No explicit user command like "use browser" is needed.
 - WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.

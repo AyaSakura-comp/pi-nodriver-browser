@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Browser identity fixture</title>
+</head>
+<body>
+  <output id="identity"></output>
+  <script>
+    const data = navigator.userAgentData;
+    document.getElementById('identity').textContent = [
+      `ua=${navigator.userAgent}`,
+      `uaMobile=${data ? data.mobile : 'unsupported'}`,
+      `uaPlatform=${data ? data.platform : 'unsupported'}`,
+      `touchPoints=${navigator.maxTouchPoints}`,
+      `innerWidth=${window.innerWidth}`,
+    ].join('\n');
+  </script>
+</body>
+</html>

@@ -23,6 +23,52 @@ TOUCH_LAB_HOST = 'aya.crayfish-monitor.ts.net'
 TOUCH_LAB_PATH_PREFIX = '/touch-trace'
 
 
+def detect_access_block(url: str, title: str, text: str) -> str | None:
+    """Return a strong access-block reason without flagging ordinary help content."""
+    try:
+        path = urllib.parse.urlsplit(url).path.casefold()
+    except ValueError:
+        path = ''
+    if re.search(r'/(?:captcha(?:[-_/]|$)|challenge(?:[-_/]|$))', path):
+        return 'captcha URL'
+
+    normalized_title = ' '.join((title or '').casefold().split())
+    normalized_text = ' '.join((text or '')[:12000].casefold().split())
+    combined = f'{normalized_title}\n{normalized_text}'
+
+    if (
+        re.search(r'(^|\b)429(?:\b|$)', normalized_title)
+        or 'too many requests' in normalized_title
+        or '429 too many requests' in normalized_text
+    ):
+        return 'HTTP 429'
+    if any(marker in combined for marker in (
+        '您是人還是機器人',
+        '請驗證您是人類',
+        'verify you are human',
+        'are you a robot',
+        'are you human',
+    )):
+        return 'robot verification'
+    if (
+        normalized_title in {'captcha', 'challenge', 'security challenge', 'human verification'}
+        or any(marker in combined for marker in (
+            'just a moment...',
+            'enable javascript and cookies to continue',
+            'our systems have detected unusual traffic',
+            'attention required! | cloudflare',
+            'challenge validation',
+        ))
+    ):
+        return 'anti-bot challenge'
+    if (
+        normalized_title in {'access denied', 'forbidden', 'request blocked'}
+        or normalized_text.startswith(('access denied', 'request blocked', '403 forbidden'))
+    ):
+        return 'access denied'
+    return None
+
+
 def generate_minimum_jerk_offsets(delta_x: float, delta_y: float, steps: int = 20) -> list[tuple[float, float]]:
     """Return a deterministic minimum-jerk path from zero to the requested drift."""
     if steps < 1:

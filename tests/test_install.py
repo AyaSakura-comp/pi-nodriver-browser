@@ -78,13 +78,17 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
 
-    def test_mobile_profile_does_not_mix_iphone_safari_with_desktop_spoofs(self):
+    def test_mobile_profile_uses_android_chrome_identity_without_touch_emulation(self):
         worker_source = (ROOT / 'worker.py').read_text()
         stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()
         open_action = worker_source.split("        if action == 'open':", 1)[1].split("        if action == 'mobile':", 1)[0]
 
+        self.assertIn("platform='Android'", open_action)
+        self.assertIn('user_agent_metadata=metadata', open_action)
+        self.assertIn('set_user_agent_override', open_action)
+        self.assertIn('set_touch_emulation_enabled(enabled=False)', open_action)
         self.assertNotIn('iPhone OS', open_action)
-        self.assertNotIn('set_user_agent_override', open_action)
+        self.assertNotIn('Safari/604.1', open_action)
         self.assertNotIn('NVIDIA GeForce RTX 4070', stealth_source)
         self.assertNotIn('fakePlugins', stealth_source)
 
@@ -104,6 +108,13 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('do not include < or >', worker_source)
         self.assertIn('To enter text, use fill or type with a literal ref', extension_source)
         self.assertNotIn('Press Enter, Tab, Space, Backspace, or text', extension_source)
+
+    def test_vision_gesture_guidance_prefers_xvfb_mouse_input(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+
+        self.assertIn('Vision click, long press, and drag prefer trusted Xvfb mouse input', extension_source)
+        self.assertGreaterEqual(worker_source.count("'backend': 'xvfb-or-cdp'"), 3)
 
     def test_form_safety_and_navigation_guidance_matches_runtime_guards(self):
         extension_source = (ROOT / 'index.ts').read_text()

@@ -53,7 +53,7 @@ flowchart TB
     end
 
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
-        ENGINE -->|"Interactive Mode (390x844 touch viewport / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Interactive Mode (390x844 Android Chrome mobile viewport, touch emulation off / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
         TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
         TABS_POOL --> CHROME
@@ -67,12 +67,13 @@ flowchart TB
 #### 1. Client-Daemon IPC & Session Isolation
 * **Zero-Spawning Overhead**: A single persistent Python daemon (`worker.py`) runs in the background. Pi commands connect via Unix Domain Socket (`nodriver-browser.sock`), avoiding the 2–3s cold-start penalty of launching Chrome on every turn.
 * **Per-Session Tab Routing**: Each Pi conversation maintains its own isolated `session_id` mapping. Session tabs, active viewports, and downloads operate independently without cross-session interference.
+* **Android-to-Linux Block Fallback**: Interactive navigation starts with the Android Chrome identity. Strong CAPTCHA/challenge URLs or copy, localized robot checks, access-denied titles, and HTTP 429 pages cause exactly one retry in a fresh target using Chrome's native Linux identity. The blocked Android target is closed first, the internal retry does not consume another agent `open`, and the result reports `identityUsed` plus `fallbackReason`.
 * **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
 
 #### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
 Integrated directly into Chrome via `--load-extension` to reduce common automation fingerprints and detect challenge widgets. It does not solve visual hCaptcha challenges or use third-party CAPTCHA bypass services; unresolved challenges require human completion before the agent resumes.
 * **`stealth.js`**:
-  * **Coherent Native Fingerprints**: Preserves Chrome's real WebGL renderer, plugin list, and user agent rather than mixing an iPhone Safari identity with desktop NVIDIA/Windows values.
+  * **Coherent Chrome Fingerprints**: Preserves Chrome's real WebGL renderer and plugin list while advertising an Android Chrome UA and matching User-Agent Client Hints derived from the installed Chrome version. It never mixes an iPhone Safari identity with a Chromium engine.
   * **Bot Flag Erasure**: Completely removes `navigator.webdriver` and normalizes `navigator.plugins`, `navigator.languages` (`zh-TW`, `en-US`), and `Notification.permission`.
   * **Runtime Consistency**: Injects authentic `window.chrome.runtime`, `window.chrome.csi`, and `window.chrome.loadTimes` structures.
 * **`turnstile_solver.js`**:
@@ -457,7 +458,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates to URL, **auto-dismisses blocking banners**, and **automatically returns interactive `@refs` snapshot**. Per session, the 3rd consecutive same-origin open is blocked; a different-origin open resets the streak. | Interactive Tab (500x1000 / 390x844 touch viewport) |
+| **`open`** | `open <url>` | Navigates with an Android Chrome identity, matching mobile Client Hints, a 390x844 viewport, and touch emulation disabled. Strong access-block signals trigger one fresh-target native Linux retry. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `identityUsed` and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; the internal fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
@@ -522,7 +523,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Variable | Default | Description |
 |---|---|---|
-| `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + 390x844 touch viewport without clipping). |
+| `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + 390x844 mobile viewport without clipping). |
 | `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
 | `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |

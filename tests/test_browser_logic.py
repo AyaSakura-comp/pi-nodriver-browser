@@ -9,7 +9,64 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, detect_access_block, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+
+
+class AccessBlockDetectionTests(unittest.TestCase):
+    def test_detects_strong_challenge_urls_and_localized_robot_copy(self):
+        self.assertEqual(
+            detect_access_block(
+                'https://example.test/sttc/px/captcha-v2/index.html', '', ''
+            ),
+            'captcha URL',
+        )
+        self.assertEqual(
+            detect_access_block(
+                'https://example.test/', '安全性檢查', '您是人還是機器人？'
+            ),
+            'robot verification',
+        )
+
+    def test_detects_rate_limit_and_cloudflare_challenges(self):
+        self.assertEqual(
+            detect_access_block('https://example.test/', '429 Too Many Requests', ''),
+            'HTTP 429',
+        )
+        self.assertEqual(
+            detect_access_block(
+                'https://example.test/', 'Service unavailable',
+                '429 Too Many Requests',
+            ),
+            'HTTP 429',
+        )
+        self.assertEqual(
+            detect_access_block(
+                'https://example.test/', 'Just a moment...',
+                'Enable JavaScript and cookies to continue',
+            ),
+            'anti-bot challenge',
+        )
+
+    def test_detects_body_only_access_denied_and_exact_challenge_titles(self):
+        self.assertEqual(
+            detect_access_block(
+                'https://example.test/', 'Example', 'Access Denied\nReference #1234'
+            ),
+            'access denied',
+        )
+        self.assertEqual(
+            detect_access_block('https://example.test/', 'CAPTCHA', ''),
+            'anti-bot challenge',
+        )
+
+    def test_does_not_classify_normal_booking_or_captcha_help_content(self):
+        self.assertIsNone(
+            detect_access_block(
+                'https://inline.app/booking/restaurant',
+                'Online booking',
+                'Book a table and read our help article about avoiding captcha problems.',
+            )
+        )
 
 
 class GoogleSearchLogicTests(unittest.TestCase):

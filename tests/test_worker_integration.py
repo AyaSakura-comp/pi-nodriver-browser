@@ -38,6 +38,13 @@ class FakeBrowser:
         return None
 
 
+def fake_browser_command_response(_command):
+    return (
+        '1.3', 'Chrome/147.0.7727.101', 'test-revision',
+        'Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36', '14.7',
+    )
+
+
 class FakePage:
     def __init__(self, browser, target_id):
         self.browser = browser
@@ -91,6 +98,32 @@ class SlowImageCandidatePage(FakeImageCandidatePage):
             return 'Slow discovery page text.'
         await asyncio.sleep(1)
         return json.dumps(self.candidates)
+
+
+class AccessBlockPollingUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_execution_context_failure_does_not_abort_polling(self):
+        from worker import BrowserWorker
+
+        class ReloadingPage:
+            url = 'https://example.test/booking'
+
+            def __init__(self):
+                self.calls = 0
+
+            async def evaluate(self, script):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError('execution context was destroyed')
+                if script == 'document.title':
+                    return 'Security check'
+                return '您是人還是機器人？'
+
+        reason = await BrowserWorker().detect_page_access_block(
+            ReloadingPage(), 'https://example.test/booking',
+            settle_seconds=0.05, poll_interval=0.001,
+        )
+
+        self.assertEqual(reason, 'robot verification')
 
 
 class CloseFailingPage(FakePage):
@@ -1273,7 +1306,7 @@ class TouchDriftCommandUnitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
-    async def test_vision_long_press_uses_minimum_jerk_touch_drift(self):
+    async def test_vision_long_press_uses_xvfb_capable_mouse_hold(self):
         from browser_logic import VisionPageState
         from worker import BrowserWorker
 
@@ -1305,12 +1338,9 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(before_dispatch)
             worker.vision_guard.consume_marker.assert_not_called()
             await before_dispatch()
-            return {
-                'offsets': [(0.0, 0.0), (6.0, -4.0)],
-                'midwayPath': None,
-            }
+            return None
 
-        worker.native_touch_drift = AsyncMock(side_effect=run_native)
+        worker.native_long_press = AsyncMock(side_effect=run_native)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             screenshot = Path(temp_dir) / 'verify.png'
@@ -1321,23 +1351,17 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
                 session_id='session-a',
             )
 
-        worker.native_touch_drift.assert_awaited_once_with(
+        worker.native_long_press.assert_awaited_once_with(
             page,
             marker.click_x,
             marker.click_y,
             1200,
-            6.0,
-            -4.0,
-            24,
             capture_midway=True,
-            before_dispatch=worker.native_touch_drift.await_args.kwargs['before_dispatch'],
+            before_dispatch=worker.native_long_press.await_args.kwargs['before_dispatch'],
         )
         worker.vision_guard.consume_marker.assert_called_once()
-        self.assertEqual(result['inputType'], 'touch')
-        self.assertEqual(result['deltaX'], 6.0)
-        self.assertEqual(result['deltaY'], -4.0)
-        self.assertEqual(result['steps'], 24)
-        self.assertEqual(result['plannedPoints'], 2)
+        self.assertEqual(result['inputType'], 'mouse')
+        self.assertEqual(result['backend'], 'xvfb-or-cdp')
 
     async def test_setup_failure_invalidates_marker_without_consuming_it(self):
         from worker import BrowserWorker
@@ -1353,7 +1377,7 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
         worker.vision_guard.consume_marker = Mock()
         worker.vision_guard.invalidate = Mock()
         worker.configure_download_session = AsyncMock()
-        worker.native_touch_drift = AsyncMock(side_effect=RuntimeError('viewport setup failed'))
+        worker.native_long_press = AsyncMock(side_effect=RuntimeError('viewport setup failed'))
 
         with self.assertRaisesRegex(RuntimeError, 'viewport setup failed'):
             await worker._execute(
@@ -1614,8 +1638,8 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         from worker import BrowserWorker
 
         class FailingPage(FakePage):
-            async def send(self, _command):
-                return None
+            async def send(self, command):
+                return fake_browser_command_response(command)
 
             async def get(self, _url):
                 raise RuntimeError('navigation failed')
@@ -1647,8 +1671,8 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         from worker import BrowserWorker
 
         class CancelledPage(FakePage):
-            async def send(self, _command):
-                return None
+            async def send(self, command):
+                return fake_browser_command_response(command)
 
             async def get(self, _url):
                 raise asyncio.CancelledError()
@@ -1705,8 +1729,8 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         from worker import BrowserWorker
 
         class ReadyPage(FakePage):
-            async def send(self, _command):
-                return None
+            async def send(self, command):
+                return fake_browser_command_response(command)
 
             async def get(self, url):
                 self.url = url
@@ -1745,8 +1769,8 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
         from worker import BrowserWorker
 
         class ReadyPage(FakePage):
-            async def send(self, _command):
-                return None
+            async def send(self, command):
+                return fake_browser_command_response(command)
 
             async def get(self, url):
                 self.url = url
@@ -3572,6 +3596,135 @@ class WorkerIntegrationTests(unittest.TestCase):
         time.sleep(0.2)
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
+
+    def test_open_retries_android_block_once_in_fresh_native_linux_target(self):
+        requests = []
+
+        class AdaptiveBlockHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                requests.append((handler_self.path, user_agent))
+                if 'Android' in user_agent:
+                    title = 'Security check'
+                    body = '您是人還是機器人？'
+                else:
+                    title = 'Booking ready'
+                    body = '<button>Reserve table</button>'
+                payload = (
+                    f'<!doctype html><title>{title}</title><body>{body}</body>'
+                ).encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), AdaptiveBlockHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            result = self.command(f'open http://127.0.0.1:{server.server_port}/booking')
+            self.assertEqual(result['identityUsed'], 'linux-fallback')
+            self.assertEqual(result['fallbackReason'], 'robot verification')
+            self.assertIn('Reserve table', result['text'])
+            booking_agents = [ua for path, ua in requests if path == '/booking']
+            self.assertEqual(len(booking_agents), 2)
+            self.assertIn('Linux; Android 10; K', booking_agents[0])
+            self.assertIn('X11; Linux x86_64', booking_agents[1])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_open_waits_for_asynchronously_rendered_android_challenge(self):
+        requests = []
+
+        class DelayedChallengeHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                requests.append((handler_self.path, user_agent))
+                if 'Android' in user_agent:
+                    body = (
+                        '<div id="status">Loading booking</div>'
+                        '<script>setTimeout(() => {'
+                        'document.getElementById("status").textContent = '
+                        '"您是人還是機器人？";}, 250);</script>'
+                    )
+                else:
+                    body = '<button>Delayed booking ready</button>'
+                payload = f'<!doctype html><title>Booking</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), DelayedChallengeHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            result = self.command(f'open http://127.0.0.1:{server.server_port}/booking')
+            self.assertEqual(result['identityUsed'], 'linux-fallback')
+            self.assertEqual(result['fallbackReason'], 'robot verification')
+            self.assertIn('Delayed booking ready', result['text'])
+            booking_agents = [ua for path, ua in requests if path == '/booking']
+            self.assertEqual(len(booking_agents), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_open_does_not_retry_when_linux_fallback_is_also_blocked(self):
+        requests = []
+
+        class AlwaysBlockedHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                requests.append((
+                    handler_self.path, handler_self.headers.get('User-Agent', '')
+                ))
+                payload = b'<!doctype html><title>Access Denied</title><body>Blocked</body>'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), AlwaysBlockedHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            result = self.command(f'open http://127.0.0.1:{server.server_port}/booking')
+            self.assertEqual(result['identityUsed'], 'linux-fallback')
+            self.assertEqual(result['fallbackReason'], 'access denied')
+            booking_agents = [ua for path, ua in requests if path == '/booking']
+            self.assertEqual(len(booking_agents), 2)
+            self.assertIn('Android', booking_agents[0])
+            self.assertIn('X11; Linux x86_64', booking_agents[1])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_open_uses_android_chrome_identity_without_touch_emulation(self):
+        fixture_url = (ROOT / 'tests/fixture_browser_identity.html').as_uri()
+        self.command(f'open {fixture_url}')
+
+        identity = self.command('get text')['text']
+        self.assertIn('Linux; Android 10; K', identity)
+        self.assertIn('Mobile Safari/537.36', identity)
+        self.assertIn('uaMobile=true', identity)
+        self.assertIn('uaPlatform=Android', identity)
+        self.assertIn('touchPoints=0', identity)
+        self.assertIn('innerWidth=390', identity)
 
     def test_snapshot_lists_only_interactive_objects_in_the_current_viewport(self):
         fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()

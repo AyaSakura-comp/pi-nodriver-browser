@@ -26,7 +26,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_block, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -3317,6 +3317,25 @@ class BrowserWorker:
         except Exception:
             await page.sleep(0.3)
 
+    async def detect_page_access_block(
+        self, page, target_url, settle_seconds=0.4, poll_interval=0.1
+    ):
+        """Poll briefly for challenge pages that replace initial loading content."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settle_seconds
+        while True:
+            try:
+                title = str(await page.evaluate('document.title') or '')
+                body_text = str(await page.evaluate('document.body?.innerText || ""') or '')
+                reason = detect_access_block(page.url or target_url, title, body_text)
+            except Exception:
+                # Redirecting challenge pages transiently destroy their execution context.
+                # Keep polling within the same deadline; cancellation still propagates.
+                reason = None
+            if reason is not None or loop.time() >= deadline:
+                return reason
+            await asyncio.sleep(min(poll_interval, max(0.0, deadline - loop.time())))
+
     async def require_page(self, session_id):
         page = self.pages.get(session_id)
         if page is None:
@@ -4123,8 +4142,12 @@ class BrowserWorker:
                 pass
         return False
 
-    async def native_long_press(self, page, x, y, duration_ms=1000, capture_midway=True):
+    async def native_long_press(
+        self, page, x, y, duration_ms=1000, capture_midway=True, before_dispatch=None
+    ):
         await page.bring_to_front()
+        if before_dispatch is not None:
+            await before_dispatch()
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             res = await self.xvfb_mouse_long_press(page, x, y, duration_ms, capture_midway=capture_midway)
             if res:
@@ -4180,8 +4203,10 @@ class BrowserWorker:
         except Exception:
             return None
 
-    async def mouse_click_allowing_target_close(self, page, x, y, timeout_seconds=1.0):
-        if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
+    async def mouse_click_allowing_target_close(
+        self, page, x, y, timeout_seconds=1.0, prefer_xvfb=False
+    ):
+        if prefer_xvfb and os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if await self.xvfb_mouse_click(page, x, y):
                 return True
         try:
@@ -4233,7 +4258,12 @@ class BrowserWorker:
 
         if before_dispatch is not None:
             await before_dispatch()
-        click_completed = await self.mouse_click_allowing_target_close(page, x, y)
+        # DOM-resolved targets use CDP mouse coordinates, which remain exact when
+        # Android mobile metrics run without touch emulation. Vision-confirmed
+        # coordinates retain Xvfb hardware forwarding via their revalidation callback.
+        click_completed = await self.mouse_click_allowing_target_close(
+            page, x, y, prefer_xvfb=before_dispatch is not None
+        )
         if not click_completed:
             return page
         loop = asyncio.get_running_loop()
@@ -4611,20 +4641,82 @@ class BrowserWorker:
             await self.configure_download_session(session_id)
             page = await self.create_managed_tab(session_id, 'page')
             self.begin_tab_activity(page)
+            identity_used = 'android'
+            fallback_reason = None
 
             try:
-                # Keep Chrome's native identity coherent while using a compact touch viewport.
-                # In particular, do not advertise iPhone Safari from a Linux Chromium engine.
+                # Advertise the installed Chromium engine as Android Chrome so adaptive sites
+                # serve their mobile UI without the Safari/Chromium fingerprint mismatch.
+                _, product, _, browser_user_agent, _ = await page.send(uc.cdp.browser.get_version())
+                version_match = re.search(r'(?:Chrome|Chromium)/([0-9.]+)', f'{product} {browser_user_agent}')
+                if version_match is None:
+                    raise RuntimeError('could not determine the installed Chrome version')
+                full_version = version_match.group(1)
+                major_version = full_version.split('.', 1)[0]
+                ua = (
+                    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 '
+                    f'(KHTML, like Gecko) Chrome/{major_version}.0.0.0 Mobile Safari/537.36'
+                )
+                brands = [
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=major_version),
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=major_version),
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99'),
+                ]
+                full_version_list = [
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=full_version),
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=full_version),
+                    uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99.0.0.0'),
+                ]
+                metadata = uc.cdp.emulation.UserAgentMetadata(
+                    platform='Android', platform_version='14.0.0', architecture='',
+                    model='Pixel 8', mobile=True, brands=brands,
+                    full_version_list=full_version_list, full_version=full_version,
+                    bitness='', wow64=False, form_factors=['Mobile'],
+                )
+                await page.send(uc.cdp.network.set_user_agent_override(
+                    user_agent=ua,
+                    accept_language='zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                    platform='Android',
+                    user_agent_metadata=metadata,
+                ))
                 w, h = 390, 844
                 await page.send(uc.cdp.emulation.set_device_metrics_override(
                     width=w, height=h, device_scale_factor=3.0, mobile=True
                 ))
-                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
+                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=False))
                 page._is_mobile_mode = True
 
                 await page.get(target_url)
                 await self.configure_download_session(session_id, page)
                 await self.wait_for_page_ready(page)
+
+                fallback_reason = await self.detect_page_access_block(page, target_url)
+                if fallback_reason is not None:
+                    blocked_page = page
+                    self.end_tab_activity(blocked_page)
+                    async with self.tab_management_lock:
+                        record = next(
+                            (item for item in self.tab_registry.records()
+                             if item.page is blocked_page),
+                            None,
+                        )
+                        if record is not None:
+                            await self.evict_tab(record)
+                        else:
+                            await blocked_page.close()
+
+                    page = await self.create_managed_tab(session_id, 'page')
+                    self.begin_tab_activity(page)
+                    identity_used = 'linux-fallback'
+                    await page.send(uc.cdp.emulation.set_device_metrics_override(
+                        width=w, height=h, device_scale_factor=3.0, mobile=True
+                    ))
+                    await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=False))
+                    page._is_mobile_mode = True
+                    await page.get(target_url)
+                    await self.configure_download_session(session_id, page)
+                    await self.wait_for_page_ready(page)
+
                 try:
                     await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
                     await page.sleep(0.3)
@@ -4718,13 +4810,25 @@ class BrowserWorker:
                     'url': page.url or parts[1],
                     'screenshotPath': str(output),
                     'count': 0,
+                    'identityUsed': identity_used,
+                    'fallbackReason': fallback_reason,
                 }
             snapshot_text = format_snapshot(elements or [])
+            identity_text = (
+                'native Linux Chrome fallback after Android block'
+                if identity_used == 'linux-fallback'
+                else 'Android Chrome'
+            )
             return {
-                'text': f'Opened {page.url or parts[1]} (touch-enabled Chrome viewport 390x844)\n\nInteractive elements on page:\n{snapshot_text}',
+                'text': (
+                    f'Opened {page.url or parts[1]} ({identity_text}; mobile viewport '
+                    f'390x844; touch emulation off)\n\nInteractive elements on page:\n{snapshot_text}'
+                ),
                 'action': action,
                 'url': page.url or parts[1],
-                'count': len(elements or [])
+                'count': len(elements or []),
+                'identityUsed': identity_used,
+                'fallbackReason': fallback_reason,
             }
 
         if action == 'snapshot':
@@ -5206,44 +5310,34 @@ class BrowserWorker:
                     if current is not None:
                         current.unlink(missing_ok=True)
 
-            delta_x, delta_y, steps = 6.0, -4.0, 24
             try:
-                touch_result = await self.native_touch_drift(
+                midway_path = await self.native_long_press(
                     page,
                     marker.click_x,
                     marker.click_y,
                     duration_ms,
-                    delta_x,
-                    delta_y,
-                    steps,
                     capture_midway=True,
                     before_dispatch=verify_preview_immediately_before_long_press,
                 )
             except (Exception, asyncio.CancelledError):
                 self.vision_guard.invalidate(session_id)
                 raise
-            midway_path = touch_result['midwayPath']
-            offsets = touch_result['offsets']
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
             midway_info = f'\n📸 Captured live midway snapshot while held down at 50% ({int(duration_ms*0.5)}ms).' if midway_path else ''
             resp = {
                 'text': (
-                    f'Vision-confirmed touch long press executed at ({marker.x:g}, {marker.y:g}) '
-                    f'for {duration_ms}ms with minimum-jerk drift ΔX={delta_x:g}px, '
-                    f'ΔY={delta_y:g}px over {steps} steps (isTrusted: true).{midway_info}\n'
-                    f'URL: {page.url}'
+                    f'Vision-confirmed mouse long press executed at ({marker.x:g}, {marker.y:g}) '
+                    f'for {duration_ms}ms through Xvfb hardware input with CDP fallback '
+                    f'(isTrusted: true).{midway_info}\nURL: {page.url}'
                 ),
                 'action': action,
                 'url': page.url,
                 'x': marker.x,
                 'y': marker.y,
                 'durationMs': duration_ms,
-                'inputType': 'touch',
-                'deltaX': delta_x,
-                'deltaY': delta_y,
-                'steps': steps,
-                'plannedPoints': len(offsets),
+                'inputType': 'mouse',
+                'backend': 'xvfb-or-cdp',
             }
             if midway_path:
                 resp['screenshotPath'] = str(midway_path)
@@ -5851,7 +5945,7 @@ class BrowserWorker:
 
 
         if action == 'mobile':
-            raise ValueError("Browser is permanently fixed in touch-enabled compact mode (390x844). 'mobile off' is disabled.")
+            raise ValueError("Browser is permanently fixed in Android Chrome mobile mode (390x844; touch emulation off). 'mobile off' is disabled.")
 
         if action == 'screenshot':
             page = await self.require_page(session_id)
