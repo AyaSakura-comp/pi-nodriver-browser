@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import http.server
 import io
@@ -189,52 +190,25 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
         from browser_logic import VisionFallbackContext
         return VisionFallbackContext('semantic-page', self.page.url, 'loader-a')
 
-    async def test_three_failed_semantic_clicks_unlock_vision_fallback(self):
-        for count in range(1, 4):
-            with self.assertRaisesRegex(ValueError, rf'{count}/3'):
-                await self.worker.execute('click-css #missing', 'session-a')
-
+    async def test_vision_is_available_before_any_semantic_failure(self):
         self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
 
-    async def test_successful_semantic_click_resets_failure_progress(self):
-        for _ in range(3):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
-        await self.worker.execute('click-css #success', 'session-a')
+    async def test_semantic_failure_is_preserved_without_unlock_progress(self):
+        with self.assertRaisesRegex(ValueError, 'DOM click target was unavailable') as raised:
+            await self.worker.execute('click-css #missing', 'session-a')
 
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+        self.assertNotIn('VISION_FALLBACK', str(raised.exception))
+        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
 
-    async def test_context_switch_resets_failure_progress(self):
-        for _ in range(3):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
-
-        await self.worker.execute('switch opener', 'session-a')
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_stale_ref_preserves_recovery_exception_and_records_progress(self):
+    async def test_stale_ref_preserves_recovery_exception_without_unlock_progress(self):
         from worker import StaleRefError
 
         with self.assertRaises(StaleRefError) as raised:
             await self.worker.execute('click @stale', 'session-a')
 
-        self.assertEqual(raised.exception.vision_fallback_progress, (1, False))
+        self.assertFalse(hasattr(raised.exception, 'vision_fallback_progress'))
 
-    async def test_stale_guard_retry_does_not_increment_progress(self):
-        from worker import StaleRefError
-
-        with self.assertRaises(StaleRefError):
-            await self.worker.execute('click @stale', 'session-a')
-        with self.assertRaisesRegex(ValueError, 'STALE_REF_GUARD'):
-            await self.worker.execute('click @guarded', 'session-a')
-
-        with self.assertRaisesRegex(ValueError, r'1/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_stale_ref_recovery_response_reports_failure_progress(self):
+    async def test_stale_ref_recovery_response_omits_unlock_progress(self):
         from worker import execute_request
 
         self.worker.stale_ref_recovery = AsyncMock(return_value={
@@ -249,118 +223,35 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response['ok'])
         self.assertIn('CLICK NOT PERFORMED', response['text'])
-        self.assertIn('VISION_FALLBACK_PROGRESS', response['text'])
-        self.assertIn('1/3', response['text'])
+        self.assertNotIn('VISION_FALLBACK', response['text'])
 
-    async def test_stale_ref_recovery_failure_still_reports_progress(self):
-        from worker import execute_request
-
-        self.worker.stale_ref_recovery = AsyncMock(side_effect=RuntimeError('capture failed'))
-        response = await execute_request(self.worker, {
-            'id': 1,
-            'sessionId': 'session-a',
-            'command': 'click @stale',
-        })
-
-        self.assertFalse(response['ok'])
-        self.assertIn('visual recovery failed', response['error'])
-        self.assertIn('VISION_FALLBACK_PROGRESS', response['error'])
-        self.assertIn('1/3', response['error'])
-
-    async def test_resolving_a_semantic_target_breaks_failure_sequence(self):
-        for _ in range(2):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
-
-        self.worker.semantic_target_resolved('session-a')
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_post_dispatch_or_infrastructure_failure_does_not_count(self):
+    async def test_post_dispatch_error_is_preserved(self):
         with self.assertRaisesRegex(TimeoutError, 'settle failed'):
             await self.worker.execute('click-css #postdispatch', 'session-a')
 
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_invalid_css_does_not_count_as_semantic_failure(self):
+    async def test_invalid_css_error_is_preserved(self):
         with self.assertRaisesRegex(ValueError, 'invalid CSS selector'):
             await self.worker.execute('click-css [', 'session-a')
 
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_non_counting_action_on_different_context_clears_failure_progress_on_return(self):
-        for _ in range(3):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
-        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-        other_page = FakePage(FakeBrowser(), 'other-page')
-        self.worker.pages['session-a'] = other_page
-        await self.worker.execute('get text', 'session-a')
-
-        self.worker.pages['session-a'] = self.page
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_failure_during_loader_or_context_change_does_not_charge_progress(self):
-        from browser_logic import VisionFallbackContext
-
-        class ContextChangingWorker(self.worker.__class__):
-            def __init__(self):
-                super().__init__()
-                self.calls = 0
-
-            async def vision_fallback_context(self, page):
-                self.calls += 1
-                loader = 'loader-b' if self.calls > 1 else 'loader-a'
-                return VisionFallbackContext(page.target.target_id, page.url, loader)
-
-        worker = ContextChangingWorker()
-        worker.pages['session-a'] = self.page
-
-        with self.assertRaisesRegex(ValueError, 'DOM click target was unavailable') as raised:
-            await worker.execute('click-css #missing', 'session-a')
-        self.assertNotIn('VISION_FALLBACK_PROGRESS', str(raised.exception))
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_resolved_but_rejected_ref_action_resets_failure_progress(self):
-        for _ in range(2):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
-
-        with self.assertRaisesRegex(ValueError, 'target control is disabled'):
-            await self.worker.execute('click-js @disabled', 'session-a')
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
-
-    async def test_vision_mark_requires_fresh_screenshot_after_unlock(self):
+    async def test_semantic_failure_invalidates_previous_screenshot(self):
         from browser_logic import VisionPageState
 
         state = VisionPageState('semantic-page', self.page.url, 390, 844, 'loader-a')
         self.worker.vision_guard.record_screenshot('session-a', state)
 
-        for _ in range(3):
-            with self.assertRaises(ValueError):
-                await self.worker.execute('click-css #missing', 'session-a')
+        with self.assertRaises(ValueError):
+            await self.worker.execute('click-css #missing', 'session-a')
 
-        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
         with self.assertRaisesRegex(ValueError, 'VISION_SCREENSHOT_REQUIRED'):
             self.worker.vision_guard.issue_marker(
                 'session-a', state, 100, 200, '0123456789abcdef01234567', 'hash-a'
             )
 
-    async def test_raw_coordinate_failure_does_not_count(self):
+    async def test_raw_coordinate_failure_does_not_lock_vision(self):
         with self.assertRaisesRegex(ValueError, 'DOM click failed'):
             await self.worker.execute('click 20 30', 'session-a')
 
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+        self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
 
 
 class ImageCandidateSidecarUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -1305,6 +1196,384 @@ class TouchDriftCommandUnitTests(unittest.IsolatedAsyncioTestCase):
                 await worker._execute('touch-drift @e1 100ms 2 3', session_id='session-a')
 
 
+class OmniParseCommandUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ensure_page_front_does_not_reactivate_the_current_target(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'active-page')
+        page.bring_to_front = AsyncMock()
+        page.evaluate = AsyncMock(return_value='visible')
+        worker.xvfb_active_target_id = 'active-page'
+
+        await worker.ensure_page_front(page)
+
+        page.bring_to_front.assert_not_awaited()
+
+    async def test_ensure_page_front_activates_a_different_target_once(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'next-page')
+        page.bring_to_front = AsyncMock()
+        page.evaluate = AsyncMock(return_value='visible')
+        worker.xvfb_active_target_id = 'other-page'
+
+        await worker.ensure_page_front(page)
+        await worker.ensure_page_front(page)
+
+        page.bring_to_front.assert_awaited_once()
+        self.assertEqual(worker.xvfb_active_target_id, 'next-page')
+
+    def test_page_candidate_filter_removes_chrome_ui_and_caps_ranked_results(self):
+        from worker import BrowserWorker
+
+        elements = [
+            {'id': 90, 'confidence': 0.99, 'box': [0, 10, 20, 30], 'center': [10, 20]},
+            {'id': 91, 'confidence': 0.98, 'box': [0, 70, 20, 100], 'center': [10, 85]},
+        ] + [
+            {
+                'id': index,
+                'confidence': 0.10 + index / 100,
+                'box': [10, 100 + index, 30, 120 + index],
+                'center': [20, 110 + index],
+            }
+            for index in range(20)
+        ]
+
+        filtered = BrowserWorker.filter_omni_page_candidates(elements)
+
+        self.assertEqual(len(filtered), 15)
+        self.assertTrue(all(element['center'][1] >= 90 for element in filtered))
+        self.assertEqual([element['id'] for element in filtered], list(range(15)))
+        self.assertEqual(filtered[0]['sourceId'], 19)
+        self.assertEqual(filtered[-1]['sourceId'], 5)
+
+    def test_cdp_candidate_filter_keeps_top_of_viewport_controls(self):
+        from worker import BrowserWorker
+
+        filtered = BrowserWorker.filter_omni_page_candidates(
+            [{
+                'id': 4, 'confidence': 0.9,
+                'box': [5.0, 5.0, 25.0, 25.0], 'center': [15.0, 15.0],
+            }],
+            image_width=100,
+            image_height=160,
+            capture_backend='cdp',
+        )
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]['sourceId'], 4)
+
+    def test_candidate_filter_rejects_nonfinite_and_out_of_bounds_geometry(self):
+        from worker import BrowserWorker
+
+        filtered = BrowserWorker.filter_omni_page_candidates(
+            [
+                {'id': 1, 'confidence': 0.9, 'box': [1, 100, 20, 120], 'center': [10, 110]},
+                {'id': 2, 'confidence': 1.0, 'box': [1, 100, 20, 120], 'center': [float('nan'), 110]},
+                {'id': 3, 'confidence': 1.0, 'box': [1, 100, 120, 130], 'center': [110, 115]},
+                {'id': 4, 'confidence': 1.0, 'box': [20, 120, 10, 130], 'center': [15, 125]},
+            ],
+            image_width=100,
+            image_height=160,
+            capture_backend='xvfb',
+        )
+
+        self.assertEqual([item['sourceId'] for item in filtered], [1])
+
+    async def test_omniparse_rejects_state_change_during_screenshot_capture(self):
+        from PIL import Image
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omniparse-state-change')
+        worker.pages['session-a'] = page
+        before = VisionPageState('omniparse-state-change', page.url, 390, 844, loader_id='a')
+        after = VisionPageState('omniparse-state-change', page.url, 390, 844, loader_id='b')
+        worker.vision_page_state = AsyncMock(side_effect=[before, after])
+        worker.call_omniparser = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clean = Path(temp_dir) / 'clean.png'
+            Image.new('RGB', (100, 160), 'gray').save(clean)
+            worker.save_viewport_screenshot = AsyncMock(return_value=clean)
+
+            with self.assertRaisesRegex(ValueError, 'changed during screenshot capture'):
+                await worker._execute('vision-mark omni', session_id='session-a')
+
+        worker.call_omniparser.assert_not_awaited()
+        self.assertNotIn('session-a', worker.omni_previews)
+
+    async def test_omniparse_format_failure_does_not_leave_hidden_preview(self):
+        from PIL import Image
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omniparse-format-failure')
+        worker.pages['session-a'] = page
+        state = VisionPageState('omniparse-format-failure', page.url, 390, 844)
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.call_omniparser = AsyncMock(return_value={
+            'latency': None,
+            'elements': [{
+                'id': 1, 'confidence': 0.9,
+                'box': [10, 100, 30, 120], 'center': [20, 110],
+            }],
+        })
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clean = Path(temp_dir) / 'clean.png'
+            Image.new('RGB', (100, 160), 'gray').save(clean)
+            worker.save_viewport_screenshot = AsyncMock(return_value=clean)
+
+            with self.assertRaises((TypeError, ValueError)):
+                await worker._execute('vision-mark omni', session_id='session-a')
+
+        self.assertNotIn('session-a', worker.omni_previews)
+
+    async def test_full_screenshot_discards_existing_omni_preview(self):
+        from PIL import Image
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'full-shot')
+        worker.pages['session-a'] = page
+        worker.omni_previews['session-a'] = {'createdAt': time.monotonic()}
+
+        async def save(output, format='png', full_page=False):
+            Image.new('RGB', (100, 160), 'gray').save(output)
+
+        page.save_screenshot = AsyncMock(side_effect=save)
+        worker.touch_tab = Mock()
+
+        await worker._execute('screenshot --full', session_id='session-a')
+
+        self.assertNotIn('session-a', worker.omni_previews)
+
+    async def test_omniparse_returns_detector_centers_and_annotated_screenshot(self):
+        from PIL import Image
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omniparse-page')
+        worker.pages['session-a'] = page
+        state = VisionPageState(
+            'omniparse-page', page.url, 390, 844,
+            visual_width=390, visual_height=844,
+        )
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.vision_guard.record_screenshot = Mock()
+        response_image = io.BytesIO()
+        Image.new('RGB', (100, 160), 'white').save(response_image, format='PNG')
+        worker.call_omniparser = AsyncMock(return_value={
+            'width': 100,
+            'height': 160,
+            'latency': 0.25,
+            'elements': [
+                {
+                    'id': 7, 'confidence': 0.75,
+                    'box': [10.0, 90.0, 30.0, 110.0],
+                    'center': [20.0, 100.0],
+                },
+                {
+                    'id': 8, 'confidence': 0.99,
+                    'box': [10.0, 20.0, 30.0, 40.0],
+                    'center': [20.0, 30.0],
+                },
+            ],
+            'annotated_image_base64': base64.b64encode(response_image.getvalue()).decode(),
+        })
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clean = Path(temp_dir) / 'clean.png'
+            Image.new('RGB', (100, 160), 'gray').save(clean)
+            worker.save_viewport_screenshot = AsyncMock(return_value=clean)
+            worker.screenshot_capture_backends[str(clean)] = 'xvfb'
+
+            result = await worker._execute('vision-mark omni', session_id='session-a')
+
+            self.assertTrue(Path(result['screenshotPath']).is_file())
+            with Image.open(result['screenshotPath']).convert('RGB') as annotated:
+                self.assertEqual(annotated.getpixel((99, 159)), (128, 128, 128))
+
+        self.assertIn('id=0 center=(20,100)', result['text'])
+        self.assertNotIn('center=(20,30)', result['text'])
+        self.assertEqual(result['elements'][0]['center'], [20.0, 100.0])
+        self.assertEqual(result['elements'][0]['sourceId'], 7)
+        worker.vision_guard.record_screenshot.assert_called_once_with('session-a', state)
+        self.assertIn('session-a', worker.omni_previews)
+        self.assertEqual(worker.omni_previews['session-a']['captureBackend'], 'xvfb')
+
+    async def test_failed_omniparse_replacement_discards_the_older_preview(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omniparse-failure')
+        worker.pages['session-a'] = page
+        worker.omni_previews['session-a'] = {'createdAt': time.monotonic()}
+        state = VisionPageState('omniparse-failure', page.url, 390, 844)
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.save_viewport_screenshot = AsyncMock(side_effect=RuntimeError('capture failed'))
+
+        with self.assertRaisesRegex(RuntimeError, 'capture failed'):
+            await worker._execute('vision-mark omni', session_id='session-a')
+
+        self.assertNotIn('session-a', worker.omni_previews)
+
+    async def test_semantic_click_discards_an_existing_omni_preview(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'semantic-click')
+        worker.pages['session-a'] = page
+        worker.omni_previews['session-a'] = {'createdAt': time.monotonic()}
+        worker.resolve_click_target = AsyncMock(return_value={
+            'x': 10.0, 'y': 20.0, 'tag': 'button', 'text': 'Continue',
+        })
+        worker.semantic_target_resolved = Mock()
+        worker.configure_download_session = AsyncMock()
+        worker.native_click = AsyncMock(return_value=page)
+        worker.track_clicked_page = AsyncMock(return_value=page)
+
+        await worker._execute('click @e1', session_id='session-a')
+
+        self.assertNotIn('session-a', worker.omni_previews)
+
+    async def test_native_drag_uses_exact_xvfb_preview_points_when_provided(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'drag-page')
+        page.sleep = AsyncMock()
+        worker.ensure_page_front = AsyncMock()
+        worker.xvfb_mouse_drag = AsyncMock(return_value=True)
+
+        with patch.dict(os.environ, {'PI_NODRIVER_XVFB_FORWARD_CLICK': '1'}):
+            result = await worker.native_drag(
+                page, 93.6, 138.4, 156.0, 222.0, duration_ms=750,
+                xvfb_screen_points=((120.0, 240.0), (200.0, 300.0)),
+            )
+
+        self.assertTrue(result)
+        worker.xvfb_mouse_drag.assert_awaited_once_with(
+            page, 120.0, 240.0, 200.0, 300.0, 750,
+        )
+
+    async def test_coordinate_vision_click_does_not_require_pixel_identical_screenshot(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omni-live-page')
+        worker.pages['session-a'] = page
+        state = VisionPageState(
+            'omni-live-page', page.url, 390, 844,
+            visual_width=390, visual_height=844,
+        )
+        worker.omni_previews['session-a'] = {
+            'state': state,
+            'imageHash': 'an intentionally stale pixel hash',
+            'imageWidth': 500,
+            'imageHeight': 1000,
+            'createdAt': time.monotonic(),
+            'captureBackend': 'xvfb',
+            'elements': [{'id': 2, 'center': [212.96, 502.14]}],
+        }
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.save_viewport_screenshot = AsyncMock(
+            side_effect=AssertionError('pixel screenshot must not be recaptured')
+        )
+        worker.configure_download_session = AsyncMock()
+        worker.track_clicked_page = AsyncMock(return_value=page)
+
+        async def click(*args, before_dispatch=None, **kwargs):
+            await before_dispatch()
+            return page
+
+        worker.native_click = AsyncMock(side_effect=click)
+
+        result = await worker._execute(
+            'vision-click 212.96 502.14', session_id='session-a'
+        )
+
+        worker.save_viewport_screenshot.assert_not_awaited()
+        worker.native_click.assert_awaited_once()
+        self.assertEqual(result['omniElementId'], 2)
+
+    async def test_coordinate_vision_click_must_match_and_consumes_omni_center(self):
+        from PIL import Image
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omni-click-page')
+        worker.pages['session-a'] = page
+        state = VisionPageState(
+            'omni-click-page', page.url, 390, 844,
+            visual_width=390, visual_height=844,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            verify = Path(temp_dir) / 'verify.png'
+            Image.new('RGB', (100, 80), 'gray').save(verify)
+            worker.omni_previews['session-a'] = {
+                'state': state,
+                'imageHash': worker.screenshot_hash(verify),
+                'imageWidth': 100,
+                'imageHeight': 80,
+                'createdAt': time.monotonic(),
+                'captureBackend': 'xvfb',
+                'elements': [{'id': 0, 'center': [20.0, 30.0]}],
+            }
+            worker.vision_page_state = AsyncMock(return_value=state)
+            worker.save_viewport_screenshot = AsyncMock(return_value=verify)
+            worker.configure_download_session = AsyncMock()
+            worker.track_clicked_page = AsyncMock(return_value=page)
+
+            async def click(*args, before_dispatch=None, **kwargs):
+                await before_dispatch()
+                return page
+
+            worker.native_click = AsyncMock(side_effect=click)
+            result = await worker._execute(
+                'vision-click 20 30', session_id='session-a'
+            )
+
+        worker.native_click.assert_awaited_once()
+        args = worker.native_click.await_args.args
+        kwargs = worker.native_click.await_args.kwargs
+        self.assertEqual(args[1:], (78.0, 316.5))
+        self.assertEqual(kwargs['xvfb_screen_point'], (20.0, 30.0))
+        self.assertNotIn('session-a', worker.omni_previews)
+        self.assertEqual(result['omniElementId'], 0)
+
+
+class VisionMarkerRenderingUnitTests(unittest.TestCase):
+    def test_click_marker_is_cursor_with_hotspot_at_upper_left_tip(self):
+        from PIL import Image
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clean = Path(temp_dir) / 'clean.png'
+            Image.new('RGB', (100, 100), '#808080').save(clean)
+
+            marked = BrowserWorker.annotate_vision_screenshot(clean, 30, 30)
+
+            with Image.open(marked).convert('RGB') as image:
+                hotspot = image.getpixel((30, 30))
+                arrow_body = image.getpixel((37, 45))
+                left_of_tip = image.getpixel((10, 30))
+
+        self.assertGreater(hotspot[0], 200)
+        self.assertLess(hotspot[1], 80)
+        self.assertGreater(min(arrow_body), 220)
+        self.assertEqual(left_of_tip, (128, 128, 128))
+
+
 class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_vision_long_press_uses_xvfb_capable_mouse_hold(self):
         from browser_logic import VisionPageState
@@ -1319,6 +1588,7 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
             y=240.0,
             click_x=118.0,
             click_y=164.0,
+            capture_backend='xvfb',
         )
         state = VisionPageState(
             target_id='vision-touch',
@@ -1357,6 +1627,7 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
             marker.click_y,
             1200,
             capture_midway=True,
+            xvfb_screen_point=(marker.x, marker.y),
             before_dispatch=worker.native_long_press.await_args.kwargs['before_dispatch'],
         )
         worker.vision_guard.consume_marker.assert_called_once()
@@ -1371,7 +1642,7 @@ class VisionLongPressTouchUnitTests(unittest.IsolatedAsyncioTestCase):
         worker.pages['session-a'] = page
         marker = SimpleNamespace(
             token='0123456789abcdef01234567', x=120.0, y=240.0,
-            click_x=118.0, click_y=164.0,
+            click_x=118.0, click_y=164.0, capture_backend='xvfb',
         )
         worker.vision_guard.current_marker = Mock(return_value=marker)
         worker.vision_guard.consume_marker = Mock()
@@ -4797,42 +5068,16 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.command('click-css "#custom"')
         self.assertIn('custom-clicked', self.status())
 
-    def unlock_vision_fallback(self):
-        for count in range(1, 4):
-            blocked = self.command_raw('click-css "#pi-nodriver-missing-target"')
-            self.assertFalse(blocked['ok'])
-            self.assertIn(f'{count}/3', blocked['error'])
-        self.assertIn('VISION_FALLBACK_UNLOCKED', blocked['error'])
-
     def test_vision_correctness_marks_retries_and_confirms_before_coordinate_click(self):
         fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         self.command(f'open {fixture_url}')
         self.assertEqual(self.command('snapshot -i')['text'], '(no interactive elements)')
-
-        self.command('screenshot')
-        locked = self.command_raw('vision-mark 300 330')
-        self.assertFalse(locked['ok'])
-        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
-        self.assertIn('0/3', locked['error'])
 
         raw_click = self.command_raw('click 300 330')
         self.assertFalse(raw_click['ok'])
         self.assertIn('VISION_CLICK_GUARD', raw_click['error'])
         self.assertIn('vision-idle', self.command('get text')['text'])
 
-        still_locked = self.command_raw('vision-mark 300 330')
-        self.assertFalse(still_locked['ok'])
-        self.assertIn('0/3', still_locked['error'])
-
-        for _ in range(3):
-            invalid_css = self.command_raw('click-css "["')
-            self.assertFalse(invalid_css['ok'])
-            self.assertIn('invalid CSS selector', invalid_css['error'])
-            self.assertNotIn('VISION_FALLBACK_PROGRESS', invalid_css['error'])
-        still_locked = self.command_raw('vision-mark 300 330')
-        self.assertIn('0/3', still_locked['error'])
-
-        self.unlock_vision_fallback()
         clean = self.command('screenshot')
         clean_bytes = Path(clean['screenshotPath']).read_bytes()
         wrong = self.command('vision-mark 60 180')
@@ -4842,7 +5087,9 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('NO CLICK PERFORMED', wrong['text'])
         self.assertIn('vision-idle', self.command('get text')['text'])
 
-        corrected = self.command('vision-mark 300 330')
+        # Xvfb screenshots include the 76 px Chrome toolbar, so the canvas
+        # target at viewport (300, 330) is displayed at screen (300, 406).
+        corrected = self.command('vision-mark 300 406')
         self.assertNotEqual(wrong['previewToken'], corrected['previewToken'])
         stale_confirmation = self.command_raw(f"vision-click {wrong['previewToken']}")
         self.assertFalse(stale_confirmation['ok'])
@@ -4856,22 +5103,18 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertFalse(reused['ok'])
         self.assertIn('current marked preview', reused['error'])
 
-    def test_successful_semantic_click_locks_vision_fallback_again(self):
+    def test_successful_semantic_click_does_not_lock_direct_vision(self):
         self.open_fixture()
-        self.unlock_vision_fallback()
         self.command('click-css "#custom"')
         self.command('screenshot')
 
-        blocked = self.command_raw('vision-mark 300 330')
+        marked = self.command('vision-mark 300 330')
 
-        self.assertFalse(blocked['ok'])
-        self.assertIn('VISION_FALLBACK_LOCKED', blocked['error'])
-        self.assertIn('0/3', blocked['error'])
+        self.assertEqual(marked['action'], 'vision-mark')
 
     def test_full_page_images_invalidate_existing_viewport_marker(self):
         fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         self.command(f'open {fixture_url}')
-        self.unlock_vision_fallback()
         self.command('screenshot')
         first = self.command('vision-mark 60 180')
 
@@ -4891,41 +5134,31 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertFalse(marker_blocked['ok'])
         self.assertIn('VISION_SCREENSHOT_REQUIRED', marker_blocked['error'])
 
-    def test_invalid_css_on_hidden_empty_document_does_not_unlock_vision_fallback(self):
+    def test_invalid_css_does_not_lock_direct_vision(self):
         fixture_url = (ROOT / 'tests/fixture_hidden_empty.html').as_uri()
         self.command(f'open {fixture_url}')
-        for _ in range(3):
-            invalid_css = self.command_raw('click-css "["')
-            self.assertFalse(invalid_css['ok'])
-            self.assertIn('invalid CSS selector', invalid_css['error'])
-            self.assertNotIn('VISION_FALLBACK_PROGRESS', invalid_css['error'])
-        self.command('screenshot')
-        still_locked = self.command_raw('vision-mark 300 330')
-        self.assertFalse(still_locked['ok'])
-        self.assertIn('VISION_FALLBACK_LOCKED', still_locked['error'])
-        self.assertIn('0/3', still_locked['error'])
+        invalid_css = self.command_raw('click-css "["')
+        self.assertFalse(invalid_css['ok'])
+        self.assertIn('invalid CSS selector', invalid_css['error'])
 
-    def test_context_navigation_clears_failure_progress_on_return(self):
+        self.command('screenshot')
+        marked = self.command('vision-mark 300 330')
+        self.assertEqual(marked['action'], 'vision-mark')
+
+    def test_navigation_does_not_lock_direct_vision(self):
         fixture_a = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         fixture_b = (ROOT / 'tests/fixture.html').as_uri()
         self.command(f'open {fixture_a}')
-        self.unlock_vision_fallback()
         self.command(f'open {fixture_b}')
         self.command('get url')
         self.command(f'open {fixture_a}')
         self.command('screenshot')
-        locked = self.command_raw('vision-mark 300 330')
-        self.assertFalse(locked['ok'])
-        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
-        self.assertIn('0/3', locked['error'])
 
-    def test_resolved_but_disabled_ref_resets_fallback_progress(self):
+        marked = self.command('vision-mark 300 330')
+        self.assertEqual(marked['action'], 'vision-mark')
+
+    def test_disabled_ref_does_not_lock_direct_vision(self):
         self.open_fixture()
-        for count in range(1, 3):
-            blocked = self.command_raw('click-css "#pi-nodriver-missing-target"')
-            self.assertFalse(blocked['ok'])
-            self.assertIn(f'{count}/3', blocked['error'])
-
         snapshot = self.command('snapshot -i')['text']
         go_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
         disable_ref = next(line for line in snapshot.splitlines() if 'Disable go' in line).split()[0]
@@ -4936,16 +5169,14 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('disabled', disabled_result['error'])
 
         self.command('screenshot')
-        locked = self.command_raw('vision-mark 300 330')
-        self.assertFalse(locked['ok'])
-        self.assertIn('VISION_FALLBACK_LOCKED', locked['error'])
-        self.assertIn('0/3', locked['error'])
+        marked = self.command('vision-mark 300 330')
+        self.assertEqual(marked['action'], 'vision-mark')
 
-    def test_vision_mark_requires_fresh_screenshot_after_unlocking_fallback(self):
+    def test_semantic_failure_requires_a_fresh_screenshot_for_vision_mark(self):
         fixture_url = (ROOT / 'tests/fixture_vision_canvas.html').as_uri()
         self.command(f'open {fixture_url}')
         self.command('screenshot')
-        self.unlock_vision_fallback()
+        self.command_raw('click-css "#pi-nodriver-missing-target"')
         stale_shot_blocked = self.command_raw('vision-mark 300 330')
         self.assertFalse(stale_shot_blocked['ok'])
         self.assertIn('VISION_SCREENSHOT_REQUIRED', stale_shot_blocked['error'])

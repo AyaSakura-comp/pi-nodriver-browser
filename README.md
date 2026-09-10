@@ -53,7 +53,7 @@ flowchart TB
     end
 
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
-        ENGINE -->|"Interactive Mode (390x844 Android Chrome mobile viewport, touch emulation off / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
+        ENGINE -->|"Interactive Mode (390x844 Android Chrome mobile viewport, touch emulation on / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
         TAB_ACTIVE --> CHROME["Headful Google Chrome / Chromium"]
         TABS_POOL --> CHROME
@@ -188,11 +188,11 @@ See [Semantic Browser Actions: Technical Design, Workflow, and Architecture](doc
 1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `click`).
 2. Semantic fallback with `click-text` or `click-css`.
 3. Direct DOM fallback with `click-js @ref`.
-4. After **three consecutive legitimate semantic click failures on the same page**, the browser reports `VISION_FALLBACK_UNLOCKED`. Only then, for canvas or inaccessible visual-only controls, use the mandatory vision-correct sequence: `screenshot` → inspect image → `vision-mark <x> <y>` → inspect the marked image → re-mark until correct → `vision-click <preview-token>`.
+4. For canvas or inaccessible visual-only controls, use the mandatory vision-correct sequence directly: `screenshot` → inspect image → `vision-mark <x> <y>` → inspect the marked image → re-mark until correct → `vision-click <preview-token>`.
 
-Raw `click <x> <y>` is blocked, and agents must not fabricate failures merely to unlock fallback. The threshold is fixed at 3. Malformed commands, invalid selectors, stale-guard retries, infrastructure failures, and raw-coordinate attempts do not count; only explicit semantic target-resolution failures count. A successful semantic click, completed vision click, navigation, close, document reload, or different page/tab context locks fallback again.
+Raw `click <x> <y>` remains blocked, but no deliberately failed semantic clicks are required before `vision-mark` or `vision-click`.
 
-Once unlocked, `vision-mark` interprets `x y` directly in the returned screenshot's pixel coordinate system, draws the crosshair onto a copied PNG outside the untrusted page, and converts that point to dispatch coordinates using trusted CDP visual-viewport metrics. It returns a one-time token tied to the session, active tab, loader/document, URL, scroll/visual viewport, rendered-image hash, and a short TTL. Immediately before mouse dispatch, `vision-click` brings the tab forward, captures the viewport again, and requires the trusted state and clean screenshot hash to match. A newer marker or any mismatch permanently invalidates the older token. A full-page overview (`snapshot -i --full` or `screenshot --full`) intentionally cannot arm coordinate confirmation because scaled document coordinates are not current-viewport interaction coordinates.
+`vision-mark` interprets `x y` directly in the returned screenshot's pixel coordinate system and draws a high-contrast mouse cursor onto a copied PNG outside the untrusted page; its upper-left red tip is the exact click hotspot. When the screenshot and input backend are Xvfb, `vision-click` dispatches that exact 1:1 screen pixel with no viewport scaling or duplicated toolbar offset. CDP fallback separately uses the stored visual-viewport conversion. It returns a one-time token tied to the session, active tab, loader/document, URL, scroll/visual viewport, rendered-image hash, and a short TTL. Immediately before mouse dispatch, `vision-click` brings the tab forward, captures the viewport again, and requires the trusted state and clean screenshot hash to match. A newer marker or any mismatch permanently invalidates the older token. A full-page overview (`snapshot -i --full` or `screenshot --full`) intentionally cannot arm coordinate confirmation because scaled document coordinates are not current-viewport interaction coordinates.
 
 ### 2. Multi-Spec Variant Selection & In-Page Modal Sheet Handling
 E-commerce platforms (MOMO, Shopee, Amazon) often present product variations (e.g. 度數 200度~800度, 顏色, 尺寸) in dynamic bottom sheets or in-page spec drawers:
@@ -458,7 +458,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates with an Android Chrome identity, matching mobile Client Hints, a 390x844 viewport, and touch emulation disabled. Strong access-block signals trigger one fresh-target native Linux retry. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `identityUsed` and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; the internal fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
+| **`open`** | `open <url>` | Navigates with an Android Chrome identity, matching mobile Client Hints, a 390x844 viewport, and touch emulation enabled. Strong access-block signals trigger one fresh-target native Linux retry. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `identityUsed` and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; the internal fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
@@ -468,9 +468,11 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
 | **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
 | **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
-| **`vision-mark`** | `vision-mark <x> <y>` | Draws a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; returns a one-time preview token | Interactive Tab |
-| **`vision-click`** | `vision-click [preview-token]` | Consumes the visually confirmed marker token and clicks its stored viewport point (hardware click via Xvfb `xdotool`, `isTrusted: true`) | Interactive Tab |
-| **`vision-long-press`** | `vision-long-press [preview-token] [duration]` | **Vision Touch Long Press**: Dispatches a trusted touch hold at the visually confirmed point for `duration` (e.g. `2s`, `1500ms`, `1.5`, default `1000ms`) while following a deterministic minimum-jerk drift of ΔX `+6px` / ΔY `-4px` over 24 steps, with a live midway snapshot. | Interactive Tab |
+| **`vision-mark omni`** | `vision-mark omni` | Runs OmniParser V3, removes Chrome-toolbar candidates (`center y < 90`), ranks by confidence, and returns at most 15 numbered page regions with exact screenshot-pixel centers | Interactive Tab |
+| **`vision-mark`** | `vision-mark <x> <y>` | Draws a high-contrast mouse cursor whose upper-left red tip is the screenshot-pixel click hotspot; returns a one-time preview token | Interactive Tab |
+| **`vision-click` (Omni)** | `vision-click <x> <y>` | Clicks an exact center returned by the latest fresh `vision-mark omni`; arbitrary raw coordinates remain blocked | Interactive Tab |
+| **`vision-click`** | `vision-click [preview-token]` | Consumes the visually confirmed marker token; Xvfb clicks the exact screenshot pixel while CDP fallback uses its separately mapped viewport point | Interactive Tab |
+| **`vision-long-press`** | `vision-long-press [preview-token] [duration]` | **Vision Mouse Long Press**: Uses Xvfb `xdotool` to hold the left mouse button at the visually confirmed point for `duration` (e.g. `2s`, `1500ms`, `1.5`, default `1000ms`), with slight pointer jitter and a live midway snapshot. Falls back to CDP mouse events when Xvfb input is unavailable. | Interactive Tab |
 | **`vision-mark-drag`** | `vision-mark-drag <start_x> <start_y> <end_x> <end_y>` | Draws a visual drag trajectory (Green start circle ➔ Blue arrow ➔ Red end target) on screenshot for inspection and calibration without executing drag | Interactive Tab |
 | **`vision-drag`** | `vision-drag [preview-token] [duration_ms]` | Executes smooth hardware drag on Xvfb along the visually confirmed trajectory (via `xdotool` interpolation, `isTrusted: true`) | Interactive Tab |
 | **`fill`** | `fill @e6 "text"` | Clears and types only into a text-editable input/textarea/contenteditable ref; `<label>` refs fail closed | Interactive Tab |
@@ -493,7 +495,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
    - Supports seconds (`2s`, `1.5s`, `3.5`), milliseconds (`1500ms`, `2500`), or numeric inputs (values `< 50` are automatically interpreted as seconds, while `>= 50` are milliseconds).
 2. **Human Kinematic Drift**:
    - DOM `long-press` retains subtle random mouse micro-movements within a $\pm 2$px radius.
-   - `vision-long-press` uses native trusted touch events and a deterministic minimum-jerk path from the marked point to ΔX `+6px` / ΔY `-4px` over 24 steps, matching the validated touch trace.
+   - `vision-click`, `vision-long-press`, and `vision-drag` prefer trusted Xvfb mouse input; long press uses `mousedown` → timed hold with slight jitter → `mouseup`, while drag interpolates mouse movement with the button held. CDP mouse events remain the fallback.
 3. **Live Midway Snapshot Capture (50% Checkpoint)**:
    - Captures an instant non-intrusive X11 snapshot exactly halfway through the hold duration while `mousedown` remains active. The screenshot is automatically attached to the tool response (`screenshotPath`), enabling the Agent to visually verify charging bars, hold-to-reveal modals, or radial menus.
 4. **Daemon Self-Healing & Transparent Reconnection**:
@@ -507,7 +509,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
   - **適用情境**：使用者要求截圖、檢視當前可視範圍、檢查表單狀態、或進行 `vision-mark` 座標校準。
   - **運作機制**：直接從 Xvfb 擷取 `500x1000` 實體視窗畫面（包含 Chrome 分頁標籤、網址列與 1:1 實體像素座標）。
   - **Wayland / Ozone X11 強制隔離**：啟動時自動從環境變數過濾 `WAYLAND_DISPLAY` 並傳遞 `--ozone-platform=x11`，防止 Linux 桌面環境下 Chrome 誤連 Wayland 造成 Xvfb 擷取出未繪製的純黑空圖。
-  - **多 Session 自動聚焦 (`bring_to_front`)**：截取 Xvfb 實體畫面時，自動將發動請求的 session tab 帶至 Chrome 視窗最前景，確保截圖畫面永遠與當前 session 操作一致，避免分頁相互覆蓋。
+  - **多 Session 條件式聚焦 (`bring_to_front`)**：只有目標 session tab 與目前作用中 tab 不同時才切到前景；同一 tab 的連續截圖、Omni 偵測與點擊驗證不會重複搶焦點，因此原生 dropdown/menu 等 transient UI 能保持展開。
   - **全黑圖保護與 CDP 自動 Fallback**：透過 `is_empty_screenshot` 進行像素層級校驗，若 Xvfb 畫面為純黑未初始化狀態，自動無縫切換 CDP 記憶體渲染，保證 100% 回傳可用畫面。
 - **整頁長截圖 (`screenshot --full` / `snapshot -i --full`)**：
   - **適用情境**：**輔助 DOM 語意點擊 (Non-Vision Browser Click)**。當頁面很長且 Agent 需要一眼掌握全頁排版、尋找特定按鈕或標題以決定呼叫哪一個 `@ref` / `fill` / `click-text` 時使用。
@@ -519,17 +521,27 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 ---
 
+### Default Interaction Strategy
+
+The deployed default is **CDP/DOM semantic actions first, OmniParser fallback second**. Semantic refs, `find-option`, and `select` provide the fastest path for ordinary controls; `vision-mark omni` is the default fallback for visual-only or non-semantic controls. Manual screenshot marking remains available and configurable, but is not the default.
+
+Set `PI_NODRIVER_VISION_FALLBACK=manual` before starting Pi to prefer ordinary `screenshot → vision-mark <x> <y> → vision-click <token>` as the visual fallback. Unset it or set it to `omni` to restore the recommended default. `PI_NODRIVER_VISION_ONLY=1` remains available for forced vision benchmark sessions.
+
+Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-vision-safety-hardening.md`](docs/plans/2026-09-11-vision-safety-hardening.md), including process-wide Xvfb serialization, complete preview lifecycle cleanup, checked `xdotool` exit status, and DOM/geometry freshness for Omni candidates.
+
 ### Environment Variables & Display Configuration
 
 | Variable | Default | Description |
 |---|---|---|
+| `PI_NODRIVER_VISION_FALLBACK` | `omni` (default) | Visual fallback after CDP/DOM semantic actions. Use `omni` for `vision-mark omni` (recommended) or `manual` for screenshot/cursor-marker fallback. |
+| `PI_NODRIVER_VISION_ONLY` | `0` | Set `1` only for forced vision benchmarks; normal deployment keeps CDP/DOM available. |
 | `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + 390x844 mobile viewport without clipping). |
 | `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
-| `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height offset in pixels for X11 screen coordinates calculation. |
+| `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height used only when converting viewport-origin coordinates to X11 screen coordinates. Xvfb-backed `vision-click` already has screenshot/screen coordinates and does not add it again. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
-| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM `long-press`; `vision-long-press` instead uses its fixed 24-step native-touch minimum-jerk path. |
+| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM and vision mouse long presses. |
 | `PI_NODRIVER_LONG_PRESS_JITTER_PX` | `2.0` | Maximum radius (in pixels) for human micro-jitter drift during long-press holding. |
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
 | `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |

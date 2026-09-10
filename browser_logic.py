@@ -621,20 +621,8 @@ class VisionFallbackGuard:
         return count, count >= self.threshold
 
     def require_unlocked(self, session_id: str, context: VisionFallbackContext) -> None:
-        if os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '1') == '1' or os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
-            return
-        previous = self._failures.get(session_id)
-        if previous and previous[0] != context:
-            self._failures.pop(session_id, None)
-            previous = None
-        count = previous[1] if previous else 0
-        if count < self.threshold:
-            raise ValueError(
-                f'VISION_FALLBACK_LOCKED: vision-mark is available only after '
-                f'{self.threshold} consecutive semantic target-resolution failures on the current page/document '
-                f'({count}/{self.threshold} recorded). Keep using @ref, click-text, click-css, or '
-                f'click-js; do not fabricate failures just to unlock coordinate fallback.'
-            )
+        """Compatibility no-op: guarded vision previews are always available."""
+        return
 
     def observe_context(self, session_id: str, context: VisionFallbackContext) -> None:
         previous = self._failures.get(session_id)
@@ -667,6 +655,9 @@ def map_screenshot_point_to_viewport(
     image_height: int,
     x: float,
     y: float,
+    *,
+    capture_backend: str = 'cdp',
+    toolbar_height: float = 0,
 ) -> tuple[float, float]:
     dimensions = (
         float(image_width), float(image_height),
@@ -674,11 +665,20 @@ def map_screenshot_point_to_viewport(
     )
     if not all(math.isfinite(value) and value > 0 for value in dimensions):
         raise ValueError('vision screenshot and visual viewport dimensions must be finite and positive')
-    if not all(math.isfinite(value) for value in (x, y)):
+    if not all(math.isfinite(value) for value in (x, y, toolbar_height)):
         raise ValueError('vision screenshot coordinates must be finite')
+    if capture_backend not in {'xvfb', 'cdp'}:
+        raise ValueError('vision screenshot capture backend must be xvfb or cdp')
+    content_y = y
+    content_height = float(image_height)
+    if capture_backend == 'xvfb':
+        if toolbar_height < 0 or toolbar_height >= image_height:
+            raise ValueError('Xvfb toolbar height must fit inside the screenshot')
+        content_y -= toolbar_height
+        content_height -= toolbar_height
     return (
         x * page.visual_width / image_width,
-        y * page.visual_height / image_height,
+        content_y * page.visual_height / content_height,
     )
 
 
@@ -753,6 +753,7 @@ class VisionMarker:
     page: VisionPageState
     image_hash: str
     created_at: float
+    capture_backend: str = 'cdp'
     is_drag: bool = False
     end_x: float = 0.0
     end_y: float = 0.0
@@ -785,6 +786,7 @@ class VisionCorrectnessGuard:
         image_height: int | None = None,
         click_x: float | None = None,
         click_y: float | None = None,
+        capture_backend: str = 'cdp',
     ) -> VisionMarker:
         screenshot = self._screenshots.get(session_id)
         if screenshot is None:
@@ -820,10 +822,13 @@ class VisionCorrectnessGuard:
             raise ValueError('vision click coordinates must be finite')
         if not image_hash:
             raise ValueError('vision marker requires a rendered screenshot hash')
+        if capture_backend not in {'xvfb', 'cdp'}:
+            raise ValueError('vision marker capture backend must be xvfb or cdp')
         marker = VisionMarker(
             token=token, x=x, y=y, click_x=click_x, click_y=click_y,
             image_width=int(image_width), image_height=int(image_height),
-            page=page, image_hash=image_hash, created_at=self.clock()
+            page=page, image_hash=image_hash, created_at=self.clock(),
+            capture_backend=capture_backend,
         )
         self._markers[session_id] = marker
         self._screenshots[session_id] = (page, self.clock())
@@ -845,6 +850,7 @@ class VisionCorrectnessGuard:
         click_y1: float | None = None,
         click_x2: float | None = None,
         click_y2: float | None = None,
+        capture_backend: str = 'cdp',
     ) -> VisionMarker:
         screenshot = self._screenshots.get(session_id)
         if screenshot is None:
@@ -880,11 +886,14 @@ class VisionCorrectnessGuard:
             raise ValueError('vision drag coordinates must be finite')
         if not image_hash:
             raise ValueError('vision marker requires a rendered screenshot hash')
+        if capture_backend not in {'xvfb', 'cdp'}:
+            raise ValueError('vision marker capture backend must be xvfb or cdp')
         marker = VisionMarker(
             token=token, x=x1, y=y1, click_x=click_x1, click_y=click_y1,
             image_width=int(image_width), image_height=int(image_height),
             page=page, image_hash=image_hash, created_at=self.clock(),
-            is_drag=True, end_x=x2, end_y=y2, click_end_x=click_x2, click_end_y=click_y2
+            capture_backend=capture_backend, is_drag=True, end_x=x2, end_y=y2,
+            click_end_x=click_x2, click_end_y=click_y2,
         )
         self._markers[session_id] = marker
         self._screenshots[session_id] = (page, self.clock())
@@ -919,12 +928,11 @@ class VisionCorrectnessGuard:
                 'take a fresh screenshot and mark again'
             )
         if marker.image_hash != image_hash:
-            if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') != '1' and os.environ.get('PI_NODRIVER_ALLOW_DIRECT_VISION', '1') != '1':
-                self._markers.pop(session_id, None)
-                raise ValueError(
-                    'VISION_CONFIRMATION_REQUIRED: rendered content changed after the marked preview; '
-                    'take a fresh screenshot and mark again'
-                )
+            self._markers.pop(session_id, None)
+            raise ValueError(
+                'VISION_CONFIRMATION_REQUIRED: rendered content changed after the marked preview; '
+                'take a fresh screenshot and mark again'
+            )
         self._markers.pop(session_id, None)
         return marker
 

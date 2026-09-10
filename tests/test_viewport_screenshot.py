@@ -79,6 +79,36 @@ class ViewportScreenshotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(output.is_file())
                 page.save_screenshot.assert_awaited_once()
                 self.assertFalse(BrowserWorker.is_empty_screenshot(output))
+                self.assertEqual(worker.screenshot_capture_backends[str(output)], 'cdp')
+
+    async def test_ensure_page_front_rechecks_visibility_when_cached_target_is_stale(self):
+        worker = BrowserWorker()
+        page = SimpleNamespace(
+            target=SimpleNamespace(target_id='cached-page'),
+            evaluate=AsyncMock(return_value='hidden'),
+            bring_to_front=AsyncMock(),
+        )
+        worker.xvfb_active_target_id = 'cached-page'
+
+        activated = await worker.ensure_page_front(page)
+
+        self.assertTrue(activated)
+        page.evaluate.assert_awaited_once()
+        page.bring_to_front.assert_awaited_once()
+
+    async def test_ensure_page_front_fails_closed_when_visibility_check_fails(self):
+        worker = BrowserWorker()
+        page = SimpleNamespace(
+            target=SimpleNamespace(target_id='cached-page'),
+            evaluate=AsyncMock(side_effect=RuntimeError('context unavailable')),
+            bring_to_front=AsyncMock(),
+        )
+        worker.xvfb_active_target_id = 'cached-page'
+
+        activated = await worker.ensure_page_front(page)
+
+        self.assertTrue(activated)
+        page.bring_to_front.assert_awaited_once()
 
     async def test_save_viewport_screenshot_switches_session_pages(self):
         worker = BrowserWorker()

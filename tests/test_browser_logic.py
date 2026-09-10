@@ -234,68 +234,27 @@ class VisionCommandParsingTests(unittest.TestCase):
 
 
 class VisionFallbackGuardTests(unittest.TestCase):
-    def setUp(self):
-        self.env_patcher = patch.dict(os.environ, {'PI_NODRIVER_ALLOW_DIRECT_VISION': '0', 'PI_NODRIVER_VISION_ONLY': '0'})
-        self.env_patcher.start()
-        self.addCleanup(self.env_patcher.stop)
-        self.guard = VisionFallbackGuard(threshold=3)
-        self.page = VisionFallbackContext('tab-a', 'https://example.test/', 'loader-a')
+    def test_direct_vision_is_never_locked_by_legacy_environment_flags(self):
+        guard = VisionFallbackGuard(threshold=3)
+        page = VisionFallbackContext('tab-a', 'https://example.test/', 'loader-a')
 
-    def test_stays_locked_until_three_semantic_click_failures(self):
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', self.page)
+        with patch.dict(os.environ, {
+            'PI_NODRIVER_ALLOW_DIRECT_VISION': '0',
+            'PI_NODRIVER_VISION_ONLY': '0',
+        }):
+            guard.require_unlocked('session-a', page)
 
-        self.assertEqual(self.guard.record_failure('session-a', self.page), (1, False))
-        self.assertEqual(self.guard.record_failure('session-a', self.page), (2, False))
-        self.assertEqual(self.guard.record_failure('session-a', self.page), (3, True))
-        self.guard.require_unlocked('session-a', self.page)
-
-    def test_different_page_does_not_inherit_unlock(self):
-        for _ in range(3):
-            self.guard.record_failure('session-a', self.page)
+    def test_direct_access_survives_context_changes_and_resets(self):
+        guard = VisionFallbackGuard(threshold=3)
+        page = VisionFallbackContext('tab-a', 'https://example.test/', 'loader-a')
         other = VisionFallbackContext('tab-b', 'https://example.test/next', 'loader-b')
 
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', other)
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', self.page)
+        guard.record_failure('session-a', page)
+        guard.observe_context('session-a', other)
+        guard.reset('session-a')
 
-    def test_same_url_reload_does_not_inherit_unlock(self):
-        for _ in range(3):
-            self.guard.record_failure('session-a', self.page)
-        reloaded = VisionFallbackContext('tab-a', self.page.url, 'loader-b')
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', reloaded)
-
-    def test_success_reset_locks_fallback_again(self):
-        for _ in range(3):
-            self.guard.record_failure('session-a', self.page)
-        self.guard.reset('session-a')
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', self.page)
-
-    def test_observe_context_clears_failures_when_context_changes(self):
-        for _ in range(3):
-            self.guard.record_failure('session-a', self.page)
-        other = VisionFallbackContext('tab-b', 'https://example.test/other', 'loader-b')
-        self.guard.observe_context('session-a', other)
-
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', self.page)
-        with self.assertRaisesRegex(ValueError, r'0/3'):
-            self.guard.require_unlocked('session-a', other)
-
-    def test_observe_context_keeps_failures_when_context_matches(self):
-        self.guard.record_failure('session-a', self.page)
-        self.guard.observe_context('session-a', self.page)
-        self.assertEqual(self.guard.record_failure('session-a', self.page), (2, False))
-
-    def test_threshold_is_fixed_at_three(self):
-        for threshold in (0, 1, 2, 4, 11):
-            with self.subTest(threshold=threshold), self.assertRaisesRegex(ValueError, 'fixed at 3'):
-                VisionFallbackGuard(threshold=threshold)
+        guard.require_unlocked('session-a', page)
+        guard.require_unlocked('session-a', other)
 
     def test_only_well_formed_semantic_clicks_count_as_attempts(self):
         accepted = [
@@ -332,6 +291,20 @@ class VisionCoordinateMappingTests(unittest.TestCase):
             map_screenshot_point_to_viewport(page, 390, 844, 300, 330),
             (150.0, 165.0),
         )
+
+    def test_xvfb_mapping_removes_toolbar_before_scaling_to_viewport(self):
+        page = VisionPageState(
+            'tab-a', 'https://example.test/', 390, 844,
+            visual_width=390, visual_height=844, visual_scale=1,
+        )
+
+        x, y = map_screenshot_point_to_viewport(
+            page, 500, 1000, 250, 538,
+            capture_backend='xvfb', toolbar_height=76,
+        )
+
+        self.assertAlmostEqual(x, 195)
+        self.assertAlmostEqual(y, 422)
 
     def test_maps_nonstandard_webui_screenshot_size(self):
         page = VisionPageState(
@@ -464,6 +437,18 @@ class VisionCorrectnessGuardTests(unittest.TestCase):
             self.guard.consume_marker('session-a', self.page, token, 'hash-b')
         with self.assertRaisesRegex(ValueError, 'current marked preview'):
             self.guard.consume_marker('session-a', self.page, token, 'hash-a')
+
+    def test_default_xvfb_environment_still_rejects_rendered_content_change(self):
+        token = '0123456789abcdef01234567'
+        self.guard.record_screenshot('session-a', self.page)
+        self.guard.issue_marker('session-a', self.page, 120, 300, token, 'hash-a')
+
+        with patch.dict(os.environ, {
+            'PI_NODRIVER_XVFB_FORWARD_CLICK': '1',
+            'PI_NODRIVER_ALLOW_DIRECT_VISION': '1',
+        }):
+            with self.assertRaisesRegex(ValueError, 'rendered content changed'):
+                self.guard.consume_marker('session-a', self.page, token, 'hash-b')
 
     def test_issues_and_consumes_drag_marker(self):
         token = '0123456789abcdef01234567'

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import fcntl
 import hashlib
 import http.client
@@ -32,7 +33,7 @@ MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
     'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
-    'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'open', 'press', 'press-hold', 'screenshot',
+    'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'omniparse', 'open', 'press', 'press-hold', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'touch-drift', 'type', 'upload',
     'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
@@ -110,12 +111,17 @@ IMAGE_IPV4_TRANSLATABLE = ipaddress.ip_network('::ffff:0:0:0/96')
 
 # Commands that observe the page without changing it. Repeating one of these
 # verbatim cannot produce new information, so an identical repeat is a loop.
-NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'vision-mark', 'get', 'downloads', 'download-info', 'find-option'}
+NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'omniparse', 'vision-mark', 'get', 'downloads', 'download-info', 'find-option'}
 REPEAT_LIMIT = 3
 VISION_INVALIDATING_ACTIONS = {
-    'click-css', 'click-js', 'click-text', 'close', 'dismiss', 'download', 'fill',
-    'fill-submit', 'fill_submit', 'open', 'press', 'scroll', 'select', 'shutdown',
-    'switch', 'type', 'upload', 'wait-popup', 'wait-popup-close',
+    'click', 'click-css', 'click-js', 'click-text', 'close', 'dismiss', 'download',
+    'fill', 'fill-submit', 'fill_submit', 'long-press', 'longpress', 'open', 'press',
+    'press-hold', 'scroll', 'select', 'shutdown', 'switch', 'type', 'upload',
+    'wait-popup', 'wait-popup-close',
+}
+OMNI_ONLY_INVALIDATING_ACTIONS = {
+    'omniparse', 'touch-drift', 'vision-drag', 'vision-long-press', 'vision-longpress',
+    'vision-mark', 'vision-mark-drag',
 }
 
 
@@ -1701,6 +1707,9 @@ class BrowserWorker:
             ttl_seconds=float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
         )
         self.vision_fallback_guard = VisionFallbackGuard()
+        self.omni_previews = {}
+        self.screenshot_capture_backends = {}
+        self.xvfb_active_target_id = None
         self.max_tabs = int(os.environ.get('PI_NODRIVER_MAX_TABS', '20'))
         self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
         self.tab_management_lock = asyncio.Lock()
@@ -1888,6 +1897,24 @@ class BrowserWorker:
 
     def touch_tab(self, page):
         self.tab_registry.touch(page)
+
+    @staticmethod
+    def page_target_id(page):
+        return getattr(getattr(page, 'target', None), 'target_id', None)
+
+    async def ensure_page_front(self, page):
+        target_id = self.page_target_id(page)
+        if target_id is not None and target_id == self.xvfb_active_target_id:
+            try:
+                if await page.evaluate('document.visibilityState') == 'visible':
+                    return False
+            except Exception:
+                # Fail closed: cached focus is only trusted after the target proves
+                # it is still visible. A stale cache could otherwise expose another session.
+                pass
+        await page.bring_to_front()
+        self.xvfb_active_target_id = target_id
+        return True
 
     async def vision_fallback_context(self, page):
         state = await self.vision_page_state(page)
@@ -3347,7 +3374,7 @@ class BrowserWorker:
                 while openers:
                     opener = openers.pop()
                     if opener in self.browser.tabs:
-                        await opener.bring_to_front()
+                        await self.ensure_page_front(opener)
                         self.pages[session_id] = opener
                         self.switch_session_action_target(session_id, opener)
                         self.touch_tab(opener)
@@ -3423,8 +3450,9 @@ class BrowserWorker:
     async def save_viewport_screenshot(self, page, prefix):
         try:
             if hasattr(page, 'bring_to_front'):
-                await page.bring_to_front()
-                await asyncio.sleep(0.05)
+                activated = await self.ensure_page_front(page)
+                if activated:
+                    await asyncio.sleep(0.05)
         except Exception:
             pass
         output_dir = Path(tempfile.mkdtemp(prefix=prefix))
@@ -3444,6 +3472,9 @@ class BrowserWorker:
                     await asyncio.wait_for(proc.wait(), timeout=screenshot_timeout)
                     if output.is_file() and output.stat().st_size > 0:
                         if not self.is_empty_screenshot(output):
+                            self.screenshot_capture_backends[str(output)] = 'xvfb'
+                            if len(self.screenshot_capture_backends) > 128:
+                                self.screenshot_capture_backends.pop(next(iter(self.screenshot_capture_backends)))
                             return output
                 except Exception:
                     pass
@@ -3455,11 +3486,126 @@ class BrowserWorker:
             )
         except TimeoutError as error:
             raise TimeoutError(f'screenshot timed out after {screenshot_timeout:g} seconds') from error
+        self.screenshot_capture_backends[str(output)] = 'cdp'
+        if len(self.screenshot_capture_backends) > 128:
+            self.screenshot_capture_backends.pop(next(iter(self.screenshot_capture_backends)))
         return output
+
+    async def call_omniparser(self, screenshot_path):
+        endpoint = urllib.parse.urlparse(
+            os.environ.get('PI_NODRIVER_OMNIPARSER_URL', 'http://127.0.0.1:8012/parse')
+        )
+        if endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost'}:
+            raise ValueError('OmniParser endpoint must be a local HTTP URL')
+        payload = json.dumps({
+            'image_base64': base64.b64encode(Path(screenshot_path).read_bytes()).decode('ascii')
+        }).encode('utf-8')
+
+        def request():
+            connection = http.client.HTTPConnection(
+                endpoint.hostname, endpoint.port or 80,
+                timeout=float(os.environ.get('PI_NODRIVER_OMNIPARSER_TIMEOUT', '30')),
+            )
+            try:
+                connection.request(
+                    'POST', endpoint.path or '/parse', body=payload,
+                    headers={'Content-Type': 'application/json'},
+                )
+                response = connection.getresponse()
+                body = response.read()
+                if response.status != 200:
+                    raise RuntimeError(
+                        f'OmniParser returned HTTP {response.status}: {body[:300].decode(errors="replace")}'
+                    )
+                return json.loads(body)
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(request)
 
     @staticmethod
     def screenshot_hash(path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    @staticmethod
+    def filter_omni_page_candidates(
+        elements, min_y=90, limit=15, *, image_width=None, image_height=None,
+        capture_backend='xvfb',
+    ):
+        if capture_backend not in {'xvfb', 'cdp'}:
+            raise ValueError('Omni capture backend must be xvfb or cdp')
+        effective_min_y = float(min_y) if capture_backend == 'xvfb' else 0.0
+        validated = []
+        for element in elements:
+            center = element.get('center', [])
+            box = element.get('box', [])
+            if len(center) < 2 or len(box) < 4:
+                continue
+            try:
+                center_x, center_y = (float(value) for value in center[:2])
+                x1, y1, x2, y2 = (float(value) for value in box[:4])
+                confidence = float(element.get('confidence', 0))
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (
+                center_x, center_y, x1, y1, x2, y2, confidence
+            )):
+                continue
+            if center_x < 0 or center_y < effective_min_y or x1 < 0 or y1 < 0:
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if image_width is not None and (
+                center_x >= image_width or x2 > image_width
+            ):
+                continue
+            if image_height is not None and (
+                center_y >= image_height or y2 > image_height
+            ):
+                continue
+            candidate = dict(element)
+            candidate['center'] = [center_x, center_y]
+            candidate['box'] = [x1, y1, x2, y2]
+            candidate['confidence'] = confidence
+            validated.append(candidate)
+        ranked = sorted(
+            validated,
+            key=lambda element: element['confidence'],
+            reverse=True,
+        )[:limit]
+        filtered = []
+        for new_id, element in enumerate(ranked):
+            candidate = dict(element)
+            candidate['sourceId'] = element.get('id')
+            candidate['id'] = new_id
+            filtered.append(candidate)
+        return filtered
+
+    @staticmethod
+    def annotate_omni_candidates(clean_path, output_path, elements):
+        with Image.open(clean_path) as source:
+            image = source.convert('RGB')
+        draw = ImageDraw.Draw(image)
+        scale = max(1.0, min(image.width / 390, image.height / 844))
+        line_width = max(2, round(2 * scale))
+        for element in elements:
+            box = element.get('box', [])
+            if len(box) < 4:
+                continue
+            x1, y1, x2, y2 = (round(float(value)) for value in box[:4])
+            draw.rectangle((x1, y1, x2, y2), outline='#00e5ff', width=line_width)
+            label = str(element.get('id', '?'))
+            text_box = draw.textbbox((x1, y1), label)
+            label_width = text_box[2] - text_box[0] + 6
+            label_height = text_box[3] - text_box[1] + 4
+            label_top = max(0, y1 - label_height)
+            draw.rectangle(
+                (x1, label_top, x1 + label_width, label_top + label_height),
+                fill='#111111', outline='#00e5ff', width=1,
+            )
+            draw.text((x1 + 3, label_top + 1), label, fill='#ffffff')
+        image.save(output_path, format='PNG')
+        return Path(output_path)
 
     @staticmethod
     def annotate_vision_screenshot(clean_path, x, y):
@@ -3467,37 +3613,41 @@ class BrowserWorker:
         output = clean_path.with_name('marked-screenshot.png')
         with Image.open(clean_path) as source:
             image = source.convert('RGB')
-        center_x = round(x)
-        center_y = round(y)
+        hotspot_x = round(x)
+        hotspot_y = round(y)
         scale = max(1.0, min(image.width / 390, image.height / 844))
-        radius = round(26 * scale)
-        outer_width = max(7, round(7 * scale))
-        inner_width = max(4, round(4 * scale))
-        line_radius = round(38 * scale)
+        def point(dx, dy):
+            return (
+                hotspot_x + round(dx * scale),
+                hotspot_y + round(dy * scale),
+            )
+
+        # Conventional mouse cursor: the sharp upper-left tip is the exact
+        # click hotspot. A small red/white dot makes that single pixel rule
+        # explicit while the high-contrast arrow remains visible on any UI.
+        polygon = [
+            point(0, 0), point(5, 32), point(13, 23), point(22, 43),
+            point(30, 39), point(20, 20), point(33, 19),
+        ]
         draw = ImageDraw.Draw(image)
-        bounds = (
-            center_x - radius,
-            center_y - radius,
-            center_x + radius,
-            center_y + radius,
-        )
-        draw.ellipse(bounds, outline='#ffffff', width=outer_width)
-        draw.ellipse(bounds, outline='#ff1744', width=inner_width)
+        draw.polygon(polygon, fill='#ffffff', outline='#111111')
         draw.line(
-            (center_x - line_radius, center_y, center_x + line_radius, center_y),
-            fill='#ffffff', width=outer_width,
+            polygon + [polygon[0]],
+            fill='#111111',
+            width=max(2, round(3 * scale)),
+            joint='curve',
         )
-        draw.line(
-            (center_x, center_y - line_radius, center_x, center_y + line_radius),
-            fill='#ffffff', width=outer_width,
-        )
-        draw.line(
-            (center_x - line_radius, center_y, center_x + line_radius, center_y),
-            fill='#ff1744', width=inner_width,
-        )
-        draw.line(
-            (center_x, center_y - line_radius, center_x, center_y + line_radius),
-            fill='#ff1744', width=inner_width,
+        hotspot_radius = max(3, round(3 * scale))
+        draw.ellipse(
+            (
+                hotspot_x - hotspot_radius,
+                hotspot_y - hotspot_radius,
+                hotspot_x + hotspot_radius,
+                hotspot_y + hotspot_radius,
+            ),
+            fill='#ff1744',
+            outline='#ffffff',
+            width=max(1, round(scale)),
         )
         image.save(output, format='PNG')
         return output
@@ -3811,10 +3961,9 @@ class BrowserWorker:
     def is_owned_popup(opener, popup):
         return popup.target.opener_id == opener.target.target_id
 
-    async def xvfb_mouse_click(self, page, x, y):
-        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
-        screen_x = int(round(float(x)))
-        screen_y = int(round(float(y))) + toolbar_height
+    async def xvfb_mouse_click(self, page, screen_x, screen_y):
+        screen_x = int(round(float(screen_x)))
+        screen_y = int(round(float(screen_y)))
         display = os.environ.get('DISPLAY')
         if display:
             try:
@@ -3831,11 +3980,10 @@ class BrowserWorker:
         return False
 
     async def xvfb_mouse_drag(self, page, start_x, start_y, end_x, end_y, duration_ms=500):
-        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
         sx1 = int(round(float(start_x)))
-        sy1 = int(round(float(start_y))) + toolbar_height
+        sy1 = int(round(float(start_y)))
         sx2 = int(round(float(end_x)))
-        sy2 = int(round(float(end_y))) + toolbar_height
+        sy2 = int(round(float(end_y)))
         display = os.environ.get('DISPLAY')
         if display:
             try:
@@ -3871,10 +4019,23 @@ class BrowserWorker:
                 pass
         return False
 
-    async def native_drag(self, page, start_x, start_y, end_x, end_y, duration_ms=500):
-        await page.bring_to_front()
+    async def native_drag(
+        self, page, start_x, start_y, end_x, end_y, duration_ms=500,
+        xvfb_screen_points=None,
+    ):
+        await self.ensure_page_front(page)
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
-            if await self.xvfb_mouse_drag(page, start_x, start_y, end_x, end_y, duration_ms):
+            if xvfb_screen_points is None:
+                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                xvfb_screen_points = (
+                    (start_x, start_y + toolbar_height),
+                    (end_x, end_y + toolbar_height),
+                )
+            (screen_start_x, screen_start_y), (screen_end_x, screen_end_y) = xvfb_screen_points
+            if await self.xvfb_mouse_drag(
+                page, screen_start_x, screen_start_y, screen_end_x, screen_end_y,
+                duration_ms,
+            ):
                 await page.sleep(0.2)
                 return True
         try:
@@ -3946,7 +4107,9 @@ class BrowserWorker:
 
         # Setup has its own cumulative deadline and is deliberately outside the
         # touch cleanup region: no touchEnd is sent unless touchStart is attempted.
-        await await_bounded_operation(page.bring_to_front(), 'bring-to-front setup', setup_deadline)
+        await await_bounded_operation(
+            self.ensure_page_front(page), 'bring-to-front setup', setup_deadline
+        )
         viewport = await await_bounded_operation(
             self.vision_page_state(page), 'viewport lookup setup', setup_deadline
         )
@@ -4075,9 +4238,8 @@ class BrowserWorker:
         return {'offsets': offsets, 'midwayPath': midway_path}
 
     async def xvfb_mouse_long_press(self, page, x, y, duration_ms=1000, capture_midway=True):
-        toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
         screen_x = int(round(float(x)))
-        screen_y = int(round(float(y))) + toolbar_height
+        screen_y = int(round(float(y)))
         jitter_enabled = os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER', '1') == '1'
         max_jitter = float(os.environ.get('PI_NODRIVER_LONG_PRESS_JITTER_PX', '2.0'))
         display = os.environ.get('DISPLAY')
@@ -4143,13 +4305,20 @@ class BrowserWorker:
         return False
 
     async def native_long_press(
-        self, page, x, y, duration_ms=1000, capture_midway=True, before_dispatch=None
+        self, page, x, y, duration_ms=1000, capture_midway=True, before_dispatch=None,
+        xvfb_screen_point=None,
     ):
-        await page.bring_to_front()
+        await self.ensure_page_front(page)
         if before_dispatch is not None:
             await before_dispatch()
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
-            res = await self.xvfb_mouse_long_press(page, x, y, duration_ms, capture_midway=capture_midway)
+            if xvfb_screen_point is None:
+                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                xvfb_screen_point = (x, y + toolbar_height)
+            res = await self.xvfb_mouse_long_press(
+                page, *xvfb_screen_point, duration_ms,
+                capture_midway=capture_midway,
+            )
             if res:
                 await page.sleep(0.2)
                 return res if isinstance(res, (str, Path)) else None
@@ -4204,10 +4373,14 @@ class BrowserWorker:
             return None
 
     async def mouse_click_allowing_target_close(
-        self, page, x, y, timeout_seconds=1.0, prefer_xvfb=False
+        self, page, x, y, timeout_seconds=1.0, prefer_xvfb=False,
+        xvfb_screen_point=None,
     ):
         if prefer_xvfb and os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
-            if await self.xvfb_mouse_click(page, x, y):
+            if xvfb_screen_point is None:
+                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                xvfb_screen_point = (x, y + toolbar_height)
+            if await self.xvfb_mouse_click(page, *xvfb_screen_point):
                 return True
         try:
             await asyncio.wait_for(
@@ -4221,7 +4394,9 @@ class BrowserWorker:
                 return False
             raise TimeoutError('native mouse click did not complete')
 
-    async def native_click(self, page, x, y, before_dispatch=None):
+    async def native_click(
+        self, page, x, y, before_dispatch=None, xvfb_screen_point=None
+    ):
         minimum_settle_seconds = 0.1
         maximum_settle_seconds = 0.5
         new_tab_timeout_seconds = 2.0
@@ -4230,7 +4405,7 @@ class BrowserWorker:
         before_target_ids = {tab.target.target_id for tab in self.browser.tabs}
         clicking_page = page
         before_url = page.url
-        await page.bring_to_front()
+        await self.ensure_page_front(page)
         try:
             expect_new_tab = bool(await page.evaluate(f'''(() => {{
               window.__piClickSettle?.observer?.disconnect();
@@ -4258,11 +4433,13 @@ class BrowserWorker:
 
         if before_dispatch is not None:
             await before_dispatch()
-        # DOM-resolved targets use CDP mouse coordinates, which remain exact when
-        # Android mobile metrics run without touch emulation. Vision-confirmed
-        # coordinates retain Xvfb hardware forwarding via their revalidation callback.
+        # DOM-resolved targets use CDP mouse coordinates. Vision-confirmed coordinates
+        # retain Xvfb hardware forwarding; Android touch emulation converts those
+        # trusted mouse events for native mobile controls such as <select>.
         click_completed = await self.mouse_click_allowing_target_close(
-            page, x, y, prefer_xvfb=before_dispatch is not None
+            page, x, y,
+            prefer_xvfb=before_dispatch is not None,
+            xvfb_screen_point=xvfb_screen_point,
         )
         if not click_completed:
             return page
@@ -4283,7 +4460,7 @@ class BrowserWorker:
                 ]
                 if owned_popups:
                     page = owned_popups[-1]
-                    await page.bring_to_front()
+                    await self.ensure_page_front(page)
                     before_tabs = len(self.browser.tabs)
                     before_target_ids = {tab.target.target_id for tab in self.browser.tabs}
                     before_url = page.url
@@ -4335,7 +4512,7 @@ class BrowserWorker:
             while openers:
                 opener = openers.pop()
                 if opener in self.browser.tabs:
-                    await opener.bring_to_front()
+                    await self.ensure_page_front(opener)
                     self.switch_session_action_target(session_id, opener)
                     self.popup_just_closed.add(session_id)
                     return opener
@@ -4477,38 +4654,10 @@ class BrowserWorker:
                     and self.pages.get(session_id) is recovered_popup_opener
                 ):
                     self.popup_just_closed.add(session_id)
-        except (StaleRefError, SemanticClickTargetError) as error:
-            if semantic_click and fallback_context is not None:
-                current_page = self.pages.get(session_id)
-                fallback_context_after = None
-                if current_page is not None:
-                    try:
-                        fallback_context_after = await self.vision_fallback_context(current_page)
-                    except Exception:
-                        pass
-                if fallback_context_after == fallback_context:
-                    self.vision_guard.invalidate(session_id)
-                    count, unlocked = self.vision_fallback_guard.record_failure(
-                        session_id, fallback_context
-                    )
-                    state = 'UNLOCKED' if unlocked else 'PROGRESS'
-                    next_step = (
-                        'Vision fallback is now unlocked on this page. Take and inspect a fresh screenshot, '
-                        'then use vision-mark only if semantic interaction is genuinely unavailable.'
-                        if unlocked else
-                        'Vision fallback remains locked; continue with semantic controls and do not fabricate failures.'
-                    )
-                    progress_message = (
-                        f'VISION_FALLBACK_{state}: semantic target-resolution failure '
-                        f'{count}/{self.vision_fallback_guard.threshold}. {next_step}'
-                    )
-                    if isinstance(error, StaleRefError):
-                        error.vision_fallback_progress = (count, unlocked)
-                        error.vision_fallback_message = progress_message
-                        raise
-                    raise ValueError(f'{error}\n{progress_message}') from error
-                else:
-                    self.vision_fallback_guard.reset(session_id)
+        except (StaleRefError, SemanticClickTargetError):
+            # Vision preview is directly available; semantic failures are never used
+            # as an unlock counter or encouraged as a prerequisite.
+            self.vision_guard.invalidate(session_id)
             raise
         if semantic_click or action in {
             'open', 'close', 'switch', 'wait-popup', 'wait-popup-close', 'vision-click'
@@ -4526,6 +4675,9 @@ class BrowserWorker:
         self.track_repeat(session_id, action, parts)
         if action in VISION_INVALIDATING_ACTIONS:
             self.vision_guard.invalidate(session_id)
+            self.omni_previews.pop(session_id, None)
+        elif action in OMNI_ONLY_INVALIDATING_ACTIONS:
+            self.omni_previews.pop(session_id, None)
         if action in {'click', 'click-js', 'vision-click', 'press', 'fill', 'open', 'type', 'select', 'upload', 'dismiss', 'fill-submit', 'fill_submit'}:
             self.scroll_history[session_id] = []
         uses_ref = (
@@ -4683,7 +4835,7 @@ class BrowserWorker:
                 await page.send(uc.cdp.emulation.set_device_metrics_override(
                     width=w, height=h, device_scale_factor=3.0, mobile=True
                 ))
-                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=False))
+                await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
                 page._is_mobile_mode = True
 
                 await page.get(target_url)
@@ -4711,7 +4863,7 @@ class BrowserWorker:
                     await page.send(uc.cdp.emulation.set_device_metrics_override(
                         width=w, height=h, device_scale_factor=3.0, mobile=True
                     ))
-                    await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=False))
+                    await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
                     page._is_mobile_mode = True
                     await page.get(target_url)
                     await self.configure_download_session(session_id, page)
@@ -4822,7 +4974,7 @@ class BrowserWorker:
             return {
                 'text': (
                     f'Opened {page.url or parts[1]} ({identity_text}; mobile viewport '
-                    f'390x844; touch emulation off)\n\nInteractive elements on page:\n{snapshot_text}'
+                    f'390x844; touch emulation on)\n\nInteractive elements on page:\n{snapshot_text}'
                 ),
                 'action': action,
                 'url': page.url or parts[1],
@@ -4838,6 +4990,7 @@ class BrowserWorker:
 
             if is_full:
                 self.vision_guard.invalidate(session_id)
+                self.omni_previews.pop(session_id, None)
                 output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-full-'))
                 output = output_dir / 'overview.jpg'
                 screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -4850,10 +5003,9 @@ class BrowserWorker:
                         'Visual overview only; no DOM refs were generated. Inspect the image first. '
                         'Do not click coordinates from this overview. Run snapshot -i in the relevant viewport, '
                         'then prefer @ref, click-text, click-css, fill, or select—including controls inside iframes. '
-                        f'For a canvas or visual-only control, coordinate fallback remains locked until '
-                        f'{self.vision_fallback_guard.threshold} consecutive semantic target-resolution failures '
-                        'occur on this page/document. Once unlocked, move to its real viewport and use '
-                        'screenshot, then vision-mark <x> <y>, inspect the marked image, and vision-click its preview token. '
+                        'For a canvas or visual-only control, move to its real viewport and use screenshot, '
+                        'then vision-mark <x> <y>, inspect the marked image, and vision-click its preview token; '
+                        'no deliberately failed semantic clicks are required. '
                         'Use scroll down or scroll up to inspect additional sections before reporting an object missing.'
                     ),
                     'action': 'snapshot-full-vision',
@@ -4951,7 +5103,7 @@ class BrowserWorker:
                 element = await page.select('[data-pi-dismiss-ref="active"]')
                 if not element:
                     break
-                await page.bring_to_front()
+                await self.ensure_page_front(page)
                 await element.scroll_into_view()
                 await page.sleep(0.2)
                 await element.mouse_click()
@@ -5011,12 +5163,9 @@ class BrowserWorker:
             )
             return self.download_response(record, action, session_id)
 
-        if action == 'vision-mark':
+        if action == 'vision-mark' and not (len(parts) == 2 and parts[1].lower() == 'omni'):
             x, y = parse_vision_mark(parts)
             page = await self.require_page(session_id)
-            self.vision_fallback_guard.require_unlocked(
-                session_id, await self.vision_fallback_context(page)
-            )
             clean = None
             output = None
             try:
@@ -5031,8 +5180,11 @@ class BrowserWorker:
                 image_hash = self.screenshot_hash(clean)
                 with Image.open(clean) as screenshot_image:
                     image_width, image_height = screenshot_image.size
+                capture_backend = self.screenshot_capture_backends.get(str(clean), 'cdp')
                 click_x, click_y = map_screenshot_point_to_viewport(
-                    page_state, image_width, image_height, x, y
+                    page_state, image_width, image_height, x, y,
+                    capture_backend=capture_backend,
+                    toolbar_height=float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76')),
                 )
                 output = self.annotate_vision_screenshot(clean, x, y)
                 token = secrets.token_hex(12)
@@ -5047,6 +5199,7 @@ class BrowserWorker:
                     image_height=image_height,
                     click_x=click_x,
                     click_y=click_y,
+                    capture_backend=capture_backend,
                 )
             except Exception:
                 self.vision_guard.invalidate(session_id)
@@ -5060,8 +5213,8 @@ class BrowserWorker:
             return {
                 'text': (
                     f'VISION PREVIEW — NO CLICK PERFORMED\n'
-                    f'Marker {token} is centered at screenshot coordinates ({x:g}, {y:g}).\n'
-                    'Inspect the attached marked screenshot now. If the crosshair is wrong, run '
+                    f'Marker {token} has its upper-left cursor tip/red hotspot at screenshot coordinates ({x:g}, {y:g}).\n'
+                    'Inspect the attached marked screenshot now. If the cursor hotspot is wrong, run '
                     '`vision-mark <x> <y>` again. Only if it is correct, run exactly:\n'
                     f'vision-click {token}'
                 ),
@@ -5076,9 +5229,6 @@ class BrowserWorker:
         if action == 'vision-mark-drag':
             x1, y1, x2, y2 = parse_vision_mark_drag(parts)
             page = await self.require_page(session_id)
-            self.vision_fallback_guard.require_unlocked(
-                session_id, await self.vision_fallback_context(page)
-            )
             clean = None
             output = None
             try:
@@ -5093,11 +5243,15 @@ class BrowserWorker:
                 image_hash = self.screenshot_hash(clean)
                 with Image.open(clean) as screenshot_image:
                     image_width, image_height = screenshot_image.size
+                capture_backend = self.screenshot_capture_backends.get(str(clean), 'cdp')
+                toolbar_height = float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
                 click_x1, click_y1 = map_screenshot_point_to_viewport(
-                    page_state, image_width, image_height, x1, y1
+                    page_state, image_width, image_height, x1, y1,
+                    capture_backend=capture_backend, toolbar_height=toolbar_height,
                 )
                 click_x2, click_y2 = map_screenshot_point_to_viewport(
-                    page_state, image_width, image_height, x2, y2
+                    page_state, image_width, image_height, x2, y2,
+                    capture_backend=capture_backend, toolbar_height=toolbar_height,
                 )
                 output = self.annotate_vision_drag_screenshot(clean, x1, y1, x2, y2)
                 token = secrets.token_hex(12)
@@ -5116,6 +5270,7 @@ class BrowserWorker:
                     click_y1=click_y1,
                     click_x2=click_x2,
                     click_y2=click_y2,
+                    capture_backend=capture_backend,
                 )
             except Exception:
                 self.vision_guard.invalidate(session_id)
@@ -5185,6 +5340,11 @@ class BrowserWorker:
                     current.unlink(missing_ok=True)
             self.vision_guard.invalidate(session_id)
 
+            xvfb_screen_points = None
+            if marker.capture_backend == 'xvfb':
+                xvfb_screen_points = (
+                    (marker.x, marker.y), (marker.end_x, marker.end_y)
+                )
             await self.native_drag(
                 page,
                 marker.click_x,
@@ -5192,6 +5352,7 @@ class BrowserWorker:
                 marker.click_end_x,
                 marker.click_end_y,
                 duration_ms=duration_ms,
+                xvfb_screen_points=xvfb_screen_points,
             )
             return {
                 'text': (
@@ -5206,12 +5367,79 @@ class BrowserWorker:
                 'endX': marker.end_x,
                 'endY': marker.end_y,
                 'durationMs': duration_ms,
+                'inputType': 'mouse',
+                'backend': 'xvfb-or-cdp',
             }
 
         if action == 'vision-click':
-            token = parts[1] if len(parts) >= 2 and not parts[1].isdigit() else None
             page = await self.require_page(session_id)
+            if len(parts) == 3:
+                try:
+                    x, y = float(parts[1]), float(parts[2])
+                except ValueError as error:
+                    raise ValueError('usage: vision-click <x> <y> after vision-mark omni') from error
+                if not all(math.isfinite(value) for value in (x, y)):
+                    raise ValueError('OmniParser click coordinates must be finite')
+                preview = self.omni_previews.get(session_id)
+                if preview is None:
+                    raise ValueError(
+                        'OMNI_PREVIEW_REQUIRED: run vision-mark omni and inspect its numbered screenshot first'
+                    )
+                ttl = float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
+                if time.monotonic() - preview['createdAt'] > ttl:
+                    self.omni_previews.pop(session_id, None)
+                    raise ValueError('OMNI_PREVIEW_EXPIRED: run vision-mark omni again')
+                matched = next((
+                    element for element in preview['elements']
+                    if abs(float(element['center'][0]) - x) <= 0.51
+                    and abs(float(element['center'][1]) - y) <= 0.51
+                ), None)
+                if matched is None:
+                    raise ValueError(
+                        'OMNI_CENTER_REQUIRED: copy an exact center=(x,y) returned by vision-mark omni'
+                    )
+                click_x, click_y = map_screenshot_point_to_viewport(
+                    preview['state'], preview['imageWidth'], preview['imageHeight'], x, y,
+                    capture_backend=preview.get('captureBackend', 'cdp'),
+                    toolbar_height=preview.get('toolbarHeight', 0),
+                )
+                previous = page
+                await self.configure_download_session(session_id, page)
+
+                async def verify_omni_preview_before_click():
+                    try:
+                        current_state = await self.vision_page_state(page)
+                        if current_state != preview['state']:
+                            raise ValueError(
+                                'OMNI_CONFIRMATION_REQUIRED: page changed; run vision-mark omni again'
+                            )
+                    finally:
+                        self.omni_previews.pop(session_id, None)
+
+                page = await self.native_click(
+                    page, click_x, click_y,
+                    before_dispatch=verify_omni_preview_before_click,
+                    xvfb_screen_point=(x, y)
+                    if preview.get('captureBackend') == 'xvfb' else None,
+                )
+                page = await self.track_clicked_page(session_id, previous, page)
+                self.pages[session_id] = page
+                return {
+                    'text': (
+                        f"OmniParser-confirmed click on id={matched.get('id')} "
+                        f"at screenshot coordinates ({x:g}, {y:g})\nURL: {page.url}"
+                    ),
+                    'action': 'vision-click-omni',
+                    'url': page.url,
+                    'x': x,
+                    'y': y,
+                    'omniElementId': matched.get('id'),
+                    'inputType': 'mouse',
+                    'backend': 'xvfb-or-cdp',
+                }
+            token = parts[1] if len(parts) >= 2 and not parts[1].isdigit() else None
             marker = self.vision_guard.current_marker(session_id, token)
+            self.omni_previews.pop(session_id, None)
             token = marker.token
             previous = page
             await self.configure_download_session(session_id, page)
@@ -5248,6 +5476,8 @@ class BrowserWorker:
                 marker.click_x,
                 marker.click_y,
                 before_dispatch=verify_preview_immediately_before_click,
+                xvfb_screen_point=(marker.x, marker.y)
+                if marker.capture_backend == 'xvfb' else None,
             )
             page = await self.track_clicked_page(session_id, previous, page)
             self.pages[session_id] = page
@@ -5262,6 +5492,8 @@ class BrowserWorker:
                 'y': marker.y,
                 'clickX': marker.click_x,
                 'clickY': marker.click_y,
+                'inputType': 'mouse',
+                'backend': 'xvfb-or-cdp',
             }
 
         if action in ('vision-long-press', 'vision-longpress'):
@@ -5318,6 +5550,8 @@ class BrowserWorker:
                     duration_ms,
                     capture_midway=True,
                     before_dispatch=verify_preview_immediately_before_long_press,
+                    xvfb_screen_point=(marker.x, marker.y)
+                    if marker.capture_backend == 'xvfb' else None,
                 )
             except (Exception, asyncio.CancelledError):
                 self.vision_guard.invalidate(session_id)
@@ -5352,12 +5586,10 @@ class BrowserWorker:
                 except ValueError as error:
                     raise ValueError('usage: click @e1 (use the literal snapshot ref; do not include < or >)') from error
                 raise ValueError(
-                    'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Vision fallback unlocks only '
-                    f'after {self.vision_fallback_guard.threshold} consecutive legitimate semantic target-resolution failures '
-                    'on the same page; do not fabricate '
-                    'failures. Once unlocked, run `screenshot`, inspect the image, run `vision-mark <x> <y>`, '
-                    'inspect and correct the attached marked image, then run the exact '
-                    '`vision-click <preview-token>` command returned by vision-mark.'
+                    'VISION_CLICK_GUARD: raw coordinate clicks are disabled. Run `screenshot`, inspect the image, '
+                    'run `vision-mark <x> <y>` directly without deliberately failing semantic clicks, inspect and '
+                    'correct the attached marked image, then run the exact `vision-click <preview-token>` command '
+                    'returned by vision-mark.'
                 )
             if len(parts) != 2 or not parts[1].startswith('@'):
                 raise ValueError('usage: click @e1 (use the literal snapshot ref; do not include < or >)')
@@ -5865,7 +6097,7 @@ class BrowserWorker:
                     await self.admit_popup(session_id, page, popup)
                     self.popup_just_switched.add(session_id)
                     await self.configure_download_session(session_id, popup)
-                    await popup.bring_to_front()
+                    await self.ensure_page_front(popup)
                     while popup.url in ('', 'about:blank') and loop.time() < deadline:
                         await asyncio.sleep(0.05)
                         await self.browser.update_targets()
@@ -5885,7 +6117,7 @@ class BrowserWorker:
             while openers:
                 opener = openers.pop()
                 if opener in self.browser.tabs:
-                    await opener.bring_to_front()
+                    await self.ensure_page_front(opener)
                     self.pages[session_id] = opener
                     self.switch_session_action_target(session_id, opener)
                     self.touch_tab(opener)
@@ -5926,7 +6158,7 @@ class BrowserWorker:
                     while openers:
                         opener = openers.pop()
                         if opener in self.browser.tabs:
-                            await opener.bring_to_front()
+                            await self.ensure_page_front(opener)
                             self.pages[session_id] = opener
                             self.switch_session_action_target(session_id, opener)
                             self.touch_tab(opener)
@@ -5945,7 +6177,91 @@ class BrowserWorker:
 
 
         if action == 'mobile':
-            raise ValueError("Browser is permanently fixed in Android Chrome mobile mode (390x844; touch emulation off). 'mobile off' is disabled.")
+            raise ValueError("Browser is permanently fixed in Android Chrome mobile mode (390x844; touch emulation on). 'mobile off' is disabled.")
+
+        if action == 'omniparse' or (
+            action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni'
+        ):
+            if action == 'omniparse' and len(parts) != 1:
+                raise ValueError('usage: omniparse')
+            page = await self.require_page(session_id)
+            before_state = await self.vision_page_state(page)
+            clean = await self.save_viewport_screenshot(page, 'pi-nodriver-omniparse-clean-')
+            try:
+                state = await self.vision_page_state(page)
+                if state != before_state:
+                    raise ValueError(
+                        'OMNI_CONFIRMATION_REQUIRED: page changed during screenshot capture; '
+                        'run vision-mark omni again'
+                    )
+                with Image.open(clean) as screenshot_image:
+                    image_width, image_height = screenshot_image.size
+                capture_backend = self.screenshot_capture_backends.get(str(clean), 'cdp')
+                parsed = await self.call_omniparser(clean)
+                if await self.vision_page_state(page) != state:
+                    raise ValueError(
+                        'OMNI_CONFIRMATION_REQUIRED: page changed during detection; run vision-mark omni again'
+                    )
+                try:
+                    latency = float(parsed['latency'])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError('OmniParser returned an invalid latency') from error
+                if not math.isfinite(latency) or latency < 0:
+                    raise ValueError('OmniParser returned an invalid latency')
+                elements = self.filter_omni_page_candidates(
+                    parsed.get('elements', []),
+                    image_width=image_width,
+                    image_height=image_height,
+                    capture_backend=capture_backend,
+                )
+                annotated_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-omniparse-'))
+                annotated = annotated_dir / 'annotated.png'
+                self.annotate_omni_candidates(clean, annotated, elements)
+                lines = []
+                for element in elements:
+                    center = element['center']
+                    box = element['box']
+                    lines.append(
+                        f"id={element.get('id')} center=({center[0]:g},{center[1]:g}) "
+                        f"box=({box[0]:g},{box[1]:g},{box[2]:g},{box[3]:g}) "
+                        f"confidence={element['confidence']:g}"
+                    )
+                coordinate_note = (
+                    'Coordinates are exact Xvfb screenshot pixels.'
+                    if capture_backend == 'xvfb'
+                    else 'Coordinates are CDP viewport screenshot pixels.'
+                )
+                response = {
+                    'text': (
+                        f"OmniParser detected {len(elements)} interactive regions in "
+                        f"{latency:g}s. {coordinate_note}\n"
+                        + '\n'.join(lines)
+                        + '\nChoose the matching numbered box, then copy its exact center into vision-click <x> <y>.'
+                    ),
+                    'action': 'vision-mark-omni' if action == 'vision-mark' else action,
+                    'url': page.url,
+                    'screenshotPath': str(annotated),
+                    'elements': elements,
+                    'latency': latency,
+                }
+            finally:
+                clean.unlink(missing_ok=True)
+            self.touch_tab(page)
+            self.vision_guard.record_screenshot(session_id, state)
+            toolbar_height = (
+                float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                if capture_backend == 'xvfb' else 0.0
+            )
+            self.omni_previews[session_id] = {
+                'state': state,
+                'imageWidth': image_width,
+                'imageHeight': image_height,
+                'captureBackend': capture_backend,
+                'toolbarHeight': toolbar_height,
+                'createdAt': time.monotonic(),
+                'elements': elements,
+            }
+            return response
 
         if action == 'screenshot':
             page = await self.require_page(session_id)
@@ -5953,6 +6269,7 @@ class BrowserWorker:
             full_page = '--full' in args_str or '-full' in args_str or '-i' in args_str and ('full' in args_str)
             if full_page:
                 self.vision_guard.invalidate(session_id)
+                self.omni_previews.pop(session_id, None)
                 output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-shot-'))
                 output = output_dir / 'screenshot.png'
                 screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -5971,9 +6288,8 @@ class BrowserWorker:
                     await self.vision_page_state(page),
                 )
                 note = (
-                    ' Current Xvfb window screenshot captured (500x1000). vision-mark additionally requires '
-                    f'VISION_FALLBACK_UNLOCKED after {self.vision_fallback_guard.threshold} consecutive '
-                    'semantic target-resolution failures on this page/document.'
+                    ' Current Xvfb window screenshot captured (500x1000). After inspecting it, '
+                    'vision-mark can be used directly without deliberately failing semantic clicks.'
                 )
             return {
                 'text': f'Screenshot saved: {output}.{note}',

@@ -235,7 +235,7 @@ A fuzzy `select @ref <query>` remains available for a unique, high-confidence wi
 2. Use the exact `@ref` with `click`, `fill`, `type`, `select`, or `fill-submit`.
 3. Use `click-text` or `click-css` when no useful ref is present.
 4. Use `click-js @ref` only when a DOM click is specifically required.
-5. Only after three consecutive legitimate semantic click failures on the same page produce `VISION_FALLBACK_UNLOCKED`, use visual fallback for canvas or inaccessible visual-only content: run `screenshot`, inspect it, use its pixel coordinates with `vision-mark <x> <y>`, inspect and correct the marked image, then confirm only the latest token with `vision-click <preview-token>`. Never fabricate failures to unlock it.
+5. For canvas or inaccessible visual-only content, use visual fallback directly without deliberately failing semantic clicks: run `screenshot`, inspect it, use its pixel coordinates with `vision-mark <x> <y>`, inspect and correct the marked image, then confirm only the latest token with `vision-click <preview-token>`.
 
 Raw `click <x> <y>` is blocked. `snapshot -i --full` is visual overview only: it deliberately returns no refs, invalidates pending coordinate previews, and must not be treated as a coordinate map.
 
@@ -370,4 +370,10 @@ The commit's release baseline is 124 discovered tests: 74 fast tests enabled by 
 2. `upload` does not yet use the recursive frame-aware resolver.
 3. A page can complete a long server-side action while the browser command's settle timeout expires; generated artifacts must be checked before classifying the action as failed.
 4. Refs are intentionally ephemeral and require a fresh snapshot after meaningful DOM changes.
-5. Visual-only coordinate interaction is initially locked. Three consecutive semantic click failures in the same session/page context unlock the guarded screenshot → external-PNG marked preview → trusted CDP viewport conversion → image/hash revalidation → one-time `vision-click` workflow; malformed commands and raw coordinate attempts do not count, and successful semantic interaction resets progress.
+5. The default interaction strategy is CDP/DOM semantic actions first with OmniParser as the visual fallback (`PI_NODRIVER_VISION_FALLBACK=omni`). Omni returns guarded candidate centers for one-time coordinate clicks; manual screenshot → marker-token interaction remains configurable with `PI_NODRIVER_VISION_FALLBACK=manual`. Manual tokens retain image/hash revalidation, while Omni centers use TTL plus trusted page/loader/viewport state so transient menus may change visually. Xvfb dispatch uses exact screenshot pixels and raw unguarded coordinate clicks remain blocked.
+6. Shared Xvfb focus, root capture, and hardware input are not yet enclosed by one process-wide critical section across all clients and sessions.
+7. Preview cleanup still needs one centralized lifecycle path covering loop-guard failures, close, quarantine, eviction, and every state-changing action.
+8. `xdotool` subprocess completion is not yet uniformly validated by exit status with guaranteed mouse-button cleanup before CDP fallback.
+9. Omni filtering validates finite image bounds, but still needs center-inside-box consistency and DOM-only movement/replacement detection that preserves native transient menus.
+
+The implementation sequence and acceptance tests for items 6–9 are maintained in [`plans/2026-09-11-vision-safety-hardening.md`](plans/2026-09-11-vision-safety-hardening.md).

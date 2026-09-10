@@ -78,7 +78,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
 
-    def test_mobile_profile_uses_android_chrome_identity_without_touch_emulation(self):
+    def test_mobile_profile_uses_android_chrome_identity_with_touch_emulation(self):
         worker_source = (ROOT / 'worker.py').read_text()
         stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()
         open_action = worker_source.split("        if action == 'open':", 1)[1].split("        if action == 'mobile':", 1)[0]
@@ -86,7 +86,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("platform='Android'", open_action)
         self.assertIn('user_agent_metadata=metadata', open_action)
         self.assertIn('set_user_agent_override', open_action)
-        self.assertIn('set_touch_emulation_enabled(enabled=False)', open_action)
+        self.assertIn('set_touch_emulation_enabled(enabled=True)', open_action)
         self.assertNotIn('iPhone OS', open_action)
         self.assertNotIn('Safari/604.1', open_action)
         self.assertNotIn('NVIDIA GeForce RTX 4070', stealth_source)
@@ -108,6 +108,29 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('do not include < or >', worker_source)
         self.assertIn('To enter text, use fill or type with a literal ref', extension_source)
         self.assertNotIn('Press Enter, Tab, Space, Backspace, or text', extension_source)
+
+    def test_vision_guidance_allows_direct_marking_without_failure_unlocks(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        for source in (extension_source, worker_source, readme_source):
+            self.assertNotIn('3 consecutive legitimate semantic', source)
+            self.assertNotIn('three consecutive legitimate semantic', source)
+            self.assertNotIn('VISION_FALLBACK_LOCKED', source)
+        self.assertIn('vision-mark <x> <y>', extension_source)
+        self.assertIn('without deliberately failing semantic clicks', extension_source)
+
+    def test_default_visual_fallback_is_configurable_and_prefers_omni(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        self.assertIn('PI_NODRIVER_VISION_FALLBACK', extension_source)
+        self.assertIn('const DEFAULT_VISION_FALLBACK = "omni"', extension_source)
+        self.assertIn('CDP/DOM semantic actions first', extension_source)
+        self.assertIn('manual', extension_source)
+        self.assertIn('PI_NODRIVER_VISION_FALLBACK', readme_source)
+        self.assertIn('`omni` (default)', readme_source)
 
     def test_vision_gesture_guidance_prefers_xvfb_mouse_input(self):
         extension_source = (ROOT / 'index.ts').read_text()

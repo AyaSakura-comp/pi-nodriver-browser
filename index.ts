@@ -17,6 +17,12 @@ const MAX_BATCH_IMAGE_BYTES = 40 * 1024 * 1024;
 const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
 const TIME_SENSITIVE_SEARCH_PATTERN = /(?:\b(?:19|20)\d{2}\b|\b(?:today|tomorrow|yesterday|now|current|currently|latest|recent|recently|upcoming|ago|date|time|timezone|schedule|deadline|release|price|stock|availability|exchange\s+rate|weather)\b|\bthis\s+(?:week|month|year)\b|\b(?:last|next)\s+(?:week|month|year)\b|今天|明天|昨天|現在|當下|目前|最新|最近|即將|本週|這週|上週|下週|本月|上月|下月|今年|去年|明年|日期|時間|時區|時程|排程|截止|發布|上市|價格|庫存|供貨|匯率|天氣|活動)/iu;
 const FRESH_TIME_MAX_AGE_MS = 10 * 60 * 1000;
+const DEFAULT_VISION_FALLBACK = "omni";
+const requestedVisionFallback = (process.env.PI_NODRIVER_VISION_FALLBACK || DEFAULT_VISION_FALLBACK).toLowerCase();
+const VISION_FALLBACK = requestedVisionFallback === "manual" ? "manual" : DEFAULT_VISION_FALLBACK;
+const VISION_FALLBACK_GUIDANCE = VISION_FALLBACK === "omni"
+  ? "Use CDP/DOM semantic actions first. When no reliable semantic target exists, use vision-mark omni directly without deliberately failing semantic clicks, then click the returned center. Use manual screenshot marking only when OmniParser misses."
+  : "Use CDP/DOM semantic actions first. When no reliable semantic target exists, use screenshot → vision-mark <x> <y> → token-based vision-click. OmniParser remains available but is not the configured default fallback.";
 
 function parseGettimeValue(value: string): number | undefined {
   const match = value.trim().match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([+-]\d{2})(\d{2})(?:\s+\S+)?$/);
@@ -25,11 +31,12 @@ function parseGettimeValue(value: string): number | undefined {
   return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
-const DESCRIPTION = `Autonomous live browser automation (Android Chrome mobile viewport 390x844; touch emulation off by default). Strong CAPTCHA, challenge, access-denied, or 429 signals trigger one automatic retry in a fresh native Linux Chrome target.
+const DESCRIPTION = `Autonomous live browser automation (Android Chrome mobile viewport 390x844; touch emulation on by default). Strong CAPTCHA, challenge, access-denied, or 429 signals trigger one automatic retry in a fresh native Linux Chrome target.
 ROUTING GUIDELINES:
 - WHEN TO USE BROWSER: Automatically invoke this tool when the user request requires live web data, real-time e-commerce pricing/promotions (MOMO, PChome, Amazon, Shopee), current stock availability, real-time exchange rates/schedules, dynamic web portals, interactive form submissions, UI flows, or login/OAuth authentication. No explicit user command like "use browser" is needed.
 - WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.
 Guidelines:
+- DEFAULT INTERACTION STRATEGY (${VISION_FALLBACK}): ${VISION_FALLBACK_GUIDANCE}
 - REF SYNTAX IS LITERAL: snapshot outputs refs like @e16. Use 'click @e16', 'fill @e6 "text"', or 'fill-submit @e2 "query"' exactly; never wrap refs in '<' or '>'. Angle brackets in generic documentation denote placeholders, not characters to type.
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
@@ -41,7 +48,7 @@ Guidelines:
 - Preserve Form State: After selecting options, do not navigate, reload, or click recalculation/reset controls unless the user explicitly requires it; dynamic quote/configurator pages may clear selections. Verify with snapshot or screenshot instead.
 - Form Control Safety: Snapshot annotates checkbox/radio label proxies with control type plus checked="true|false", required, and disabled state. Never fill or type into a <label> ref; fill/type accepts only text-editable input, textarea, or contenteditable refs.
 - Exact Ref Before Text: When snapshot shows the desired control, click its @ref. Use click-text only when no suitable ref exists; 1–2 character queries require an exact match and longer fallback matches are prefix-only, preventing X from matching Next.
-- Vision-Correct Coordinates: Raw coordinate clicks are blocked, and vision fallback stays locked until the browser records 3 consecutive legitimate semantic target-resolution failures on the same page/document. Invalid selectors, stale-guard retries, infrastructure errors, and fabricated failures do not count. After the browser reports VISION_FALLBACK_UNLOCKED, run 'screenshot', inspect the image, use its pixel coordinates with 'vision-mark <x> <y>', inspect the attached marked screenshot, re-mark until correct, then run the exact 'vision-click <preview-token>' command returned by the latest preview.
+- Vision-Correct Coordinates: Raw coordinate clicks are blocked. The configured fallback is ${VISION_FALLBACK}. Omni mode uses 'vision-mark omni' to receive numbered boxes with exact screenshot-pixel centers, then 'vision-click <x> <y>'. Manual mode uses screenshot → vision-mark → token-based vision-click. Both remain available, but follow the configured default. Vision click, long press, and drag prefer trusted Xvfb mouse input, with CDP mouse fallback when Xvfb input is unavailable.
 - No Wait: All actions auto-settle DOM/network synchronously; do not call wait.
 - Open Loop Guard: At most 2 consecutive open actions to the same origin are allowed per session. A different-origin open resets the streak; the 3rd same-origin open is blocked until a non-open action or different-origin open runs.
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
@@ -56,11 +63,13 @@ Commands:
   click @e16 - Click the literal snapshot ref @e16, including custom controls and open Shadow DOM
   long-press @e16 [duration_ms] - Long press the literal snapshot ref for duration_ms (default 1000ms, sends trusted X11 mousedown -> hold -> mouseup)
   touch-drift @e1 <duration> <dx_px> <dy_px> [steps] - Lab-only minimum-jerk touch trace; restricted to localhost and the owned /touch-trace diagnostic page
-  vision-mark <x> <y> - Draw a crosshair at screenshot-pixel coordinates on a copied current-viewport PNG without clicking; requires a fresh screenshot
-  vision-click <preview-token> - Click the latest marked point only after inspecting the attached marked screenshot
+  vision-mark omni - Detect and number interactive regions in the current Xvfb screenshot; returns exact screenshot-pixel boxes and centers
+  vision-mark <x> <y> - Draw a high-contrast mouse cursor whose upper-left red tip is the click hotspot at screenshot-pixel coordinates; requires a fresh screenshot
+  vision-click <preview-token> - Click the latest manually marked point after visual confirmation
+  vision-click <x> <y> - Click an exact center returned by the latest fresh vision-mark omni result
   vision-mark-drag <start_x> <start_y> <end_x> <end_y> - Draw a visual drag trajectory (Green start circle -> Blue arrow -> Red end target) on screenshot for inspection and calibration without executing drag
   vision-drag [preview-token] [duration_ms] - Execute smooth hardware drag on Xvfb along the confirmed trajectory (isTrusted: true)
-  vision-long-press [preview-token] [duration_ms] - Execute a trusted touch long press with +6/-4px minimum-jerk drift over 24 steps (default 1000ms)
+  vision-long-press [preview-token] [duration_ms] - Execute an Xvfb mouse hold with slight pointer jitter (CDP mouse fallback; default 1000ms)
   click-text <text> - Click exact short text or a safe exact/prefix visible label match
   click-css <selector> - Click the first visible element matching a CSS selector, including open Shadow DOM
   click-js @e16 - Dispatch a deferred DOM click for the literal snapshot ref when a site's native mouse handler poisons CDP
@@ -310,7 +319,7 @@ export default function (pi: ExtensionAPI) {
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
       "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",
       "A missing or stale @ref does not perform the action and automatically returns both a fresh authoritative DOM snapshot and viewport image for joint inspection; never retry the old ref, and use the returned fresh refs immediately after reassessing the page.",
-      "Raw coordinate clicks are blocked. Vision fallback unlocks only after the browser records 3 consecutive legitimate semantic target-resolution failures on the same page/document; invalid selectors, stale-guard retries, infrastructure errors, and fabricated failures do not count. Once unlocked, use the image-bearing sequence: screenshot → inspect → vision-mark <x> <y> → inspect the attached marked screenshot → re-mark if needed → vision-click <preview-token>. Never confirm a marker before visually checking the image returned by vision-mark.",
+      `${VISION_FALLBACK_GUIDANCE} Raw coordinate clicks remain blocked; both Omni-center and manual preview-token clicks require a fresh guarded preview. Vision click, long press, and drag prefer trusted Xvfb mouse input, with CDP fallback when unavailable.`,
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",
       "For downloads, inspect with download-info and prefer a literal command such as `download @e16` over clicking and guessing; use downloads to check progress.",
       "To deliver a screenshot or downloaded file to the user on PiWeb / Discord, you MUST emit '[[image: <path>]]' or '[[file: <path>]]' in your reply prose. Do NOT use markdown '![alt](/tmp/...)' and do NOT rely on 'read'.",
