@@ -31,7 +31,8 @@ from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, V
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
-    'click', 'click-css', 'click-js', 'click-text', 'close', 'crawl', 'dismiss',
+    'browser-mode-switch', 'click', 'click-css', 'click-js', 'click-text', 'close',
+    'crawl', 'dismiss',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'omniparse', 'open', 'press', 'press-hold', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'touch-drift', 'type', 'upload',
@@ -127,6 +128,10 @@ OMNI_ONLY_INVALIDATING_ACTIONS = {
 
 def action_requires_session_lock(action):
     return action != 'fetch-image'
+
+
+def action_requires_page_setup(action):
+    return action not in {'browser-mode-switch', 'fetch-image'}
 
 
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
@@ -1697,6 +1702,7 @@ class BrowserWorker:
         self.browser = None
         self.launched_browser = None
         self.pages = {}
+        self.browser_modes = {}
         self.popup_openers = {}
         self.popup_just_switched = set()
         self.popup_just_closed = set()
@@ -1915,6 +1921,33 @@ class BrowserWorker:
         await page.bring_to_front()
         self.xvfb_active_target_id = target_id
         return True
+
+    def browser_mode_switch(self, parts, session_id):
+        if len(parts) > 2:
+            raise ValueError('usage: browser-mode-switch [auto|android|linux]')
+        if len(parts) == 2:
+            mode = parts[1].lower()
+            if mode not in {'auto', 'android', 'linux'}:
+                raise ValueError('browser-mode-switch mode must be auto, android, or linux')
+            if mode == 'auto':
+                self.browser_modes.pop(session_id, None)
+            else:
+                self.browser_modes[session_id] = mode
+        else:
+            mode = self.browser_modes.get(session_id, 'auto')
+        behavior = {
+            'auto': 'Android first, then one native Linux retry after a strong access block.',
+            'android': 'Force Android identity with no automatic Linux retry.',
+            'linux': 'Open directly with the native Linux identity.',
+        }[mode]
+        return {
+            'text': (
+                f'Browser mode for this session: {mode}. {behavior} '
+                'The current tab is unchanged; the mode applies to subsequent open commands.'
+            ),
+            'action': 'browser-mode-switch',
+            'browserMode': mode,
+        }
 
     async def vision_fallback_context(self, page):
         state = await self.vision_page_state(page)
@@ -4608,6 +4641,8 @@ class BrowserWorker:
         action = parts[0].lower()
         if action not in SUPPORTED_ACTIONS:
             raise ValueError(f'unsupported browser command: {action}')
+        if action == 'browser-mode-switch':
+            return self.browser_mode_switch(parts, session_id)
         if action == 'fetch-image':
             result = await self._execute(command, session_id)
             self.open_action_guard.clear(session_id)
@@ -4782,6 +4817,9 @@ class BrowserWorker:
                 text = 'No downloads for this session'
             return {'text': text, 'action': action, 'downloads': items}
 
+        if action == 'browser-mode-switch':
+            return self.browser_mode_switch(parts, session_id)
+
         if action == 'open':
             if len(parts) != 2:
                 raise ValueError('usage: open <url>')
@@ -4793,44 +4831,46 @@ class BrowserWorker:
             await self.configure_download_session(session_id)
             page = await self.create_managed_tab(session_id, 'page')
             self.begin_tab_activity(page)
-            identity_used = 'android'
+            browser_mode = self.browser_modes.get(session_id, 'auto')
+            identity_used = 'linux' if browser_mode == 'linux' else 'android'
             fallback_reason = None
 
             try:
-                # Advertise the installed Chromium engine as Android Chrome so adaptive sites
-                # serve their mobile UI without the Safari/Chromium fingerprint mismatch.
-                _, product, _, browser_user_agent, _ = await page.send(uc.cdp.browser.get_version())
-                version_match = re.search(r'(?:Chrome|Chromium)/([0-9.]+)', f'{product} {browser_user_agent}')
-                if version_match is None:
-                    raise RuntimeError('could not determine the installed Chrome version')
-                full_version = version_match.group(1)
-                major_version = full_version.split('.', 1)[0]
-                ua = (
-                    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 '
-                    f'(KHTML, like Gecko) Chrome/{major_version}.0.0.0 Mobile Safari/537.36'
-                )
-                brands = [
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=major_version),
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=major_version),
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99'),
-                ]
-                full_version_list = [
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=full_version),
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=full_version),
-                    uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99.0.0.0'),
-                ]
-                metadata = uc.cdp.emulation.UserAgentMetadata(
-                    platform='Android', platform_version='14.0.0', architecture='',
-                    model='Pixel 8', mobile=True, brands=brands,
-                    full_version_list=full_version_list, full_version=full_version,
-                    bitness='', wow64=False, form_factors=['Mobile'],
-                )
-                await page.send(uc.cdp.network.set_user_agent_override(
-                    user_agent=ua,
-                    accept_language='zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-                    platform='Android',
-                    user_agent_metadata=metadata,
-                ))
+                if browser_mode != 'linux':
+                    # Advertise the installed Chromium engine as Android Chrome so adaptive
+                    # sites serve mobile UI without a Safari/Chromium fingerprint mismatch.
+                    _, product, _, browser_user_agent, _ = await page.send(uc.cdp.browser.get_version())
+                    version_match = re.search(r'(?:Chrome|Chromium)/([0-9.]+)', f'{product} {browser_user_agent}')
+                    if version_match is None:
+                        raise RuntimeError('could not determine the installed Chrome version')
+                    full_version = version_match.group(1)
+                    major_version = full_version.split('.', 1)[0]
+                    ua = (
+                        'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 '
+                        f'(KHTML, like Gecko) Chrome/{major_version}.0.0.0 Mobile Safari/537.36'
+                    )
+                    brands = [
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=major_version),
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=major_version),
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99'),
+                    ]
+                    full_version_list = [
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Chromium', version=full_version),
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Google Chrome', version=full_version),
+                        uc.cdp.emulation.UserAgentBrandVersion(brand='Not_A Brand', version='99.0.0.0'),
+                    ]
+                    metadata = uc.cdp.emulation.UserAgentMetadata(
+                        platform='Android', platform_version='14.0.0', architecture='',
+                        model='Pixel 8', mobile=True, brands=brands,
+                        full_version_list=full_version_list, full_version=full_version,
+                        bitness='', wow64=False, form_factors=['Mobile'],
+                    )
+                    await page.send(uc.cdp.network.set_user_agent_override(
+                        user_agent=ua,
+                        accept_language='zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                        platform='Android',
+                        user_agent_metadata=metadata,
+                    ))
                 w, h = 390, 844
                 await page.send(uc.cdp.emulation.set_device_metrics_override(
                     width=w, height=h, device_scale_factor=3.0, mobile=True
@@ -4842,8 +4882,9 @@ class BrowserWorker:
                 await self.configure_download_session(session_id, page)
                 await self.wait_for_page_ready(page)
 
-                fallback_reason = await self.detect_page_access_block(page, target_url)
-                if fallback_reason is not None:
+                if browser_mode == 'auto':
+                    fallback_reason = await self.detect_page_access_block(page, target_url)
+                if browser_mode == 'auto' and fallback_reason is not None:
                     blocked_page = page
                     self.end_tab_activity(blocked_page)
                     async with self.tab_management_lock:
@@ -4964,13 +5005,14 @@ class BrowserWorker:
                     'count': 0,
                     'identityUsed': identity_used,
                     'fallbackReason': fallback_reason,
+                    'browserMode': browser_mode,
                 }
             snapshot_text = format_snapshot(elements or [])
-            identity_text = (
-                'native Linux Chrome fallback after Android block'
-                if identity_used == 'linux-fallback'
-                else 'Android Chrome'
-            )
+            identity_text = {
+                'android': 'Android Chrome',
+                'linux': 'native Linux Chrome (forced mode)',
+                'linux-fallback': 'native Linux Chrome fallback after Android block',
+            }[identity_used]
             return {
                 'text': (
                     f'Opened {page.url or parts[1]} ({identity_text}; mobile viewport '
@@ -4981,6 +5023,7 @@ class BrowserWorker:
                 'count': len(elements or []),
                 'identityUsed': identity_used,
                 'fallbackReason': fallback_reason,
+                'browserMode': browser_mode,
             }
 
         if action == 'snapshot':
@@ -6658,7 +6701,7 @@ async def execute_request(worker, request):
     action = command.split(maxsplit=1)[0].lower() if command else ''
     action_started = False
     try:
-        if action != 'fetch-image':
+        if action_requires_page_setup(action):
             worker.preflight_timeout_seconds()
             worker.begin_session_action(session_id)
             action_started = True

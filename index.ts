@@ -37,6 +37,7 @@ ROUTING GUIDELINES:
 - WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.
 Guidelines:
 - DEFAULT INTERACTION STRATEGY (${VISION_FALLBACK}): ${VISION_FALLBACK_GUIDANCE}
+- Browser Identity Mode: `browser-mode-switch auto|android|linux` is session-scoped and affects subsequent `open` commands only. `auto` is the default Android-first mode with one Linux fallback on a strong block; touch emulation and the 390x844 mobile viewport remain enabled in every identity mode.
 - REF SYNTAX IS LITERAL: snapshot outputs refs like @e16. Use 'click @e16', 'fill @e6 "text"', or 'fill-submit @e2 "query"' exactly; never wrap refs in '<' or '>'. Angle brackets in generic documentation denote placeholders, not characters to type.
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
@@ -56,7 +57,8 @@ Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto
 Commands:
   google-search <json> - Run up to four directional Google queries in parallel and return a globally de-duplicated Top 10
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean page text plus ranked image candidates
-  open <url> - Navigate to URL (automatically returns interactive elements snapshot with @refs)
+  open <url> - Navigate using the current session browser mode (automatically returns interactive elements snapshot with @refs)
+  browser-mode-switch [auto|android|linux] - Report or set the session identity mode used by subsequent open commands
   fill-submit @e1 "query" - Clear, type, and submit form / press Enter in 1 atomic step (returns updated results snapshot)
   snapshot -i - List interactive elements and form-control state in the current viewport with compact @refs
   snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
@@ -87,8 +89,8 @@ Commands:
   press <key> - Press only Enter, Tab, Space, or Backspace. To enter text, use fill or type with a literal ref
   scroll <down|up|top|bottom|left|right> [px] - Smart scroll page or nested container (returns position & 100% boundary feedback)
   get text|images|url|title [@ref] - Get page text with image candidates, image candidates only, URL, or title
-  wait-popup [ms] - Wait for an OAuth/login popup and switch to it
-  wait-popup-close [ms] - Wait for the active popup to close and return to its opener
+  wait-popup [ms] - Wait up to 2000ms for an OAuth/login popup and switch to it
+  wait-popup-close [ms] - Wait up to 2000ms for the active popup to close and return to its opener
   switch opener - Return to the popup's opener without closing the popup
   dismiss overlays [--cookies=accept|reject-optional|ignore] - Safely dismiss cookie and modal overlays
   screenshot [--full] - Default: capture current Xvfb window (500x1000 with Chrome UI, used for visual checks & vision-mark). With --full: capture complete scrollable page via CDP to assist non-vision DOM browser clicks (e.g. click @ref).
@@ -301,6 +303,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Interact with web pages using a persistent Nodriver-controlled Chrome browser",
     promptGuidelines: [
       "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots on a live page.",
+      "Use browser-mode-switch auto|android|linux only when the user requests an identity mode or an identity-specific diagnostic. It is session-scoped, affects subsequent open commands only, and never disables the mobile viewport or touch emulation.",
       "For reading or scraping full content from one or multiple URLs, prefer using the crawl tool (or browser command 'crawl <urls...>') which runs multi-tab parallel extraction without opening persistent tabs.",
       "After a web_search, judge whether the snippets actually answer the question. When they do not — the answer needs figures, quotes, code, or detail the snippet only alludes to — follow up with crawl on the promising result URLs instead of answering from snippets alone.",
       "Batch that follow-up into ONE crawl call carrying every URL you want. The pages themselves fetch in well under a second either way; what costs real time is the agent round-trip around each call, so one call with ten URLs finishes in a fraction of the time ten calls take.",
@@ -312,6 +315,7 @@ export default function (pi: ExtensionAPI) {
       "After opening the selected page for a concrete product, person, place, animal, or event, use 'get text' once; when its image candidates are genuinely useful, call fetch_images with 1–3 non-duplicate candidates and include the returned markers even when the user did not explicitly ask for images.",
       "Do not finalize a concrete-subject answer as text-only after get text or crawl returned relevant representative/content image candidates; fetching those candidates is part of answer completion, not extra browsing.",
       "For e-commerce pages with specs or options (e.g. degrees, sizes, colors), select the spec first (e.g. click @ref for '400度' or '請選擇商品規格'), then click @ref to add to cart. Spec selection drawers are in-page modals; run snapshot -i after opening, and do NOT use wait-popup.",
+      "Popup waits are capped at 2000ms; never request a longer wait-popup or wait-popup-close timeout.",
       "A LOOP_GUARD or SCROLL_LOOP_GUARD error means the browser is not making progress: stop scrolling, and use 'get text', 'screenshot --full', or answer with your own knowledge.",
       "Browser refs are literal tokens such as @e16: send `click @e16` or `fill @e6 \"text\"`; never type angle brackets around a ref.",
       "Never fill or type into a <label> ref. Use only a snapshot ref whose tag is input, textarea, or contenteditable; checkbox/radio label proxies are for click and expose checked state.",

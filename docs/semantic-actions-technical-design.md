@@ -67,9 +67,38 @@ flowchart TB
     REFGRAPH --> ROOT[Top document]
     REFGRAPH --> FRAME[Visible same-origin iframe]
     REFGRAPH --> SHADOW[Visible open Shadow DOM]
+
+    WORKER -->|vision-mark omni via local HTTP| OMNI[Microsoft OmniParser V3]
+    OMNI -->|box + center + confidence candidates| WORKER
 ```
 
 The TypeScript extension only exposes the command contract and sends one command at a time. All page inspection, ranking, stale checks, and mutations happen in the persistent Python worker and the currently routed Chrome target.
+
+### External dependent project boundary
+
+OmniParser is an independent dependent project, not an embedded module of `pi-nodriver-browser`:
+
+- upstream: [`microsoft/OmniParser`](https://github.com/microsoft/OmniParser), tested at revision `3540212`;
+- model: OmniParser V3 `weights/icon_detect_v3/model.pt`;
+- process boundary: separately managed local HTTP service, defaulting to `http://127.0.0.1:8012/parse`;
+- request: JSON containing a base64-encoded PNG;
+- response: image dimensions, detector latency, and candidate `box`, `center`, and `confidence` values;
+- ownership: OmniParser owns detector inference and weights; this project owns candidate validation, preview state, coordinate mapping, and browser input;
+- availability: required only for `vision-mark omni` and the default `PI_NODRIVER_VISION_FALLBACK=omni`. CDP/DOM actions and the configurable `manual` visual fallback remain available without it.
+
+The `pi-nodriver-browser` installer deliberately does not clone, modify, start, or upgrade OmniParser. The dependent service must be provisioned and supervised independently, and its URL may be overridden with `PI_NODRIVER_OMNIPARSER_URL`.
+
+## Browser Identity Mode
+
+`browser-mode-switch [auto|android|linux]` is a session-scoped control plane action. With no argument it reports the effective mode; with an argument it changes only subsequent `open` commands and does not reload or mutate the current tab.
+
+| Mode | Initial identity | Automatic block retry | Viewport and input |
+|---|---|---|---|
+| `auto` | Android Chrome | One fresh native Linux target after a strong CAPTCHA, challenge, access-denied, or HTTP 429 signal | 390x844 mobile metrics; touch emulation on |
+| `android` | Android Chrome | Disabled | 390x844 mobile metrics; touch emulation on |
+| `linux` | Native Linux Chrome | Not applicable; opens directly | 390x844 mobile metrics; touch emulation on |
+
+The worker stores non-default choices by `session_id`; switching back to `auto` removes the override. Every `open` response includes `browserMode`, `identityUsed`, and `fallbackReason`, allowing the caller to distinguish forced Linux from automatic `linux-fallback`. Identity mode changes user-agent behavior only—mobile metrics and touch emulation remain invariants in every mode.
 
 ## Ref and Frame Model
 

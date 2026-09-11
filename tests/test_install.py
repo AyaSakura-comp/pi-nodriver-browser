@@ -78,6 +78,16 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(updated['packages'], ['npm:pi-until-done'])
             self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
 
+    def test_browser_mode_switch_is_exposed_and_documented(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        self.assertIn('browser-mode-switch [auto|android|linux]', extension_source)
+        self.assertIn("'browser-mode-switch'", worker_source)
+        self.assertIn('`browser-mode-switch`', readme_source)
+        self.assertIn('session-scoped', readme_source)
+
     def test_mobile_profile_uses_android_chrome_identity_with_touch_emulation(self):
         worker_source = (ROOT / 'worker.py').read_text()
         stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()

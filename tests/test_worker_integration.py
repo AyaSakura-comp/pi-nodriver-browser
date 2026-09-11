@@ -2834,6 +2834,107 @@ class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
             worker.track_open_action('session-a', 'open')
 
 
+class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_defaults_to_auto_and_switches_only_the_current_session(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+
+        status = await worker._execute('browser-mode-switch', session_id='session-a')
+        switched = await worker._execute(
+            'browser-mode-switch linux', session_id='session-a'
+        )
+        other = await worker._execute('browser-mode-switch', session_id='session-b')
+
+        self.assertEqual(status['browserMode'], 'auto')
+        self.assertEqual(switched['browserMode'], 'linux')
+        self.assertEqual(worker.browser_modes['session-a'], 'linux')
+        self.assertEqual(other['browserMode'], 'auto')
+
+    async def test_supports_android_and_resets_to_auto(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+
+        android = await worker._execute(
+            'browser-mode-switch android', session_id='session-a'
+        )
+        automatic = await worker._execute(
+            'browser-mode-switch auto', session_id='session-a'
+        )
+
+        self.assertEqual(android['browserMode'], 'android')
+        self.assertEqual(automatic['browserMode'], 'auto')
+        self.assertNotIn('session-a', worker.browser_modes)
+
+    async def test_public_action_bypasses_page_preflight_and_preserves_popup_state(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = object()
+        worker.pages['session-a'] = page
+        worker.popup_just_switched.add('session-a')
+        worker.popup_just_closed.add('session-a')
+        worker.bounded_vision_fallback_context = AsyncMock(
+            side_effect=AssertionError('control-plane action must not preflight the page')
+        )
+
+        result = await worker.execute(
+            'browser-mode-switch linux', session_id='session-a'
+        )
+
+        self.assertEqual(result['browserMode'], 'linux')
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertIn('session-a', worker.popup_just_switched)
+        self.assertIn('session-a', worker.popup_just_closed)
+        worker.bounded_vision_fallback_context.assert_not_awaited()
+
+    async def test_request_path_bypasses_page_action_setup(self):
+        from worker import BrowserWorker, execute_request
+
+        worker = BrowserWorker()
+        page = object()
+        worker.pages['session-a'] = page
+        worker.popup_just_switched.add('session-a')
+        worker.popup_just_closed.add('session-a')
+        worker.preflight_timeout_seconds = Mock(
+            side_effect=AssertionError('control-plane action must ignore page preflight config')
+        )
+        worker.begin_session_action = Mock(
+            side_effect=AssertionError('control-plane action must not touch page activity')
+        )
+        worker.end_session_action = Mock()
+
+        response = await execute_request(worker, {
+            'id': 1,
+            'sessionId': 'session-a',
+            'command': 'browser-mode-switch linux',
+        })
+
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['browserMode'], 'linux')
+        self.assertIs(worker.pages['session-a'], page)
+        self.assertIn('session-a', worker.popup_just_switched)
+        self.assertIn('session-a', worker.popup_just_closed)
+        worker.preflight_timeout_seconds.assert_not_called()
+        worker.begin_session_action.assert_not_called()
+        worker.end_session_action.assert_not_called()
+
+    async def test_rejects_unknown_mode_and_extra_arguments(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+
+        for command in (
+            'browser-mode-switch desktop',
+            'browser-mode-switch linux extra',
+        ):
+            with self.subTest(command=command), self.assertRaisesRegex(
+                ValueError, 'browser-mode-switch'
+            ):
+                await worker._execute(command, session_id='session-a')
+
+
 class FetchImageUnitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         from PIL import Image
@@ -3868,6 +3969,94 @@ class WorkerIntegrationTests(unittest.TestCase):
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
+    def test_browser_mode_switch_linux_opens_directly_with_native_linux_identity(self):
+        requests = []
+
+        class IdentityHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                requests.append((
+                    handler_self.path, handler_self.headers.get('User-Agent', '')
+                ))
+                payload = b'<!doctype html><title>Ready</title><body><button>Continue</button></body>'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), IdentityHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            mode = self.command('browser-mode-switch linux')
+            result = self.command(f'open http://127.0.0.1:{server.server_port}/')
+
+            self.assertEqual(mode['browserMode'], 'linux')
+            self.assertEqual(result['browserMode'], 'linux')
+            self.assertEqual(result['identityUsed'], 'linux')
+            self.assertIsNone(result['fallbackReason'])
+            page_agents = [ua for path, ua in requests if path == '/']
+            self.assertEqual(len(page_agents), 1)
+            self.assertIn('X11; Linux x86_64', page_agents[0])
+            self.assertNotIn('Android', page_agents[0])
+
+            identity_fixture = (ROOT / 'tests/fixture_browser_identity.html').as_uri()
+            self.command(f'open {identity_fixture}')
+            identity = self.command('get text')['text']
+            self.assertIn('touchPoints=1', identity)
+            self.assertIn('innerWidth=390', identity)
+        finally:
+            self.command('browser-mode-switch auto')
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_browser_mode_switch_android_disables_automatic_linux_fallback(self):
+        requests = []
+
+        class BlockAndroidHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                requests.append((
+                    handler_self.path, handler_self.headers.get('User-Agent', '')
+                ))
+                payload = b'<!doctype html><title>Access Denied</title><body>Blocked</body>'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), BlockAndroidHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            self.command('browser-mode-switch android')
+            result = self.command(f'open http://127.0.0.1:{server.server_port}/')
+
+            self.assertEqual(result['browserMode'], 'android')
+            self.assertEqual(result['identityUsed'], 'android')
+            self.assertIsNone(result['fallbackReason'])
+            page_agents = [ua for path, ua in requests if path == '/']
+            self.assertEqual(len(page_agents), 1)
+            self.assertIn('Android', page_agents[0])
+
+            identity_fixture = (ROOT / 'tests/fixture_browser_identity.html').as_uri()
+            self.command(f'open {identity_fixture}')
+            identity = self.command('get text')['text']
+            self.assertIn('touchPoints=1', identity)
+            self.assertIn('innerWidth=390', identity)
+        finally:
+            self.command('browser-mode-switch auto')
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
     def test_open_retries_android_block_once_in_fresh_native_linux_target(self):
         requests = []
 
@@ -3985,7 +4174,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             server.server_close()
             server_thread.join(timeout=2)
 
-    def test_open_uses_android_chrome_identity_without_touch_emulation(self):
+    def test_open_uses_android_chrome_identity_with_touch_emulation(self):
         fixture_url = (ROOT / 'tests/fixture_browser_identity.html').as_uri()
         self.command(f'open {fixture_url}')
 
@@ -3994,7 +4183,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('Mobile Safari/537.36', identity)
         self.assertIn('uaMobile=true', identity)
         self.assertIn('uaPlatform=Android', identity)
-        self.assertIn('touchPoints=0', identity)
+        self.assertIn('touchPoints=1', identity)
         self.assertIn('innerWidth=390', identity)
 
     def test_snapshot_lists_only_interactive_objects_in_the_current_viewport(self):

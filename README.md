@@ -17,6 +17,22 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
 - [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
 
+## 🧩 Dependent Project: OmniParser
+
+[Microsoft OmniParser](https://github.com/microsoft/OmniParser) is an **external dependent project** used by the default visual fallback. It is not vendored, forked, or installed by `pi-nodriver-browser`; it keeps its own repository, model weights, Python environment, service lifecycle, and license.
+
+| Integration item | Contract |
+|---|---|
+| Upstream project | `microsoft/OmniParser` |
+| Tested revision | `3540212` |
+| Detector | OmniParser V3, `weights/icon_detect_v3/model.pt` |
+| Runtime boundary | Local HTTP service; default endpoint `http://127.0.0.1:8012/parse` |
+| Configuration | `PI_NODRIVER_OMNIPARSER_URL` and `PI_NODRIVER_OMNIPARSER_TIMEOUT` |
+| Required for | Default `PI_NODRIVER_VISION_FALLBACK=omni` and `vision-mark omni` |
+| Not required for | CDP/DOM semantic actions or `PI_NODRIVER_VISION_FALLBACK=manual` |
+
+The dependent service accepts a base64 PNG and returns image dimensions, latency, and detected `elements` containing `box`, `center`, and `confidence`. `pi-nodriver-browser` remains responsible for filtering candidates, preview guards, coordinate mapping, and dispatch. If the OmniParser service is unavailable, start the dependent project separately or configure `manual`; the installer does not silently download models or launch an external service.
+
 ## 🏛️ System & Software Architecture (SW Architecture)
 
 `pi-nodriver-browser` employs a decoupled **Client-Daemon Multi-Session Architecture** that isolates the lightweight TypeScript agent harness from the heavyweight Python/Chromium execution engine.
@@ -52,6 +68,11 @@ flowchart TB
         STEALTH_EXT --> S_SOLVER["turnstile_solver.js\n- Shadow DOM Inspection\n- Cloudflare Turnstile Auto-Click\n- Human-like Bezier Pointer Events"]
     end
 
+    subgraph DependentProjectLayer["External Dependent Project"]
+        ENGINE -->|"vision-mark omni\nHTTP 127.0.0.1:8012"| OMNI["Microsoft OmniParser V3\nindependent service + model weights"]
+        OMNI -->|"boxes + centers + confidence"| ENGINE
+    end
+
     subgraph BrowserLayer["5. Chromium & Display Subsystem"]
         ENGINE -->|"Interactive Mode (390x844 Android Chrome mobile viewport, touch emulation on / 500x1000 window)"| TAB_ACTIVE["Session Interactive Tab"]
         ENGINE -->|"Parallel Crawl Mode (1920x1080 Full-Desktop)"| TABS_POOL["Background Parallel Tabs 1..N\n(asyncio.gather)"]
@@ -67,7 +88,7 @@ flowchart TB
 #### 1. Client-Daemon IPC & Session Isolation
 * **Zero-Spawning Overhead**: A single persistent Python daemon (`worker.py`) runs in the background. Pi commands connect via Unix Domain Socket (`nodriver-browser.sock`), avoiding the 2–3s cold-start penalty of launching Chrome on every turn.
 * **Per-Session Tab Routing**: Each Pi conversation maintains its own isolated `session_id` mapping. Session tabs, active viewports, and downloads operate independently without cross-session interference.
-* **Android-to-Linux Block Fallback**: Interactive navigation starts with the Android Chrome identity. Strong CAPTCHA/challenge URLs or copy, localized robot checks, access-denied titles, and HTTP 429 pages cause exactly one retry in a fresh target using Chrome's native Linux identity. The blocked Android target is closed first, the internal retry does not consume another agent `open`, and the result reports `identityUsed` plus `fallbackReason`.
+* **Session-scoped Browser Identity Mode**: `browser-mode-switch auto|android|linux` reports or changes the identity used by subsequent `open` commands in only the calling session. It does not reload or modify the current tab. `auto` is the default: navigation starts with Android Chrome and strong CAPTCHA/challenge URLs or copy, localized robot checks, access-denied titles, and HTTP 429 pages cause exactly one retry in a fresh target using Chrome's native Linux identity. `android` disables that automatic retry; `linux` opens directly with the native Linux identity. Every mode retains the 390x844 mobile viewport and touch emulation. The result reports `browserMode`, `identityUsed`, and `fallbackReason`.
 * **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
 
 #### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
@@ -458,7 +479,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates with an Android Chrome identity, matching mobile Client Hints, a 390x844 viewport, and touch emulation enabled. Strong access-block signals trigger one fresh-target native Linux retry. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `identityUsed` and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; the internal fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
+| **`open`** | `open <url>` | Navigates using the calling session's browser identity mode, while always retaining the 390x844 mobile viewport and touch emulation. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `browserMode`, `identityUsed`, and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; an automatic fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
+| **`browser-mode-switch`** | `browser-mode-switch [auto\|android\|linux]` | With no argument, reports the session-scoped mode. `auto` uses Android first with one native Linux retry after a strong block; `android` forces Android with no fallback; `linux` opens directly with the native Linux identity. The setting affects subsequent `open` commands only and never disables mobile metrics or touch emulation. | Session Scope |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
@@ -556,6 +578,7 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 * Google Chrome or Chromium installed (`google-chrome`, `google-chrome-stable`, or `chromium`)
 * `xvfb-run` and `python3` (3.10+)
 * [Pi coding agent](https://github.com/badlogic/pi-mono)
+* For the default Omni visual fallback: a separately installed and running [Microsoft OmniParser](https://github.com/microsoft/OmniParser) service compatible with the local `/parse` contract. This is an external dependent project, not an installer-managed Python package. Use `PI_NODRIVER_VISION_FALLBACK=manual` when it is intentionally absent.
 
 ### One-Step Automated Installation:
 ```bash
@@ -569,6 +592,8 @@ The installer will:
 2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `Pillow==12.3.0`, `idna==3.10`).
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
 4. Automatically disable conflicting legacy browser packages.
+
+The installer does **not** clone OmniParser, download its model weights, or manage its service. Provision that dependent project separately before using the default `omni` fallback.
 
 Then reload Pi or launch a new session:
 ```text
