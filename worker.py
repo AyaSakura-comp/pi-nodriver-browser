@@ -27,7 +27,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_block, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_block, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -54,6 +54,10 @@ class SemanticClickTargetError(ValueError):
 
 
 class _PreflightDeadlineExpired(Exception):
+    pass
+
+
+class _CommandDeadlineExpired(Exception):
     pass
 
 
@@ -6116,7 +6120,7 @@ class BrowserWorker:
         if action == 'wait-popup':
             if len(parts) > 2:
                 raise ValueError('usage: wait-popup [ms]')
-            timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
+            timeout_ms = parse_popup_timeout_ms(parts[1] if len(parts) == 2 else None)
             page = await self.require_page(session_id)
             if session_id in self.popup_just_switched:
                 self.popup_just_switched.discard(session_id)
@@ -6175,7 +6179,7 @@ class BrowserWorker:
         if action == 'wait-popup-close':
             if len(parts) > 2:
                 raise ValueError('usage: wait-popup-close [ms]')
-            timeout_ms = int(parts[1]) if len(parts) == 2 else 30000
+            timeout_ms = parse_popup_timeout_ms(parts[1] if len(parts) == 2 else None)
             page = await self.require_page(session_id)
             openers = self.popup_openers.get(session_id, [])
             if session_id in self.popup_just_closed:
@@ -6694,6 +6698,21 @@ class BrowserWorker:
         await self.shutdown_browser()
 
 
+async def run_with_command_deadline(coroutine, timeout):
+    task = asyncio.create_task(coroutine)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    raise _CommandDeadlineExpired()
+
+
 async def execute_request(worker, request):
     session_id = str(request.get('sessionId') or 'default')
     command_timeout = float(os.environ.get('PI_NODRIVER_COMMAND_TIMEOUT', '75'))
@@ -6705,9 +6724,9 @@ async def execute_request(worker, request):
             worker.preflight_timeout_seconds()
             worker.begin_session_action(session_id)
             action_started = True
-        result = await asyncio.wait_for(
+        result = await run_with_command_deadline(
             worker.execute(request.get('command', ''), session_id=session_id),
-            timeout=command_timeout,
+            command_timeout,
         )
         return {'id': request.get('id'), 'sessionId': session_id, 'ok': True, **result}
     except StaleRefError as error:
@@ -6732,7 +6751,7 @@ async def execute_request(worker, request):
                     f'{progress_suffix}'
                 ),
             }
-    except TimeoutError:
+    except _CommandDeadlineExpired:
         return {
             'id': request.get('id'),
             'sessionId': session_id,

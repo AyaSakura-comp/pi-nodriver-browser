@@ -146,6 +146,39 @@ class FailingFullPageScreenshot:
         raise RuntimeError('capture failed')
 
 
+class CommandDeadlineUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outer_deadline_wins_over_child_cleanup_error(self):
+        from worker import _CommandDeadlineExpired, run_with_command_deadline
+
+        async def operation():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise TimeoutError('cleanup timed out')
+
+        with self.assertRaises(_CommandDeadlineExpired):
+            await run_with_command_deadline(operation(), 0)
+
+    async def test_external_cancellation_wins_over_child_cleanup_error(self):
+        from worker import run_with_command_deadline
+
+        started = asyncio.Event()
+
+        async def operation():
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise RuntimeError('cleanup failed')
+
+        request = asyncio.create_task(run_with_command_deadline(operation(), 10))
+        await started.wait()
+        request.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await request
+
+
 class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.env_patcher = patch.dict(os.environ, {'PI_NODRIVER_ALLOW_DIRECT_VISION': '0', 'PI_NODRIVER_VISION_ONLY': '0'})
@@ -228,6 +261,18 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_post_dispatch_error_is_preserved(self):
         with self.assertRaisesRegex(TimeoutError, 'settle failed'):
             await self.worker.execute('click-css #postdispatch', 'session-a')
+
+    async def test_request_preserves_nested_timeout_error(self):
+        from worker import execute_request
+
+        response = await execute_request(self.worker, {
+            'id': 1,
+            'sessionId': 'session-a',
+            'command': 'click-css #postdispatch',
+        })
+
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error'], 'TimeoutError: click dispatched but settle failed')
 
     async def test_invalid_css_error_is_preserved(self):
         with self.assertRaisesRegex(ValueError, 'invalid CSS selector'):

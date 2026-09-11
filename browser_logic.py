@@ -21,6 +21,13 @@ from typing import Callable
 GOOGLE_REDIRECT_PATHS = {'/url', '/goto'}
 TOUCH_LAB_HOST = 'aya.crayfish-monitor.ts.net'
 TOUCH_LAB_PATH_PREFIX = '/touch-trace'
+POPUP_TIMEOUT_MAX_MS = 2000
+
+
+def parse_popup_timeout_ms(value: str | None) -> int:
+    """Return a popup wait timeout capped at two seconds."""
+    requested_ms = int(value) if value is not None else POPUP_TIMEOUT_MAX_MS
+    return min(requested_ms, POPUP_TIMEOUT_MAX_MS)
 
 
 def detect_access_block(url: str, title: str, text: str) -> str | None:
