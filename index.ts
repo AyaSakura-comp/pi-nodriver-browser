@@ -37,7 +37,7 @@ ROUTING GUIDELINES:
 - WHEN NOT TO USE BROWSER: Do NOT use this tool for general knowledge, programming theory, algorithm design, historical facts, conceptual architecture questions, math calculations, or static knowledge that can be answered directly.
 Guidelines:
 - DEFAULT INTERACTION STRATEGY (${VISION_FALLBACK}): ${VISION_FALLBACK_GUIDANCE}
-- Browser Identity Mode: `browser-mode-switch auto|android|linux` is session-scoped and affects subsequent `open` commands only. `auto` is the default Android-first mode with one Linux fallback on a strong block; touch emulation and the 390x844 mobile viewport remain enabled in every identity mode.
+- Browser Identity Mode: \`browser-mode-switch auto|android|linux\` is session-scoped and affects subsequent \`open\` commands only. \`auto\` is the default Android-first mode with one Linux fallback on a strong block; touch emulation and the 390x844 mobile viewport remain enabled in every identity mode.
 - REF SYNTAX IS LITERAL: snapshot outputs refs like @e16. Use 'click @e16', 'fill @e6 "text"', or 'fill-submit @e2 "query"' exactly; never wrap refs in '<' or '>'. Angle brackets in generic documentation denote placeholders, not characters to type.
 - Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
