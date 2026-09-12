@@ -14,15 +14,15 @@ This suite measures end-to-end Pi agent behavior on deliberately awkward browser
 
 | Mode | Policy | Extra environment |
 |---|---|---|
-| `forced-omni` | Only `open`, `vision-mark omni`, and exact-center `vision-click` | `PI_NODRIVER_VISION_ONLY=1` |
-| `hybrid` | CDP/DOM semantic actions first, Omni fallback | none |
-| `semantic-manual` | CDP/DOM first, ordinary marked-image fallback; Omni prohibited | `PI_NODRIVER_VISION_FALLBACK=manual` |
+| `forced-omni` | Worker allows only `open`, `vision-mark omni`, and exact-center `vision-click` | vision-only + forced-Omni policy |
+| `hybrid` | CDP/DOM semantic actions first, Omni fallback; manual marker flow rejected | Omni fallback + hybrid policy |
+| `semantic-manual` | CDP/DOM first, ordinary marked-image fallback; Omni rejected | manual fallback + semantic-manual policy |
 
-Prompts live in `prompts/` and use `{{FIXTURE_URL}}`; `run.py` resolves that placeholder to the checked-out repository's absolute `file://` URI. There are no machine-specific paths in the suite. Each trial receives an isolated socket and Chrome profile, explicit vision settings that override inherited values, and a worker-enforced `PI_NODRIVER_BENCHMARK_ACTION_POLICY`. This prevents a persistent daemon or a prior mode from contaminating the next trial.
+Prompts live in `prompts/` and use `{{FIXTURE_URL}}`; `run.py` resolves that placeholder to the checked-out repository's absolute `file://` URI. There are no machine-specific paths in the suite. Each trial starts this checkout's `worker.py` through a runner-owned `xvfb-run` process group with an isolated short-path `PI_NODRIVER_SOCKET` under the system temporary directory and an isolated `PI_NODRIVER_PROFILE`, explicit vision settings that override inherited values, and a worker-enforced `PI_NODRIVER_BENCHMARK_ACTION_POLICY`. This prevents the user's persistent daemon, deployed worker version, or a prior mode from contaminating the next trial.
 
 ## Run
 
-The runner requires `pi`, the browser extension, Chrome/Xvfb, and—when using Omni—the separately managed OmniParser service documented in the root README.
+The runner requires `pi`, this repository's current browser extension, Chrome, `xvfb-run`, and—when using Omni—the separately managed OmniParser service documented in the root README. Run `./install.sh` after changing the extension so global `pi` does not benchmark a stale deployed copy.
 
 ```bash
 # Inspect commands without invoking Pi
@@ -41,12 +41,14 @@ Useful options:
 - `--timeout SECONDS` sets the per-trial limit (default: 360).
 - `--output-dir PATH` changes the JSONL destination.
 - `--provider`, `--model`, and `--thinking` select the Pi inference configuration.
+- `--worker-python PATH` selects a Python interpreter containing Nodriver dependencies; it defaults to the deployed extension's virtualenv.
+- `--socket-root PATH` selects a short local Unix-socket root (default: `/tmp`); paths over the safe length fail before launch.
 
-Results are written under `benchmarks/bad-ui/results/` by default and are intentionally ignored by Git. Each collision-resistant filename contains a UTC run ID, mode, trial number, and random suffix. Standard output streams directly to the JSONL file and standard error goes to a paired `.stderr.log`, so a non-zero Pi exit, timeout, or runner interruption preserves already-written evidence without corrupting JSONL. The runner exits non-zero for failed trials and safely terminates only the daemon whose command line matches that trial's unique socket.
+Results are written under `benchmarks/bad-ui/results/` by default and are intentionally ignored by Git. Each collision-resistant filename contains a UTC run ID, mode, trial number, and random suffix. Standard output streams directly to the JSONL file, standard error goes to a paired `.stderr.log`, and persistent worker diagnostics use paired `.worker.log` and `.worker.stderr.log` files, so a non-zero Pi exit, timeout, or runner interruption preserves already-written evidence without corrupting JSONL. The runner exits non-zero for process-level failures, continuously monitors the worker while Pi runs, handles shell/CI `SIGTERM` and `SIGHUP`, terminates and boundedly waits for the exact Pi and worker process groups it started, then removes the isolated profile and short socket directory. It never discovers or signals a daemon by guessed PID or command-line matching. A zero exit means the Pi process completed; inspect the final assistant event in Pi's JSONL and parse its nested assistant text as JSON, then use `success` and `completedLevels` for benchmark-quality scoring.
 
 ## Verification
 
-The repository test suite checks the level manifest, portable paths, prompt inventory, mode policies, and dry-run command construction:
+The repository test suite checks the manifest against the fixture, portable paths, documentation and ignore links, prompt inventory, mode policies, isolated socket/profile plans, streamed timeout evidence, and dry-run command construction:
 
 ```bash
 python3 -m unittest tests.test_bad_ui_benchmark -v

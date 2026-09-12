@@ -143,13 +143,13 @@ def validate_benchmark_action_policy(parts, policy):
     if not policy:
         return
     action = parts[0].lower()
+    coordinate_click = False
+    if action == 'vision-click' and len(parts) == 3:
+        try:
+            coordinate_click = all(math.isfinite(float(value)) for value in parts[1:])
+        except ValueError:
+            coordinate_click = False
     if policy == 'forced-omni':
-        coordinate_click = False
-        if action == 'vision-click' and len(parts) == 3:
-            try:
-                coordinate_click = all(math.isfinite(float(value)) for value in parts[1:])
-            except ValueError:
-                coordinate_click = False
         allowed = (
             action == 'open'
             or coordinate_click
@@ -161,7 +161,19 @@ def validate_benchmark_action_policy(parts, policy):
             or (action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni')
         )
     elif policy == 'hybrid':
-        allowed = True
+        manual_mark = action == 'vision-mark' and not (
+            len(parts) == 2 and parts[1].lower() == 'omni'
+        )
+        manual_click = action == 'vision-click' and not coordinate_click
+        other_vision_action = action.startswith('vision-') and action not in {
+            'vision-click', 'vision-mark'
+        }
+        allowed = (
+            action != 'screenshot'
+            and not manual_mark
+            and not manual_click
+            and not other_vision_action
+        )
     else:
         raise ValueError(f'unknown benchmark action policy: {policy}')
     if not allowed:

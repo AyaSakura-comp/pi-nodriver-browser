@@ -2900,6 +2900,21 @@ class BenchmarkActionPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'BENCHMARK_ACTION_POLICY'):
                 validate_benchmark_action_policy(parts, 'forced-omni')
 
+    def test_hybrid_policy_rejects_manual_marker_flow(self):
+        from worker import validate_benchmark_action_policy
+
+        validate_benchmark_action_policy(['snapshot', '-i'], 'hybrid')
+        validate_benchmark_action_policy(['vision-mark', 'omni'], 'hybrid')
+        validate_benchmark_action_policy(['vision-click', '120', '240'], 'hybrid')
+        for parts in (
+            ['screenshot'], ['vision-mark', '120', '240'],
+            ['vision-click', 'preview-token'], ['vision-mark-drag', '1', '2', '3', '4'],
+            ['vision-drag', 'preview-token'], ['vision-long-press', 'preview-token'],
+            ['vision-longpress', 'preview-token'],
+        ):
+            with self.assertRaisesRegex(ValueError, 'BENCHMARK_ACTION_POLICY'):
+                validate_benchmark_action_policy(parts, 'hybrid')
+
     def test_semantic_manual_policy_rejects_only_omni_marking(self):
         from worker import validate_benchmark_action_policy
 
