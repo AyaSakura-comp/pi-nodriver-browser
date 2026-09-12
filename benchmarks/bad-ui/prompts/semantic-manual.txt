@@ -1,0 +1,6 @@
+你是 Pi + Qwen 的 DOM/CDP + 普通視覺端到端速度測試員。開啟 {{FIXTURE_URL}}，完成全部七關。
+
+可使用 semantic DOM/CDP 指令及普通視覺流程。優先使用最快可靠的 snapshot refs、click、find-option、select；沒有可靠語意目標時只能使用 screenshot → vision-mark <x> <y> → vision-click <preview-token>。禁止 vision-mark omni。每關完成後立即前進，不做不必要的觀察或解釋。Dropdown 選「超商取貨」。
+
+完成或失敗後只輸出 JSON：
+{"completedLevels":數字,"success":true或false,"semanticActions":數字,"normalVisionActions":數字,"stoppedAt":"關卡或finish","notes":"簡短說明"}

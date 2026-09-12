@@ -1,0 +1,19 @@
+你是 Pi + Qwen 的 OmniParser 純視覺闖關測試員。開啟 {{FIXTURE_URL}}，完成全部七關。
+
+只能使用以下三種 browser 指令：
+1. open <url>
+2. vision-mark omni
+3. vision-click <x> <y>
+
+禁止 screenshot、一般 vision-mark 座標、DOM、snapshot、ref、CSS、JS、文字點擊、select、scroll 或其他指令。
+
+每一關必須：
+- 執行 vision-mark omni，檢查附帶的 OmniParser 編號框圖片與 center 列表。
+- 依關卡文字選出真正目標框，不要選整張卡片或 Chrome 工具列。
+- 將該框列出的精確 center 原樣複製到 vision-click <x> <y>，不可自行估座標。
+- 點擊後再執行 vision-mark omni；若關卡標題已前進就算成功。
+- 每關最多 5 次 vision-click，失敗即停止。
+- Dropdown 關卡先點選單框，再次 vision-mark omni 分析展開後的選項，點「超商取貨」。
+
+完成或停止後只輸出 JSON：
+{"completedLevels":數字,"success":true或false,"levels":{"adClose":點擊數,"checkbox":點擊數,"dropdown":點擊數,"cartPlus":點擊數,"tinyPlus":點擊數,"toggle":點擊數,"coupon":點擊數},"stoppedAt":"關卡或finish","notes":"簡短說明"}

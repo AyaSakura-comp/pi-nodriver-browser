@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Qwen Vision 點點闖關</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:#171b22;color:#20242a;font-family:Arial,"Noto Sans TC",sans-serif}body{min-height:844px}.app{position:relative;width:390px;min-height:844px;overflow:hidden;background:linear-gradient(160deg,#fffdf6,#e8e4d8);padding:14px}.top{position:relative;z-index:30}.eyebrow{font-size:11px;font-weight:800;letter-spacing:1.8px;color:#69717b}.title{margin:3px 0 10px;font-size:22px}.progress{height:8px;background:#d7d9d7;border-radius:99px;overflow:hidden}.bar{height:100%;width:0;background:linear-gradient(90deg,#17a673,#65d39c);transition:width .3s}.status{display:flex;justify-content:space-between;margin-top:7px;font-size:12px;color:#596169}.arena{position:relative;height:680px;margin-top:12px;border:1px solid #d3cec2;border-radius:16px;background:#fff;box-shadow:0 10px 30px #1c263319;overflow:hidden}.level{display:none;position:absolute;inset:0;padding:18px}.level.active{display:block}.level h2{margin:0;font-size:18px}.instruction{margin:5px 0;color:#70777d;font-size:12px}.stage{position:absolute;background:#f8f7f2;border:1px solid #c9c5ba;border-radius:12px;padding:14px;box-shadow:0 4px 12px #0002}.stage-a{left:17px;top:145px;width:328px;height:250px;background:linear-gradient(135deg,#ffef83,#ff9983);border:5px solid #fff;text-align:center;padding-top:65px}.stage-b{left:25px;top:205px;width:300px;height:125px}.stage-c{left:68px;top:150px;width:260px;height:150px}.stage-d{left:105px;top:260px;width:210px;height:115px}.stage-e{left:24px;top:360px;width:205px;height:105px}.stage-f{right:26px;top:175px;width:180px;height:135px}.stage-g{left:34px;top:300px;width:305px;height:130px}.ad-close{position:absolute;right:-9px;top:-9px;width:24px;height:24px;border-radius:50%;border:1px solid #aaa;background:#d7d7d7;color:#c8c8c8;font:14px/20px Arial;padding:0;box-shadow:0 1px 3px #0005}.ad-title{font-size:29px;font-weight:900;transform:rotate(-4deg)}.fakecheck{display:flex;gap:9px;align-items:center;margin-top:22px;font-size:14px;cursor:pointer}.fakebox{width:23px;height:23px;border:2px solid #737b84;border-radius:5px;background:#fff}.fakebox.on{background:#1769aa;border-color:#1769aa}.fakebox.on:after{content:"✓";display:block;color:#fff;text-align:center;font-weight:bold;line-height:19px}select{margin-top:24px;width:100%;height:38px;border:1px solid #8f969d;border-radius:4px;background:#fff;font-size:14px}.stepper{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:20px}.stepper button{width:36px;height:32px;border:0;border-radius:4px;background:#e1e4e6;color:#555;font-size:21px}.qty{width:28px;text-align:center;font-weight:800}.badrow{display:flex;align-items:center;gap:4px;margin-top:20px}.badrow button{width:23px;height:23px;padding:0;border:1px solid #ccc;background:#fafafa;color:#b6b6b6}.tiny{font-size:10px;color:#8d867c}.toggle{position:relative;width:49px;height:26px;margin:25px auto 0;border-radius:14px;background:#9da3a8}.toggle:after{content:"";position:absolute;left:3px;top:3px;width:20px;height:20px;border-radius:50%;background:white;box-shadow:0 1px 3px #0005}.toggle.on{background:#25885f}.toggle.on:after{left:26px}.coupon{margin-top:25px;width:100%;height:36px;padding:9px;border:1px dashed #927d52;border-radius:5px;background:#fff8df;font-size:12px}.feedback{position:absolute;left:50%;bottom:22px;transform:translateX(-50%) translateY(15px);opacity:0;background:#18362c;color:white;border-radius:99px;padding:9px 16px;font-size:12px;transition:.2s;white-space:nowrap}.feedback.show{opacity:1;transform:translateX(-50%) translateY(0)}#finish{display:none;position:absolute;inset:0;padding:100px 28px;text-align:center;background:linear-gradient(145deg,#eafff3,#fff9d8)}#finish.show{display:block}.trophy{font-size:72px}.finish-title{font-size:28px;margin:8px}.summary{font-size:13px;line-height:1.8;color:#52605a}.reset{margin-top:18px;border:0;border-radius:9px;padding:11px 18px;background:#17212a;color:white}.log{position:fixed;left:-9999px}
+</style>
+</head>
+<body>
+<main class="app">
+<header class="top"><div class="eyebrow">QWEN VISION CHALLENGE</div><h1 class="title">點點闖關：壞 UI 七連戰</h1><div class="progress"><div class="bar" id="bar"></div></div><div class="status"><span id="stageLabel">關卡 1 / 7</span><span id="score">完成 0</span></div></header>
+<section class="arena" id="arena">
+  <article class="level" data-level="adClose"><h2>關卡 1｜關閉假廣告</h2><p class="instruction">找到右上角低對比的 ×。</p><div class="stage stage-a"><button class="ad-close" id="adclose">×</button><div class="ad-title">限時假廣告</div><p>訂閱即可獲得不存在的 87 折</p></div></article>
+  <article class="level" data-level="checkbox"><h2>關卡 2｜同意條款</h2><p class="instruction">勾選自製 checkbox。</p><div class="stage stage-b"><div class="fakecheck" id="fakecheck"><span class="fakebox" id="fakebox"></span><span>同意購物條款</span></div></div></article>
+  <article class="level" data-level="dropdown"><h2>關卡 3｜選擇配送</h2><p class="instruction">下拉選擇「超商取貨」。</p><div class="stage stage-c"><select id="shipping"><option value="">選擇配送</option><option value="home">宅配到府</option><option value="store">超商取貨</option></select></div></article>
+  <article class="level" data-level="cartPlus"><h2>關卡 4｜購物車加一</h2><p class="instruction">把數量從 1 加到 2。</p><div class="stage stage-d"><div class="stepper"><button id="minus">−</button><span class="qty" id="qty">1</span><button id="plus">＋</button></div></div></article>
+  <article class="level" data-level="tinyPlus"><h2>關卡 5｜超小型加號</h2><p class="instruction">把低對比數量從 0 加到 1。</p><div class="stage stage-e"><div class="badrow"><span class="tiny">數量</span><button id="badminus">−</button><span class="qty" id="badqty">0</span><button id="badplus">＋</button><span class="tiny">低對比</span></div></div></article>
+  <article class="level" data-level="toggle"><h2>關卡 6｜開啟 Toggle</h2><p class="instruction">把無文字開關切成綠色。</p><div class="stage stage-f"><div class="toggle" id="toggle"></div></div></article>
+  <article class="level" data-level="coupon"><h2>關卡 7｜領取折價券</h2><p class="instruction">點擊看起來像輸入框的按鈕。</p><div class="stage stage-g"><div class="coupon" id="coupon" role="button" tabindex="0">領取隱藏折價券</div></div></article>
+  <div class="feedback" id="feedback">成功，前往下一關</div>
+  <section id="finish"><div class="trophy">🏆</div><h2 class="finish-title">七關全破！</h2><p class="summary" id="summary"></p><button class="reset" id="reset">重新挑戰</button></section>
+</section>
+<pre class="log" id="log"></pre>
+</main>
+<script>
+const LEVELS=['adClose','checkbox','dropdown','cartPlus','tinyPlus','toggle','coupon'];
+let current=Math.max(0,Math.min(LEVELS.length-1,Number(new URLSearchParams(location.search).get('level')||1)-1));
+const completed=[];const attempts={};let transitioning=false;
+function recordClick(){const name=LEVELS[current]||'finish';attempts[name]=(attempts[name]||0)+1;renderLog()}
+document.addEventListener('click',recordClick,true);
+function renderLog(){log.textContent=JSON.stringify({current:LEVELS[current]||'finish',completed,attempts})}
+function showLevel(index){
+  current=index;document.querySelectorAll('.level').forEach((el,i)=>el.classList.toggle('active',i===index));
+  finish.classList.toggle('show',index>=LEVELS.length);bar.style.width=`${Math.min(index,LEVELS.length)/LEVELS.length*100}%`;
+  stageLabel.textContent=index<LEVELS.length?`關卡 ${index+1} / ${LEVELS.length}`:'挑戰完成';score.textContent=`完成 ${completed.length}`;
+  if(index>=LEVELS.length)summary.textContent=`有效操作完成 7 關；總點擊 ${Object.values(attempts).reduce((a,b)=>a+b,0)} 次。`;
+  renderLog();
+}
+function complete(name){
+  if(transitioning||LEVELS[current]!==name)return;
+  transitioning=true;completed.push(name);bar.style.width=`${(current+1)/LEVELS.length*100}%`;score.textContent=`完成 ${completed.length}`;
+  feedback.classList.add('show');setTimeout(()=>{feedback.classList.remove('show');transitioning=false;showLevel(current+1)},500);
+}
+adclose.onclick=()=>complete('adClose');
+fakecheck.onclick=()=>{fakebox.classList.add('on');complete('checkbox')};
+shipping.onchange=()=>{if(shipping.value==='store')complete('dropdown')};
+minus.onclick=()=>{};plus.onclick=()=>{qty.textContent='2';complete('cartPlus')};
+badminus.onclick=()=>{};badplus.onclick=()=>{badqty.textContent='1';complete('tinyPlus')};
+toggle.onclick=()=>{toggle.classList.add('on');complete('toggle')};
+coupon.onclick=()=>{coupon.textContent='已領取 SAVE87';complete('coupon')};
+reset.onclick=()=>location.href=location.pathname;
+showLevel(current);
+</script>
+</body>
+</html>

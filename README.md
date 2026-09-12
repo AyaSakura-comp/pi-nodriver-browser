@@ -16,6 +16,7 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
 - [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
+- [Bad UI Seven-Level Benchmark](benchmarks/bad-ui/README.md) — portable end-to-end Pi agent challenge for low-contrast, tiny, native, and non-semantic controls across forced Omni, hybrid CDP+Omni, and CDP+manual-vision modes.
 
 ## 🧩 Dependent Project: OmniParser
 
@@ -479,7 +480,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url>` | Navigates using the calling session's browser identity mode, while always retaining the 390x844 mobile viewport and touch emulation. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `browserMode`, `identityUsed`, and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; an automatic fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
+| **`open`** | `open <url> [timeout_seconds]` | Navigates using the calling session's browser identity mode, with a configurable timeout (default 10s or `PI_NODRIVER_OPEN_TIMEOUT`; e.g. `open <url> 4` or `4s`), while always retaining the 390x844 mobile viewport and touch emulation. Hanging navigations abort cleanly via CDP `Page.stopLoading` and restore previous tabs. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `browserMode`, `identityUsed`, and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; an automatic fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
 | **`browser-mode-switch`** | `browser-mode-switch [auto\|android\|linux]` | With no argument, reports the session-scoped mode. `auto` uses Android first with one native Linux retry after a strong block; `android` forces Android with no fallback; `linux` opens directly with the native Linux identity. The setting affects subsequent `open` commands only and never disables mobile metrics or touch emulation. | Session Scope |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
@@ -487,7 +488,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`fetch_images`** | `fetch_images({ urls: [...] })` | Fetches up to four selected direct images concurrently, preserves partial success, and returns exact delivery markers without reinjecting image bytes into the next model turn. | Session Scope |
 | **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** returning clean text plus ranked `imageCandidates`, with 3.0s circuit breaker and anti-bot challenge detection. | 1920x1080 Full-Desktop CDP Override |
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` plus checkbox/radio `checked`, `required`, and `disabled` state in the current viewport | Interactive Tab |
-| **`snapshot -i --full`** | `snapshot -i --full` | Returns vision-first layout overview; scroll and inspect | Interactive Tab |
+| **`snapshot -i --full`** | `snapshot -i --full` | Returns full-page interactive DOM elements with `@refs` and `offscreen="true"` attributes | Interactive Tab |
 | **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
 | **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
 | **`vision-mark omni`** | `vision-mark omni` | Runs OmniParser V3, removes Chrome-toolbar candidates (`center y < 90`), ranks by confidence, and returns at most 15 numbered page regions with exact screenshot-pixel centers | Interactive Tab |
@@ -533,9 +534,11 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
   - **Wayland / Ozone X11 強制隔離**：啟動時自動從環境變數過濾 `WAYLAND_DISPLAY` 並傳遞 `--ozone-platform=x11`，防止 Linux 桌面環境下 Chrome 誤連 Wayland 造成 Xvfb 擷取出未繪製的純黑空圖。
   - **多 Session 條件式聚焦 (`bring_to_front`)**：只有目標 session tab 與目前作用中 tab 不同時才切到前景；同一 tab 的連續截圖、Omni 偵測與點擊驗證不會重複搶焦點，因此原生 dropdown/menu 等 transient UI 能保持展開。
   - **全黑圖保護與 CDP 自動 Fallback**：透過 `is_empty_screenshot` 進行像素層級校驗，若 Xvfb 畫面為純黑未初始化狀態，自動無縫切換 CDP 記憶體渲染，保證 100% 回傳可用畫面。
-- **整頁長截圖 (`screenshot --full` / `snapshot -i --full`)**：
-  - **適用情境**：**輔助 DOM 語意點擊 (Non-Vision Browser Click)**。當頁面很長且 Agent 需要一眼掌握全頁排版、尋找特定按鈕或標題以決定呼叫哪一個 `@ref` / `fill` / `click-text` 時使用。
+- **整頁長截圖 (`screenshot --full`)**：
+  - **適用情境**：**視覺長佈局檢查**。當頁面很長且 Agent 需要一眼掌握全頁排版、結構時使用。如需直接取得全頁互動元素與 `@refs`，請使用 `snapshot -i --full`。
   - **運作機制**：透過 Chrome Blink CDP 引擎在記憶體中拼接長圖，不提供 X11 物理座標（不能用於座標點擊）。
+- **整頁 DOM 元素清單 (`snapshot -i --full`)**：
+  - **適用情境**：一次取得全網頁所有可互動元素之 `@refs`，可直接 `click @ref`、`fill @ref` 或 `scroll to @ref`，超越可視範圍的元素會標註 `offscreen="true"`。
 - **原生 Chrome UI 彈窗淨化**：
   - 預設注入 `--simulate-outdated-no-au="Tue, 31 Dec 2099 23:59:59 GMT"` 與 `--check-for-update-interval=31536000`，徹底防止 Chrome 跳出「Can't update Chrome / Relaunch to update」原生桌面氣泡彈窗遮擋右上角頁面內容與選單。
   - **全面抑制儲存密碼與自動填入彈窗**：透過 profile Preferences 預先寫入 `credentials_enable_service: false`、`password_manager_enabled: false`、`password_manager_leak_detection: false`、以及關閉 `autofill`（表單、地址、信用卡），並搭配啟動參數 `--password-store=basic`、`--disable-save-password-bubble`、`--disable-single-click-autofill`，杜絕登入或填表時出現「Save password?」或自動填入下拉選單遮擋網頁畫面。
@@ -557,6 +560,7 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 |---|---|---|
 | `PI_NODRIVER_VISION_FALLBACK` | `omni` (default) | Visual fallback after CDP/DOM semantic actions. Use `omni` for `vision-mark omni` (recommended) or `manual` for screenshot/cursor-marker fallback. |
 | `PI_NODRIVER_VISION_ONLY` | `0` | Set `1` only for forced vision benchmarks; normal deployment keeps CDP/DOM available. |
+| `PI_NODRIVER_BENCHMARK_ACTION_POLICY` | (unset) | Optional fail-closed benchmark policy: `forced-omni`, `hybrid`, or `semantic-manual`. The bad-UI runner sets this only on its isolated per-trial daemon. |
 | `PI_NODRIVER_SCREEN` | `500x1000x24` | Xvfb virtual display resolution (compact default fits Chrome UI + 390x844 mobile viewport without clipping). |
 | `PI_NODRIVER_WINDOW_SIZE` | `500,1000` | Chrome startup `--window-size` in Xvfb (with `--start-maximized` and `--window-position=0,0`). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |

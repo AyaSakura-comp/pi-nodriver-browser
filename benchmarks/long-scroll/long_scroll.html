@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>超長網頁直達跳捲測試 (Long Page Direct Scroll Benchmark)</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 390px;
+  background: #0f172a;
+  color: #f8fafc;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", sans-serif;
+  margin: 0 auto;
+  overflow-x: hidden;
+}
+.header-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(15, 23, 42, 0.95);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid #334155;
+  padding: 12px 16px;
+}
+.header-bar h1 { font-size: 16px; color: #38bdf8; margin-bottom: 4px; }
+.header-bar p { font-size: 11px; color: #94a3b8; line-height: 1.4; }
+.progress-box {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+}
+.badge {
+  padding: 3px 8px;
+  border-radius: 99px;
+  background: #1e293b;
+  color: #64748b;
+  font-weight: bold;
+}
+.badge.done { background: #065f46; color: #34d399; }
+
+.section {
+  padding: 24px 16px;
+  min-height: 800px;
+  border-bottom: 1px dashed #334155;
+  position: relative;
+}
+.section h2 {
+  font-size: 20px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.section-tag {
+  font-size: 11px;
+  padding: 2px 6px;
+  background: #334155;
+  border-radius: 4px;
+  color: #94a3b8;
+}
+.card {
+  background: #1e293b;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid #334155;
+}
+.card h3 { font-size: 15px; margin-bottom: 8px; color: #f1f5f9; }
+.card p { font-size: 13px; color: #94a3b8; line-height: 1.5; }
+
+/* Target Section 1: 限時閃購區 at ~2400px */
+.target-section-flash {
+  background: linear-gradient(180deg, #1e1b4b 0%, #0f172a 100%);
+  border-left: 4px solid #818cf8;
+}
+.flash-btn {
+  width: 100%;
+  padding: 14px;
+  background: #4f46e5;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+  transition: all 0.2s;
+}
+.flash-btn.claimed {
+  background: #059669;
+  box-shadow: 0 4px 12px rgba(5, 150, 105, 0.4);
+}
+
+/* Target Section 2: VIP 專屬優惠區 at ~4000px */
+.target-section-vip {
+  background: linear-gradient(180deg, #3b0764 0%, #0f172a 100%);
+  border-left: 4px solid #c084fc;
+}
+.vip-btn {
+  width: 100%;
+  padding: 14px;
+  background: #9333ea;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(147, 51, 234, 0.4);
+  transition: all 0.2s;
+}
+.vip-btn.claimed {
+  background: #d97706;
+  box-shadow: 0 4px 12px rgba(217, 119, 6, 0.4);
+}
+
+.secret-box {
+  display: none;
+  margin-top: 14px;
+  padding: 12px;
+  background: #2e1065;
+  border: 1px dashed #a855f7;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: bold;
+  color: #f0abfc;
+  text-align: center;
+}
+.secret-box.show { display: block; }
+
+.footer {
+  padding: 32px 16px;
+  background: #020617;
+  text-align: center;
+  font-size: 12px;
+  color: #64748b;
+  min-height: 400px;
+}
+#result-log {
+  display: block;
+  margin-top: 16px;
+  padding: 12px;
+  background: #000;
+  border-radius: 6px;
+  color: #22c55e;
+  font-family: monospace;
+  font-size: 11px;
+  text-align: left;
+  white-space: pre-wrap;
+}
+</style>
+</head>
+<body>
+
+<header class="header-bar">
+  <h1>⚡ 極限電商特賣會 (總長度 ~4800px)</h1>
+  <p>任務提示：頁面非常長。請勿盲目上下小幅捲動。可使用全頁檢視或直達跳捲功能，完成兩個深層目標：</p>
+  <div class="progress-box">
+    <span class="badge" id="badge-flash">目標 1: 限時閃購券 (未領)</span>
+    <span class="badge" id="badge-vip">目標 2: VIP 特惠 (未啟動)</span>
+  </div>
+</header>
+
+<!-- Section 1 (Y ~ 100..900) -->
+<section class="section" id="sec-hot">
+  <h2>🔥 今日熱門推薦 <span class="section-tag">Y: 100px</span></h2>
+  <div class="card"><h3>AI 旗艦降噪耳機 Pro</h3><p>極致主動降噪，續航達 48 小時。特惠熱銷中。</p></div>
+  <div class="card"><h3>輕薄機械鍵盤 75%</h3><p>三模熱插拔，客製化軸體手感極佳。</p></div>
+  <div class="card"><h3>4K 電競高刷螢幕 27吋</h3><p>Fast-IPS 面板，180Hz 極速反應時間。</p></div>
+  <div class="card"><h3>氮化鎵 140W 快充頭</h3><p>支援多口同時快充，筆電手機一顆搞定。</p></div>
+</section>
+
+<!-- Section 2 (Y ~ 900..1800) -->
+<section class="section" id="sec-brands">
+  <h2>🏷️ 精選品牌旗艦館 <span class="section-tag">Y: 950px</span></h2>
+  <div class="card"><h3>潮流外設品牌館</h3><p>全系列現貨免運，登錄再享三年保固服務。</p></div>
+  <div class="card"><h3>智慧家居生態系</h3><p>全屋智慧聯動，支援語音控制與情境設定。</p></div>
+  <div class="card"><h3>戶外機能服飾展</h3><p>防潑水透氣面料，適合多雨氣候與山系穿搭。</p></div>
+  <div class="card"><h3>精品咖啡生活館</h3><p>產地直送精品豆，手沖器材特價 69 折起。</p></div>
+</section>
+
+<!-- Section 3 (Y ~ 1800..2600) -->
+<section class="section" id="sec-reviews">
+  <h2>💬 真實會員購物評價 <span class="section-tag">Y: 1800px</span></h2>
+  <div class="card"><h3>會員 Leo C. ★★★★★</h3><p>出貨速度極快，包裝完整，商品品質與預期一致！</p></div>
+  <div class="card"><h3>會員 Amber K. ★★★★★</h3><p>操作介面順暢，特價優惠很有誠意，會再回購。</p></div>
+  <div class="card"><h3>會員 Mark W. ★★★★★</h3><p>客服回覆親切且專業，售後服務非常令人安心。</p></div>
+</section>
+
+<!-- Target Section 1: 限時閃購區 (Y ~ 2600..3400) -->
+<section class="section target-section-flash" id="sec-flash">
+  <h2>⚡ 限時閃購專區 <span class="section-tag">Y: 2650px</span></h2>
+  <div class="card">
+    <h3>第一目標：領取專屬閃購折價券</h3>
+    <p>每天限量發放，點擊下方按鈕即可領取 500 元折價券！</p>
+    <br>
+    <button class="flash-btn" id="claim-flash">點我領取閃購折價券 (SAVE500)</button>
+  </div>
+</section>
+
+<!-- Section 5: 配送與售後須知 (Y ~ 3400..4100) -->
+<section class="section" id="sec-shipping">
+  <h2>📦 配送物流與常見問題 <span class="section-tag">Y: 3450px</span></h2>
+  <div class="card"><h3>全台 24 小時快速到貨說明</h3><p>台北市與新北市特定區域提供最快 6 小時極速配。</p></div>
+  <div class="card"><h3>七天鑑賞期與退換貨流程</h3><p>無條件退貨保證，免收任何手續費用。</p></div>
+  <div class="card"><h3>電子發票與載具歸戶</h3><p>支援手機條碼載具與會員載具自動對獎。</p></div>
+</section>
+
+<!-- Target Section 2: VIP 專屬優惠區 (Y ~ 4100..4800) -->
+<section class="section target-section-vip" id="sec-vip">
+  <h2>👑 VIP 專屬優惠區 <span class="section-tag">Y: 4200px</span></h2>
+  <div class="card">
+    <h3>第二目標：啟動 VIP 終極特惠領取神秘代碼</h3>
+    <p>只有滑動到頁面深層的 VIP 會員才能啟動專屬折扣碼。</p>
+    <br>
+    <button class="vip-btn" id="claim-vip">啟動 VIP 終極特惠</button>
+    <div class="secret-box" id="secret-box">
+      神秘通關代碼：<span id="secret-code">QWEN_TURBO_777</span>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <p>© 2026 極限電商測試基準. All rights reserved.</p>
+  <pre id="result-log"></pre>
+</footer>
+
+<script>
+window.__BENCHMARK_STATE__ = {
+  flashClaimed: false,
+  vipClaimed: false,
+  secretCode: "",
+  scrollEventsCount: 0,
+  maxScrollY: 0,
+  completed: false
+};
+
+const flashBtn = document.getElementById('claim-flash');
+const vipBtn = document.getElementById('claim-vip');
+const badgeFlash = document.getElementById('badge-flash');
+const badgeVip = document.getElementById('badge-vip');
+const secretBox = document.getElementById('secret-box');
+const resultLog = document.getElementById('result-log');
+
+function updateLog() {
+  resultLog.textContent = JSON.stringify(window.__BENCHMARK_STATE__, null, 2);
+}
+
+window.addEventListener('scroll', () => {
+  window.__BENCHMARK_STATE__.scrollEventsCount++;
+  window.__BENCHMARK_STATE__.maxScrollY = Math.max(
+    window.__BENCHMARK_STATE__.maxScrollY,
+    Math.round(window.scrollY)
+  );
+  updateLog();
+}, { passive: true });
+
+flashBtn.addEventListener('click', () => {
+  window.__BENCHMARK_STATE__.flashClaimed = true;
+  flashBtn.classList.add('claimed');
+  flashBtn.textContent = '✅ 已成功領取閃購折價券 (SAVE500)';
+  badgeFlash.classList.add('done');
+  badgeFlash.textContent = '目標 1: 閃購券 (已領取)';
+  checkComplete();
+});
+
+vipBtn.addEventListener('click', () => {
+  window.__BENCHMARK_STATE__.vipClaimed = true;
+  window.__BENCHMARK_STATE__.secretCode = "QWEN_TURBO_777";
+  vipBtn.classList.add('claimed');
+  vipBtn.textContent = '🎉 VIP 終極特惠已啟動！';
+  secretBox.classList.add('show');
+  badgeVip.classList.add('done');
+  badgeVip.textContent = '目標 2: VIP (已啟動)';
+  checkComplete();
+});
+
+function checkComplete() {
+  if (window.__BENCHMARK_STATE__.flashClaimed && window.__BENCHMARK_STATE__.vipClaimed) {
+    window.__BENCHMARK_STATE__.completed = true;
+  }
+  updateLog();
+}
+
+updateLog();
+</script>
+
+</body>
+</html>

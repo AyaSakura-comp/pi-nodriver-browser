@@ -1284,6 +1284,7 @@ def format_snapshot(elements: list[dict]) -> str:
             ('required', 'required'),
             ('disabled', 'disabled'),
             ('valueSet', 'value-set'),
+            ('offscreen', 'offscreen'),
         ):
             if item.get(state) is not None:
                 line += f' {label}="{str(bool(item[state])).lower()}"'

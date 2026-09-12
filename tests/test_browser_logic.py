@@ -204,6 +204,11 @@ class ParseCommandTests(unittest.TestCase):
         self.assertEqual(parse_command('scroll bottom'), ['scroll', 'bottom'])
         self.assertEqual(parse_command('scroll top'), ['scroll', 'top'])
         self.assertEqual(parse_command('scroll down 1000'), ['scroll', 'down', '1000'])
+        self.assertEqual(parse_command('scroll to 1500'), ['scroll', 'to', '1500'])
+        self.assertEqual(parse_command('scroll to 45%'), ['scroll', 'to', '45%'])
+        self.assertEqual(parse_command('scroll 45%'), ['scroll', '45%'])
+        self.assertEqual(parse_command('scroll to-ref @e10'), ['scroll', 'to-ref', '@e10'])
+        self.assertEqual(parse_command('scroll to-text "暢銷排行榜"'), ['scroll', 'to-text', '暢銷排行榜'])
 
     def test_rejects_empty_command(self):
         with self.assertRaisesRegex(ValueError, 'empty browser command'):
@@ -1022,6 +1027,16 @@ class SnapshotFormattingTests(unittest.TestCase):
         }])
 
         self.assertIn('frame="PC configurator"', output)
+
+    def test_marks_offscreen_elements_from_full_dom_snapshots(self):
+        output = format_snapshot([{
+            'ref': 'e8',
+            'tag': 'button',
+            'text': 'Load more',
+            'offscreen': True,
+        }])
+
+        self.assertIn('offscreen="true"', output)
 
     def test_marks_selected_option_for_select_controls(self):
         output = format_snapshot([{

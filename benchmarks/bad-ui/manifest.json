@@ -1,0 +1,17 @@
+{
+  "name": "bad-ui-seven-level-challenge",
+  "levels": [
+    "adClose",
+    "checkbox",
+    "dropdown",
+    "cartPlus",
+    "tinyPlus",
+    "toggle",
+    "coupon"
+  ],
+  "modes": [
+    "forced-omni",
+    "hybrid",
+    "semantic-manual"
+  ]
+}

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { createConnection, type Socket } from "node:net";
@@ -39,10 +39,10 @@ Guidelines:
 - DEFAULT INTERACTION STRATEGY (${VISION_FALLBACK}): ${VISION_FALLBACK_GUIDANCE}
 - Browser Identity Mode: \`browser-mode-switch auto|android|linux\` is session-scoped and affects subsequent \`open\` commands only. \`auto\` is the default Android-first mode with one Linux fallback on a strong block; touch emulation and the 390x844 mobile viewport remain enabled in every identity mode.
 - REF SYNTAX IS LITERAL: snapshot outputs refs like @e16. Use 'click @e16', 'fill @e6 "text"', or 'fill-submit @e2 "query"' exactly; never wrap refs in '<' or '>'. Angle brackets in generic documentation denote placeholders, not characters to type.
-- Fast 2-Step Pattern: 'open <url>' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
+- Fast 2-Step Pattern: 'open <url> [timeout_seconds]' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
 - Incidental Image Completion: Do not finalize a concrete-subject answer as text-only when get text/crawl returned relevant representative or content candidates. Call fetch_images with 1–3 non-duplicate direct URLs even when the user did not mention images; skip only irrelevant, logo/icon/ad/tracking, or low-confidence assets.
-- One-Shot Overview & DOM Semantic Assist: For long pages, use 'screenshot --full' (or 'snapshot -i --full') to capture the entire scrollable page layout in 1 step. Its primary purpose is to visually locate elements, text, and structure to assist non-vision DOM browser clicks (e.g. click @ref, fill @ref, click-text); it is NOT for coordinate clicking. When a user requests 'screenshot', always default to the current Xvfb window screenshot (500x1000 viewport with full Chrome UI).
+- One-Shot Full-Page DOM & Overview: For long pages, use 'snapshot -i --full' to discover all interactive DOM elements across the entire page with compact @refs (offscreen elements are marked with offscreen="true"). You can click/fill @refs directly or scroll to them (e.g. 'scroll to @ref' or 'scroll to-ref @ref'). Use 'screenshot --full' to capture the full visual layout when visual inspection is needed.
 - Semantic-First Iframes: Controls inside same-origin iframes receive normal @refs plus frame labels. Use fill/select/click @ref, click-text, or click-css; never guess viewport coordinates for ordinary iframe controls.
 - Searchable Dropdowns: Native <select> controls show their label, selected value, option count, and option type. Do not click them open or infer their contents from the first option. Use find-option "fuzzy keywords", then copy a returned complete 'Select exactly' command; its index and fingerprint prevent stale-option mistakes.
 - Progressive Disclosure: Never crawl or get the full page merely to inspect a dropdown. find-option searches every option internally, includes control-label context, and diversifies the top candidates across dropdowns; ambiguous queries return choices instead of guessing.
@@ -57,11 +57,11 @@ Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto
 Commands:
   google-search <json> - Run up to four directional Google queries in parallel and return a globally de-duplicated Top 10
   crawl <url1> [url2]... - Crawl one or multiple URLs in parallel and return clean page text plus ranked image candidates
-  open <url> - Navigate using the current session browser mode (automatically returns interactive elements snapshot with @refs)
+  open <url> [timeout_seconds] - Navigate using the current session browser mode (default 10s or PI_NODRIVER_OPEN_TIMEOUT; e.g. 'open https://example.com 4'; automatically returns interactive elements snapshot with @refs)
   browser-mode-switch [auto|android|linux] - Report or set the session identity mode used by subsequent open commands
   fill-submit @e1 "query" - Clear, type, and submit form / press Enter in 1 atomic step (returns updated results snapshot)
   snapshot -i - List interactive elements and form-control state in the current viewport with compact @refs
-  snapshot -i --full - Return a visual full-page overview only; then scroll and snapshot each relevant viewport
+  snapshot -i --full - List all interactive elements across the entire page with @refs (offscreen elements marked with offscreen="true"); supports direct click/fill or scroll to @ref
   click @e16 - Click the literal snapshot ref @e16, including custom controls and open Shadow DOM
   long-press @e16 [duration_ms] - Long press the literal snapshot ref for duration_ms (default 1000ms, sends trusted X11 mousedown -> hold -> mouseup)
   touch-drift @e1 <duration> <dx_px> <dy_px> [steps] - Lab-only minimum-jerk touch trace; restricted to localhost and the owned /touch-trace diagnostic page
@@ -87,7 +87,7 @@ Commands:
   find-option <keywords> - Fuzzy-search options across all labelled dropdowns and return ranked @ref/index candidates
   select @e43 <query|--index=N --fingerprint=HASH> - Fuzzy-select a confident option from the literal dropdown ref, or safely choose the exact candidate returned by find-option
   press <key> - Press only Enter, Tab, Space, or Backspace. To enter text, use fill or type with a literal ref
-  scroll <down|up|top|bottom|left|right> [px] - Smart scroll page or nested container (returns position & 100% boundary feedback)
+  scroll <down|up|top|bottom|left|right|to> [px|%|@ref|"text"] - Smart scroll page or container. Supports directional (down 600), absolute target (to 1500), percentage (to 40% or 40%), text anchor (to-text "keyword"), or element ref (to @ref)
   get text|images|url|title [@ref] - Get page text with image candidates, image candidates only, URL, or title
   wait-popup [ms] - Wait up to 2000ms for an OAuth/login popup and switch to it
   wait-popup-close [ms] - Wait up to 2000ms for the active popup to close and return to its opener
@@ -311,7 +311,7 @@ export default function (pi: ExtensionAPI) {
       "Never repeat an identical browser command; if a command returned nothing useful, change approach instead of retrying, and if two different approaches fail, leave the browser and answer by other means rather than continuing to poll.",
       "Never issue more than 2 consecutive browser open actions to the same origin. OPEN_LOOP_GUARD blocks the 3rd same-origin open until a non-open action or different-origin open runs; use the current page or batch same-site URLs with crawl instead.",
       "Browser enforces a global 20-tab LRU limit. Inactive least-recently-used tabs may be evicted automatically; tabs currently executing commands or downloading are protected.",
-      "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text and ranked image candidates from the page in 1 step, or 'screenshot --full' to view the entire layout.",
+      "Do NOT scroll repeatedly back and forth looking for terms or sections. If looking for product specs, warranty terms, or details on a long page, use 'get text' to extract all text and ranked image candidates from the page in 1 step, 'screenshot --full' to view the entire layout, or 'scroll to <px|%|text>' to jump directly to the target section in 1 step.",
       "After opening the selected page for a concrete product, person, place, animal, or event, use 'get text' once; when its image candidates are genuinely useful, call fetch_images with 1–3 non-duplicate candidates and include the returned markers even when the user did not explicitly ask for images.",
       "Do not finalize a concrete-subject answer as text-only after get text or crawl returned relevant representative/content image candidates; fetching those candidates is part of answer completion, not extra browsing.",
       "For e-commerce pages with specs or options (e.g. degrees, sizes, colors), select the spec first (e.g. click @ref for '400度' or '請選擇商品規格'), then click @ref to add to cart. Spec selection drawers are in-page modals; run snapshot -i after opening, and do NOT use wait-popup.",
@@ -321,7 +321,7 @@ export default function (pi: ExtensionAPI) {
       "Never fill or type into a <label> ref. Use only a snapshot ref whose tag is input, textarea, or contenteditable; checkbox/radio label proxies are for click and expose checked state.",
       "Use browser press only for control keys such as Enter, Tab, Space, or Backspace. To enter text, use fill or type with a literal ref; never use press for an email address or other field value.",
       "With browser, run snapshot -i before referencing page elements and re-run it after navigation or major DOM changes; normal snapshots include only the current viewport.",
-      "Use snapshot -i --full only for a visual overview: inspect the image first, then scroll up/down and run snapshot -i in each relevant viewport; do not claim an object is missing before checking likely sections and the relevant page boundary.",
+      "Use snapshot -i --full to inspect the entire document's interactive elements with @refs and offscreen=\"true\" attributes; you can click, fill, or scroll to them directly without step-by-step scrolling.",
       "A missing or stale @ref does not perform the action and automatically returns both a fresh authoritative DOM snapshot and viewport image for joint inspection; never retry the old ref, and use the returned fresh refs immediately after reassessing the page.",
       `${VISION_FALLBACK_GUIDANCE} Raw coordinate clicks remain blocked; both Omni-center and manual preview-token clicks require a fresh guarded preview. Vision click, long press, and drag prefer trusted Xvfb mouse input, with CDP fallback when unavailable.`,
       "Send exactly one browser command per tool call; never combine commands with &&, ||, ;, or pipes.",

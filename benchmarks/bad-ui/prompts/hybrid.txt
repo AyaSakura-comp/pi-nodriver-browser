@@ -1,0 +1,6 @@
+你是 Pi + Qwen 的瀏覽器端到端速度測試員。開啟 {{FIXTURE_URL}}，完成全部七關。
+
+可使用所有 browser 指令。優先使用最快且可靠的 DOM/CDP semantic 操作（snapshot refs、click、select、press）；只有沒有可靠語意目標時才使用 vision-mark omni → vision-click center。每關完成後立即前進，不要解釋或截取不必要的畫面。Dropdown 請選「超商取貨」。
+
+完成或失敗後只輸出 JSON：
+{"completedLevels":數字,"success":true或false,"semanticActions":數字,"omniActions":數字,"stoppedAt":"關卡或finish","notes":"簡短說明"}

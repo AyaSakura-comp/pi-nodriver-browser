@@ -138,6 +138,38 @@ def action_requires_page_setup(action):
     return action not in {'browser-mode-switch', 'fetch-image'}
 
 
+def validate_benchmark_action_policy(parts, policy):
+    """Fail closed when a benchmark trial attempts an out-of-policy command."""
+    if not policy:
+        return
+    action = parts[0].lower()
+    if policy == 'forced-omni':
+        coordinate_click = False
+        if action == 'vision-click' and len(parts) == 3:
+            try:
+                coordinate_click = all(math.isfinite(float(value)) for value in parts[1:])
+            except ValueError:
+                coordinate_click = False
+        allowed = (
+            action == 'open'
+            or coordinate_click
+            or (action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni')
+        )
+    elif policy == 'semantic-manual':
+        allowed = not (
+            action in {'omniparse'}
+            or (action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni')
+        )
+    elif policy == 'hybrid':
+        allowed = True
+    else:
+        raise ValueError(f'unknown benchmark action policy: {policy}')
+    if not allowed:
+        raise ValueError(
+            f'BENCHMARK_ACTION_POLICY: {action} is not allowed in {policy} mode'
+        )
+
+
 DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   document.querySelectorAll('[data-pi-dismiss-ref]').forEach(el => el.removeAttribute('data-pi-dismiss-ref'));
 
@@ -223,7 +255,7 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
   };
 })(__PI_COOKIE_POLICY__))'''
 
-SNAPSHOT_JS = r'''JSON.stringify((() => {
+SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
   const seen = new Set();
   const entries = [];
   const semanticSelector = 'a,button,input,textarea,select,summary,details,' +
@@ -235,9 +267,10 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
       const view = el.ownerDocument.defaultView;
       const style = view.getComputedStyle(el);
       const rect = el.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
-        rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth;
+      const layoutVisible = style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+      if (!layoutVisible) return false;
+      return fullPage ? true : (rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth);
     } catch (_) { return false; }
   };
   const associatedControl = el => {
@@ -304,7 +337,10 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
   };
   const visit = (root, frames = []) => {
     try {
-      root.querySelectorAll('[data-pi-ref]').forEach(el => el.removeAttribute('data-pi-ref'));
+      root.querySelectorAll('[data-pi-ref]').forEach(el => {
+        el.removeAttribute('data-pi-ref');
+        el.removeAttribute('data-pi-full-page');
+      });
       root.querySelectorAll('*').forEach(el => {
         if (!seen.has(el) && visible(el) && interactive(el)) {
           seen.add(el);
@@ -322,11 +358,25 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
   return entries.map(({ el, frames }, index) => {
     const ref = `e${index + 1}`;
     el.setAttribute('data-pi-ref', ref);
+    if (fullPage) el.setAttribute('data-pi-full-page', 'true');
     const frame = frames.map(item => {
       const named = item.getAttribute('title') || item.getAttribute('aria-label') || item.name || item.id;
       if (named) return named;
       try { return new URL(item.src, item.ownerDocument.location.href).origin; } catch (_) { return 'iframe'; }
     }).join(' > ');
+    const view = el.ownerDocument.defaultView;
+    const rect = el.getBoundingClientRect();
+    let isOffscreen = (rect.bottom <= 0 || rect.right <= 0 || rect.top >= view.innerHeight || rect.left >= view.innerWidth);
+    if (!isOffscreen && frames.length > 0) {
+      for (const frame of frames) {
+        const frameView = frame.ownerDocument.defaultView;
+        const frameRect = frame.getBoundingClientRect();
+        if (frameRect.bottom <= 0 || frameRect.right <= 0 || frameRect.top >= frameView.innerHeight || frameRect.left >= frameView.innerWidth) {
+          isOffscreen = true;
+          break;
+        }
+      }
+    }
     const control = associatedControl(el);
     const type = controlType(el);
     const checkable = ['checkbox', 'radio', 'switch'].includes(type);
@@ -396,10 +446,14 @@ SNAPSHOT_JS = r'''JSON.stringify((() => {
       optionType: el.tagName === 'SELECT' && Array.from(el.options).every(option =>
         /^[-+]?\d+(?:\.\d+)?$/.test(String(option.textContent || '').trim())
       ) ? 'numeric' : (el.tagName === 'SELECT' ? 'text' : ''),
+      offscreen: isOffscreen ? true : null,
       frame
     };
   });
-})())'''
+})(__PI_FULL_PAGE__))'''
+
+SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'false')
+FULL_SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'true')
 
 IMAGE_CANDIDATES_JS = r'''JSON.stringify((() => {
   const MAX_CANDIDATES = 8;
@@ -833,9 +887,13 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
       const view = el.ownerDocument.defaultView;
       const style = view.getComputedStyle(el);
       const rect = el.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
-        rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth;
+      const layoutVisible = style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+      if (!layoutVisible) return false;
+      if (request.kind === 'ref' && (el.hasAttribute('data-pi-full-page') || el.tagName === 'IFRAME')) {
+        return true;
+      }
+      return rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth;
     } catch (_) { return false; }
   };
   const semanticSelector = 'a,button,input,textarea,select,summary,details,label,' +
@@ -1059,6 +1117,10 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   const match = visit(document);
   if (!match) return { found: false };
   const { element, frames, shadowHosts } = match;
+  if (element.hasAttribute('data-pi-full-page')) {
+    for (const frame of frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+  }
   if (!visible(element) || frames.some(frame => !visible(frame)) ||
       shadowHosts.some(host => !visible(host))) {
     return { found: true, ok: false, error: 'target or owning frame/shadow host is not visible; run snapshot -i again' };
@@ -1546,7 +1608,7 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   return { found: true, ok: false, error: `unsupported ref action: ${request.action}` };
 })(__PI_REF_ACTION_REQUEST__))'''
 
-SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
+SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
   const docEl = document.scrollingElement || document.documentElement || document.body;
   const candidates = [];
 
@@ -1614,7 +1676,8 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
     (direction === 'down' && windowCandidate.remainingDown > 5) ||
     (direction === 'up' && windowCandidate.remainingUp > 5) ||
     ((direction === 'bottom' || direction === 'to-bottom') && windowCandidate.totalScrollableY > 5) ||
-    ((direction === 'top' || direction === 'to-top') && windowCandidate.totalScrollableY > 5)
+    ((direction === 'top' || direction === 'to-top') && windowCandidate.totalScrollableY > 5) ||
+    (direction === 'to' || direction === 'to-percent' || direction === 'to-text' || direction === 'to-ref')
   );
 
   if (windowHasRemaining) {
@@ -1628,6 +1691,7 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
       else if (direction === 'top' || direction === 'to-top') available = c.totalScrollableY;
       else if (direction === 'right') available = c.remainingRight;
       else if (direction === 'left') available = c.remainingLeft;
+      else if (direction === 'to' || direction === 'to-percent') available = c.totalScrollableY;
 
       let score = Math.min(c.area, 1000000);
       if (available > 0) {
@@ -1671,6 +1735,41 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
   } else if (direction === 'left') {
     if (isWindow) { window.scrollBy(-amount, 0); }
     else { target.scrollLeft -= amount; }
+  } else if (direction === 'to') {
+    const targetY = Math.max(0, Math.min(maxY, amount));
+    if (isWindow) { window.scrollTo(prevX, targetY); }
+    else { target.scrollTop = targetY; }
+  } else if (direction === 'to-percent') {
+    const clampedPct = Math.max(0, Math.min(100, amount));
+    const targetY = Math.round(maxY * (clampedPct / 100));
+    if (isWindow) { window.scrollTo(prevX, targetY); }
+    else { target.scrollTop = targetY; }
+  } else if (direction === 'to-text') {
+    const searchText = String(extra || '').trim().toLowerCase();
+    if (!searchText) {
+      return { notFound: true, error: 'empty search text for scroll to-text' };
+    }
+    const allEls = Array.from(document.querySelectorAll('*'));
+    let matchedEl = null;
+    for (const el of allEls) {
+      const text = (el.innerText || '').toLowerCase();
+      if (text.includes(searchText)) {
+        if (!matchedEl || (matchedEl.contains(el) && el !== matchedEl)) {
+          matchedEl = el;
+        }
+      }
+    }
+    if (!matchedEl) {
+      return { notFound: true, error: `No element containing "${extra}" found` };
+    }
+    matchedEl.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+  } else if (direction === 'to-ref') {
+    const cleanRef = String(extra || '').trim().replace(/^@/, '');
+    const matchedEl = document.querySelector(`[data-pi-ref="${cleanRef}"]`);
+    if (!matchedEl) {
+      return { notFound: true, error: `Element @${cleanRef} not found; run snapshot -i again` };
+    }
+    matchedEl.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
   }
 
   const currY = isWindow ? (window.scrollY || docEl.scrollTop || 0) : target.scrollTop;
@@ -1698,7 +1797,7 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount) => {
     atTop,
     moved
   };
-})(__DIRECTION__, __AMOUNT__))'''
+})(__DIRECTION__, __AMOUNT__, __EXTRA__))'''
 
 
 class BrowserWorker:
@@ -4645,6 +4744,9 @@ class BrowserWorker:
         action = parts[0].lower()
         if action not in SUPPORTED_ACTIONS:
             raise ValueError(f'unsupported browser command: {action}')
+        validate_benchmark_action_policy(
+            parts, os.environ.get('PI_NODRIVER_BENCHMARK_ACTION_POLICY', '')
+        )
         if action == 'browser-mode-switch':
             return self.browser_mode_switch(parts, session_id)
         if action == 'fetch-image':
@@ -4825,9 +4927,18 @@ class BrowserWorker:
             return self.browser_mode_switch(parts, session_id)
 
         if action == 'open':
-            if len(parts) != 2:
-                raise ValueError('usage: open <url>')
+            if len(parts) not in (2, 3):
+                raise ValueError('usage: open <url> [timeout_seconds]')
             target_url = normalize_open_url(parts[1])
+            timeout_sec = float(os.environ.get('PI_NODRIVER_OPEN_TIMEOUT', '10'))
+            if len(parts) == 3:
+                raw_timeout = parts[2].strip().rstrip('s').rstrip('S')
+                try:
+                    timeout_sec = float(raw_timeout)
+                except ValueError as error:
+                    raise ValueError(f'invalid open timeout: {parts[2]}') from error
+            if timeout_sec <= 0 or not math.isfinite(timeout_sec):
+                raise ValueError('open timeout must be a positive finite number')
 
             await self.ensure_browser()
             previous = self.pages.get(session_id)
@@ -4838,6 +4949,21 @@ class BrowserWorker:
             browser_mode = self.browser_modes.get(session_id, 'auto')
             identity_used = 'linux' if browser_mode == 'linux' else 'android'
             fallback_reason = None
+
+            async def navigate_with_timeout(target_page, limit_sec):
+                try:
+                    await asyncio.wait_for(target_page.get(target_url), timeout=limit_sec)
+                    await self.configure_download_session(session_id, target_page)
+                    await self.wait_for_page_ready(target_page, timeout_sec=min(2.0, max(0.5, limit_sec)))
+                except (asyncio.TimeoutError, TimeoutError) as error:
+                    try:
+                        await target_page.send(uc.cdp.page.stop_loading())
+                    except Exception:
+                        pass
+                    raise TimeoutError(
+                        f'Navigation to {target_url} timed out after {limit_sec:.1f}s. '
+                        f'The host may be unreachable, offline, or dropping connections.'
+                    ) from error
 
             try:
                 if browser_mode != 'linux':
@@ -4882,9 +5008,7 @@ class BrowserWorker:
                 await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
                 page._is_mobile_mode = True
 
-                await page.get(target_url)
-                await self.configure_download_session(session_id, page)
-                await self.wait_for_page_ready(page)
+                await navigate_with_timeout(page, timeout_sec)
 
                 if browser_mode == 'auto':
                     fallback_reason = await self.detect_page_access_block(page, target_url)
@@ -4910,9 +5034,7 @@ class BrowserWorker:
                     ))
                     await page.send(uc.cdp.emulation.set_touch_emulation_enabled(enabled=True))
                     page._is_mobile_mode = True
-                    await page.get(target_url)
-                    await self.configure_download_session(session_id, page)
-                    await self.wait_for_page_ready(page)
+                    await navigate_with_timeout(page, timeout_sec)
 
                 try:
                     await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
@@ -5038,26 +5160,12 @@ class BrowserWorker:
             if is_full:
                 self.vision_guard.invalidate(session_id)
                 self.omni_previews.pop(session_id, None)
-                output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-full-'))
-                output = output_dir / 'overview.jpg'
-                screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
-                await asyncio.wait_for(
-                    page.save_screenshot(output, format='jpeg', full_page=True),
-                    timeout=screenshot_timeout,
-                )
+                elements = json.loads(await page.evaluate(FULL_SNAPSHOT_JS))
+                self.snapshot_required_sessions.discard(session_id)
                 return {
-                    'text': (
-                        'Visual overview only; no DOM refs were generated. Inspect the image first. '
-                        'Do not click coordinates from this overview. Run snapshot -i in the relevant viewport, '
-                        'then prefer @ref, click-text, click-css, fill, or select—including controls inside iframes. '
-                        'For a canvas or visual-only control, move to its real viewport and use screenshot, '
-                        'then vision-mark <x> <y>, inspect the marked image, and vision-click its preview token; '
-                        'no deliberately failed semantic clicks are required. '
-                        'Use scroll down or scroll up to inspect additional sections before reporting an object missing.'
-                    ),
-                    'action': 'snapshot-full-vision',
-                    'count': 0,
-                    'screenshotPath': str(output),
+                    'text': format_snapshot(elements or []),
+                    'action': 'snapshot-full-dom',
+                    'count': len(elements or []),
                 }
             if os.environ.get('PI_NODRIVER_VISION_ONLY', '0') == '1':
                 output = await self.save_viewport_screenshot(page, 'pi-nodriver-vision-only-')
@@ -6023,7 +6131,77 @@ class BrowserWorker:
         if action == 'scroll':
             page = await self.require_page(session_id)
             history = self.scroll_history.setdefault(session_id, [])
-            direction = parts[1].lower() if len(parts) > 1 else 'down'
+            raw_arg = parts[1].strip() if len(parts) > 1 else 'down'
+            raw_lower = raw_arg.lower()
+
+            extra = ''
+            direction = raw_lower
+            amount = 600
+
+            if direction in ('down', 'up', 'left', 'right'):
+                amount = int(parts[2]) if len(parts) > 2 else 600
+            elif direction in ('top', 'to-top', 'bottom', 'to-bottom'):
+                amount = 0
+            elif direction.endswith('%'):
+                direction = 'to-percent'
+                try:
+                    amount = float(raw_arg.rstrip('%'))
+                except ValueError as error:
+                    raise ValueError(f'invalid scroll percentage: {raw_arg}') from error
+            elif direction == 'to':
+                if len(parts) < 3:
+                    raise ValueError('usage: scroll to <pixels|percentage%|@ref|"text">')
+                target_val = parts[2].strip()
+                if target_val.endswith('%'):
+                    direction = 'to-percent'
+                    try:
+                        amount = float(target_val.rstrip('%'))
+                    except ValueError as error:
+                        raise ValueError(f'invalid scroll percentage: {target_val}') from error
+                elif target_val.startswith('@'):
+                    direction = 'to-ref'
+                    extra = target_val
+                else:
+                    try:
+                        amount = int(float(target_val))
+                        direction = 'to'
+                    except ValueError:
+                        direction = 'to-text'
+                        extra = ' '.join(parts[2:])
+            elif direction in ('to-percent', 'percent'):
+                if len(parts) < 3:
+                    raise ValueError('usage: scroll to-percent <percentage>')
+                target_val = parts[2].strip().rstrip('%')
+                try:
+                    amount = float(target_val)
+                    direction = 'to-percent'
+                except ValueError as error:
+                    raise ValueError(f'invalid scroll percentage: {parts[2]}') from error
+            elif direction in ('to-ref', 'ref'):
+                if len(parts) < 3:
+                    raise ValueError('usage: scroll to-ref <@ref>')
+                direction = 'to-ref'
+                extra = parts[2].strip()
+            elif direction in ('to-text', 'text'):
+                if len(parts) < 3:
+                    raise ValueError('usage: scroll to-text <keyword>')
+                direction = 'to-text'
+                extra = ' '.join(parts[2:]).strip()
+            elif direction == 'to-y':
+                if len(parts) < 3:
+                    raise ValueError('usage: scroll to-y <pixels>')
+                try:
+                    amount = int(float(parts[2]))
+                    direction = 'to'
+                except ValueError as error:
+                    raise ValueError(f'invalid scroll pixel amount: {parts[2]}') from error
+            else:
+                try:
+                    amount = int(float(raw_arg))
+                    direction = 'to'
+                except ValueError:
+                    raise ValueError(f'usage: scroll down|up|top|bottom|left|right|to [args]; invalid direction: {raw_arg}')
+
             history.append(f'scroll-{direction}')
             scroll_count = sum(1 for a in history if a.startswith('scroll-'))
             has_ping_pong = ('scroll-down' in history and 'scroll-up' in history)
@@ -6034,15 +6212,16 @@ class BrowserWorker:
                     "Stop scrolling. Use 'get text' to extract all text on the page in 1 step, or 'screenshot --full' to view the entire layout."
                 )
 
-            amount = int(parts[2]) if len(parts) > 2 else 600
-
-            valid_dirs = {'down', 'up', 'top', 'bottom', 'to-top', 'to-bottom', 'left', 'right'}
-            if direction not in valid_dirs:
-                raise ValueError(f'usage: scroll down|up|top|bottom|left|right [pixels]; invalid direction: {direction}')
-
-            script = SMART_SCROLL_JS.replace('__DIRECTION__', f"'{direction}'").replace('__AMOUNT__', str(amount))
+            script = (
+                SMART_SCROLL_JS
+                .replace('__DIRECTION__', json.dumps(direction))
+                .replace('__AMOUNT__', json.dumps(amount))
+                .replace('__EXTRA__', json.dumps(extra))
+            )
             res_raw = await page.evaluate(script)
             res_meta = json.loads(res_raw) if res_raw else {}
+            if res_meta.get('notFound'):
+                raise ValueError(res_meta.get('error', f'Target not found for scroll {direction}'))
             await self.wait_for_page_ready(page)
 
             target_name = res_meta.get('targetName', 'Page Window')
@@ -6053,7 +6232,15 @@ class BrowserWorker:
             at_top = res_meta.get('atTop', False)
             moved = res_meta.get('moved', True)
 
-            if direction in ('bottom', 'to-bottom') or at_bottom:
+            if direction == 'to':
+                status_text = f'Scrolled directly to {scroll_y}px in {target_name} ({percent_y}%).'
+            elif direction == 'to-percent':
+                status_text = f'Scrolled directly to {percent_y}% ({scroll_y}/{max_y}px) in {target_name}.'
+            elif direction == 'to-text':
+                status_text = f'Scrolled to text "{extra}" in {target_name} (Position: {scroll_y}/{max_y}px, {percent_y}%).'
+            elif direction == 'to-ref':
+                status_text = f'Scrolled to {extra} in {target_name} (Position: {scroll_y}/{max_y}px, {percent_y}%).'
+            elif direction in ('bottom', 'to-bottom') or at_bottom:
                 status_text = f'Scrolled to bottom of {target_name} ({scroll_y}/{max_y}px, 100%). Reached bottom, cannot scroll further down.'
             elif direction in ('top', 'to-top') or at_top:
                 status_text = f'Scrolled to top of {target_name} (0/{max_y}px, 0%). Reached top, cannot scroll further up.'

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import functools
 import http.server
+import inspect
 import io
 import json
 import os
@@ -2879,6 +2880,102 @@ class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
             worker.track_open_action('session-a', 'open')
 
 
+class BenchmarkActionPolicyTests(unittest.TestCase):
+    def test_forced_omni_policy_allows_only_the_three_benchmark_commands(self):
+        from worker import validate_benchmark_action_policy
+
+        allowed = (
+            ['open', 'file:///tmp/levels.html'],
+            ['vision-mark', 'omni'],
+            ['vision-click', '120', '240'],
+        )
+        for parts in allowed:
+            validate_benchmark_action_policy(parts, 'forced-omni')
+
+        for parts in (
+            ['screenshot'], ['snapshot', '-i'], ['click', '@e1'],
+            ['vision-mark', '120', '240'], ['vision-click', 'preview-token'],
+            ['scroll', 'down'],
+        ):
+            with self.assertRaisesRegex(ValueError, 'BENCHMARK_ACTION_POLICY'):
+                validate_benchmark_action_policy(parts, 'forced-omni')
+
+    def test_semantic_manual_policy_rejects_only_omni_marking(self):
+        from worker import validate_benchmark_action_policy
+
+        validate_benchmark_action_policy(['snapshot', '-i'], 'semantic-manual')
+        validate_benchmark_action_policy(['vision-mark', '120', '240'], 'semantic-manual')
+        with self.assertRaisesRegex(ValueError, 'BENCHMARK_ACTION_POLICY'):
+            validate_benchmark_action_policy(['vision-mark', 'omni'], 'semantic-manual')
+
+    def test_unknown_policy_fails_closed(self):
+        from worker import validate_benchmark_action_policy
+
+        with self.assertRaisesRegex(ValueError, 'unknown benchmark action policy'):
+            validate_benchmark_action_policy(['open', 'https://example.test'], 'typo')
+
+
+class OpenTimeoutUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_rejects_invalid_timeout(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        for invalid in ('open https://example.test abc', 'open https://example.test -1', 'open https://example.test 0'):
+            with self.assertRaises((ValueError, TimeoutError)):
+                await worker._execute(invalid, session_id='session-a')
+
+    async def test_open_times_out_and_cleans_up_hanging_target(self):
+        from worker import BrowserWorker
+
+        class HangingPage(FakePage):
+            def __init__(self, browser, target_id):
+                super().__init__(browser, target_id)
+                self.stopped_loading = False
+
+            async def send(self, command):
+                if hasattr(command, 'to_json') and command.to_json().get('method') == 'Page.stopLoading':
+                    self.stopped_loading = True
+                    return None
+                if 'stop_loading' in str(command) or 'Page.stopLoading' in str(command):
+                    self.stopped_loading = True
+                    return None
+                if inspect.isgenerator(command):
+                    try:
+                        payload = next(command)
+                        if isinstance(payload, dict) and payload.get('method') == 'Page.stopLoading':
+                            self.stopped_loading = True
+                            return None
+                    except StopIteration:
+                        pass
+                return fake_browser_command_response(command)
+
+            async def get(self, url):
+                await asyncio.sleep(10)
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        previous = FakePage(worker.browser, 'tab-previous')
+        hanging = HangingPage(worker.browser, 'tab-hanging')
+        worker.browser.tabs.extend([previous, hanging])
+        worker.pages['session-a'] = previous
+        worker.register_tab(previous, 'session-a')
+        worker.ensure_browser = AsyncMock(return_value=worker.browser)
+        worker.configure_download_session = AsyncMock()
+
+        async def create_replacement(_session_id, _kind):
+            worker.register_tab(hanging, 'session-a')
+            return hanging
+
+        worker.create_managed_tab = AsyncMock(side_effect=create_replacement)
+
+        with self.assertRaisesRegex(TimeoutError, r'Navigation to https://hanging\.test/ timed out after 0\.1s'):
+            await worker._execute('open https://hanging.test/ 0.1s', session_id='session-a')
+
+        self.assertTrue(hanging.closed)
+        self.assertTrue(hanging.stopped_loading)
+        self.assertIs(worker.pages['session-a'], previous)
+
+
 class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_defaults_to_auto_and_switches_only_the_current_session(self):
         from worker import BrowserWorker
@@ -4962,23 +5059,26 @@ class WorkerIntegrationTests(unittest.TestCase):
             server.server_close()
             server_thread.join(timeout=2)
 
-    def test_full_snapshot_is_visual_only_and_prompts_scroll_exploration(self):
+    def test_full_snapshot_returns_clickable_offscreen_dom_refs(self):
         fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()
         self.command(f'open {fixture_url}')
 
         result = self.command('snapshot -i --full')
 
-        self.assertEqual(result['action'], 'snapshot-full-vision')
-        self.assertEqual(result['count'], 0)
-        self.assertNotIn('@e', result['text'])
-        self.assertIn('Visual overview only', result['text'])
-        self.assertIn('scroll down', result['text'])
-        self.assertIn('Do not click coordinates', result['text'])
-        self.assertIn('vision-mark', result['text'])
-        self.assertNotIn('Use click <x> <y>', result['text'])
-        self.assertIn('snapshot -i', result['text'])
-        self.assertTrue(Path(result['screenshotPath']).is_file())
-        self.assertGreater(Path(result['screenshotPath']).stat().st_size, 0)
+        self.assertEqual(result['action'], 'snapshot-full-dom')
+        self.assertEqual(result['count'], 3)
+        self.assertNotIn('screenshotPath', result)
+        self.assertIn('Top viewport action', result['text'])
+        self.assertIn('Middle viewport action', result['text'])
+        bottom_line = next(
+            line for line in result['text'].splitlines()
+            if 'Bottom viewport action' in line
+        )
+        self.assertIn('offscreen="true"', bottom_line)
+
+        bottom_ref = bottom_line.split()[0]
+        self.command(f'click {bottom_ref}')
+        self.assertIn('bottom-clicked', self.command('get text')['text'])
 
     def test_download_info_describes_a_snapshot_target_without_clicking(self):
         self.open_fixture()
