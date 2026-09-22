@@ -13,6 +13,7 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 
 ## 📚 Design Documents
 
+- [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
 - [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
