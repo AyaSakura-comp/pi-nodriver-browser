@@ -14,6 +14,19 @@ if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
       exit 1
     fi
   done
+  for command in pdftotext pdfimages; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+      echo "Warning: $command was not found; PDF extraction requires Poppler (usually poppler-utils)." >&2
+    fi
+  done
+  if ! python3 - <<'PY'
+import sqlite3
+connection = sqlite3.connect(':memory:')
+connection.execute('CREATE VIRTUAL TABLE fts_check USING fts5(text)')
+PY
+  then
+    echo "Warning: Python's SQLite lacks FTS5; temporary large-PDF wiki search will be unavailable." >&2
+  fi
   if [[ -z "${PI_NODRIVER_CHROME:-}" ]] && \
      ! command -v google-chrome >/dev/null 2>&1 && \
      ! command -v google-chrome-stable >/dev/null 2>&1 && \
@@ -42,6 +55,18 @@ PY
     sleep 0.1
   done
 fi
+
+# Ensure any leftover nodriver workers and their chrome children are completely reset
+stale_workers=$(pgrep -u "$USER" -f '^/home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python .*worker.py' || true)
+if [[ -n "$stale_workers" ]]; then
+  kill $stale_workers 2>/dev/null || true
+  sleep 0.5
+  kill -9 $stale_workers 2>/dev/null || true
+fi
+
+# Clean up stale nodriver sockets, env, and locks (display >= 100)
+rm -f "$PI_NODRIVER_SOCKET" "$PI_AGENT_DIR/nodriver-browser.env" "$PI_AGENT_DIR/nodriver-browser.sock.lock"
+find /tmp -maxdepth 1 -name ".X10*-lock" -mmin +5 -delete 2>/dev/null || true
 
 mkdir -p "$TARGET"
 install -m 0644 "$ROOT/index.ts" "$TARGET/index.ts"
@@ -85,3 +110,9 @@ Installed Pi Nodriver Browser to:
 The conflicting npm:pi-agent-browser package was disabled when present.
 Run /reload in Pi, or start a new Pi session.
 EOF
+
+# Automatically reset/sync Xvfb streaming service if present
+if [[ "${SKIP_STREAM_SYNC:-0}" != "1" ]] && [[ -x "$HOME/.hermes/skills/restart-service/scripts/restart-xvfb-streaming.sh" ]]; then
+  echo "Checking and syncing Xvfb streaming service..."
+  bash "$HOME/.hermes/skills/restart-service/scripts/restart-xvfb-streaming.sh" status >/dev/null 2>&1 || true
+fi
