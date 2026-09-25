@@ -1325,6 +1325,21 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   const match = visit(document);
   if (!match) return { found: false };
   const { element, frames, shadowHosts } = match;
+  try {
+    const prevOutline = element.style.outline;
+    const prevShadow = element.style.boxShadow;
+    const prevTransition = element.style.transition;
+    element.style.transition = 'all 0.15s ease-in-out';
+    element.style.outline = '3px solid #3b82f6';
+    element.style.boxShadow = '0 0 16px rgba(59, 130, 246, 0.85)';
+    setTimeout(() => {
+      try {
+        element.style.outline = prevOutline;
+        element.style.boxShadow = prevShadow;
+        element.style.transition = prevTransition;
+      } catch (_) {}
+    }, 1500);
+  } catch (_) {}
   if (element.hasAttribute('data-pi-full-page')) {
     for (const frame of frames) frame.scrollIntoView({ block: 'center', inline: 'center' });
     element.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1980,6 +1995,21 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
     if (!matchedEl) {
       return { notFound: true, error: `Element @${cleanRef} not found; run snapshot -i again` };
     }
+    try {
+      const prevOutline = matchedEl.style.outline;
+      const prevShadow = matchedEl.style.boxShadow;
+      const prevTransition = matchedEl.style.transition;
+      matchedEl.style.transition = 'all 0.15s ease-in-out';
+      matchedEl.style.outline = '3px solid #10b981';
+      matchedEl.style.boxShadow = '0 0 16px rgba(16, 185, 129, 0.85)';
+      setTimeout(() => {
+        try {
+          matchedEl.style.outline = prevOutline;
+          matchedEl.style.boxShadow = prevShadow;
+          matchedEl.style.transition = prevTransition;
+        } catch (_) {}
+      }, 1500);
+    } catch (_) {}
     matchedEl.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
   }
 
