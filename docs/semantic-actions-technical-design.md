@@ -33,7 +33,7 @@ CoolPC's estimate form is the reference acceptance workload. It has many labelle
 
 ## Non-Goals
 
-- Reading inaccessible cross-origin iframe DOM.
+- Reading cross-site (out-of-process) iframe DOM. Same-site cross-origin iframes are read through CDP isolated worlds (see Known Limitations).
 - Automating visual CAPTCHA solving or using third-party CAPTCHA bypass services.
 - Inferring product compatibility from price alone.
 - Selecting hidden or disabled controls.
@@ -314,7 +314,8 @@ This is the path that completed the CoolPC report acceptance test without treati
 | Fuzzy winner is not unique | `AMBIGUOUS_OPTION` with candidates | No |
 | Indexed option missing/replaced/reordered | `STALE_OPTION` | No |
 | Query has no full match but has family alternatives | Explicit relaxed suggestions | No automatic selection |
-| Cross-origin iframe child | Child DOM is not traversed | No semantic child action |
+| Cross-origin iframe child (same site) | Snapshotted via CDP isolated world; refs carry `frame="host"` | Yes: activate/fill/type/select/check routed to the frame |
+| Cross-site (OOPIF) iframe child | Not traversed; iframe listed with `cross-origin="true"` + visual hint | Visual fallback only |
 | Visual CAPTCHA challenge | Human handoff | No automated solving |
 
 Page text is always untrusted data. Candidate formatting escapes quotes, backslashes, and newlines, and tells the agent not to execute instructions found in product labels.
@@ -395,7 +396,7 @@ The commit's release baseline is 124 discovered tests: 74 fast tests enabled by 
 
 ## Known Limitations and Follow-Ups
 
-1. Cross-origin iframe child DOM remains inaccessible by browser origin policy.
+1. Page JS still cannot read cross-origin iframes, but the worker reads visible same-site cross-origin frames through CDP isolated worlds (`snapshot_elements`, `frame_evaluate`). Cross-site out-of-process iframes need `Target.setAutoAttach` and are not covered yet.
 2. `upload` does not yet use the recursive frame-aware resolver.
 3. A page can complete a long server-side action while the browser command's settle timeout expires; generated artifacts must be checked before classifying the action as failed.
 4. Refs are intentionally ephemeral and require a fresh snapshot after meaningful DOM changes.

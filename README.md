@@ -296,7 +296,11 @@ Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` →
 
 See [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) for the ref lifecycle, recursive resolver, dropdown transaction protocol, security boundaries, and sequence diagrams.
 
-`snapshot -i` recursively traverses accessible same-origin iframes and labels nested controls with `frame="…"`. `fill`, `type`, `select`, `fill-submit`, and `click-js` resolve those refs inside their owning frame instead of querying only the top document. The agent must use this priority order:
+`snapshot -i` recursively traverses accessible same-origin iframes and labels nested controls with `frame="…"`. `fill`, `type`, `select`, `fill-submit`, and `click-js` resolve those refs inside their owning frame instead of querying only the top document.
+
+**Cross-origin iframes** (e.g. MOMO's login overlay served from `account.momoshop.com.tw` inside `www.momoshop.com.tw`) cannot be entered by page JavaScript, so the worker enters them through CDP instead: every visible cross-origin child frame is snapshotted in its own isolated world, its refs continue the numbering and carry `frame="host"` (e.g. `@e92 <input> label="密碼" frame="account.momoshop.com.tw" type="password"`), and `activate` / `fill` / `type` / `select` / `check` on those refs run inside that frame, with click coordinates offset by the iframe's box. The iframe element itself is listed with `src="origin" cross-origin="true"`; a hint to use `vision-mark omni` appears only if its contents could not be read. Cross-site (out-of-process) iframes are not covered yet. `vision-fill` also works on a point inside a cross-origin iframe: it no longer steals focus back to the frame and types into the focused control with trusted `Input.insertText`.
+
+The agent must use this priority order:
 
 1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `activate`).
 2. Semantic fallback with `click-text` or `click-css`.
@@ -593,7 +597,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns full-page interactive DOM elements with `@refs` and `offscreen="true"` attributes | Interactive Tab |
 | **`activate`** | `activate @e16` | Activates the literal snapshot ref. The plain `click` command is removed. | Interactive Tab |
 | **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
-| **`vision-mark omni`** | `vision-mark omni` | Runs OmniParser V3, removes Chrome-toolbar candidates (`center y < 90`), ranks by confidence, and returns at most 15 numbered page regions with exact screenshot-pixel centers | Interactive Tab |
+| **`vision-mark omni`** | `vision-mark omni` | Runs OmniParser V3 on the **measured page-content area only** (tab strip, address bar and empty X-screen margins cropped away; located by aligning a CDP viewport capture inside the Xvfb screenshot, cached 120 s per window size), with detector input size and candidate cap scaled to that area (desktop 1280×633 → 1024 px / 51 boxes, mobile → 800 / 30). Returns numbered regions with exact screenshot-pixel centers, each labelled with the DOM element under its centre (`dom=<input password placeholder=…>`, via CDP hit test, also inside cross-origin iframes) | Interactive Tab |
 | **`vision-mark`** | `vision-mark <x> <y>` | Draws a high-contrast mouse cursor whose upper-left red tip is the screenshot-pixel click hotspot; returns a one-time preview token | Interactive Tab |
 | **`vision-click` (Omni)** | `vision-click <x> <y>` | Clicks an exact center returned by the latest fresh `vision-mark omni`; arbitrary raw coordinates remain blocked | Interactive Tab |
 | **`vision-click`** | `vision-click [preview-token]` | Consumes the visually confirmed marker token; Xvfb clicks the exact screenshot pixel while CDP fallback uses its separately mapped viewport point | Interactive Tab |
@@ -677,6 +681,7 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 | `PI_NODRIVER_OMNI_IMAGE_SIZE` | dynamic | Force the OmniParser input size instead of the dynamic value. |
 | `PI_NODRIVER_OMNI_LIMIT` | dynamic | Force the candidate cap; by default one per ~16k px² of page content, 30–80 (desktop ≈ 51, mobile 30). |
 | `PI_NODRIVER_OMNI_THRESHOLD` | service default | Override the detector confidence threshold per request. |
+| `PI_NODRIVER_OMNI_LABELS` | `1` | Attach the DOM element under each Omni box centre (tag, text, placeholder, aria-label; CDP hit test) so text models can choose boxes. Set `0` to skip. |
 | `PI_NODRIVER_CROSS_ORIGIN_FRAMES` | `1` | `snapshot -i` also lists controls inside visible cross-origin iframes (e.g. login overlays on another subdomain) via CDP isolated worlds; their refs carry `frame="host"` and `activate`/`fill`/`type`/`select`/`check` run inside that frame (click coordinates offset by the iframe position). Set `0` to disable. Out-of-process (cross-site) iframes are not covered yet. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
