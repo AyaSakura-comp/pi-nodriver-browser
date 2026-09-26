@@ -1942,6 +1942,27 @@ FOCUSED_FRAME_EDITABLE_JS = r'''JSON.stringify((() => {
 
 FOCUSED_FRAME_VALUE_LEN_JS = r'''(() => { const el = document.activeElement; return el ? String(el.value ?? el.textContent ?? '').length : -1; })()'''
 
+
+OMNI_BOX_LABEL_FN = r'''function () {
+  let el = this.nodeType === 3 ? this.parentElement : this;
+  if (!el) return JSON.stringify({});
+  const t = (el.closest && el.closest('a,button,input,select,textarea,label,summary,[role=button],[role=link],[role=checkbox],[role=switch],[onclick],[tabindex]')) || el;
+  const attr = n => (t.getAttribute && t.getAttribute(n)) || '';
+  const tag = (t.tagName || '').toLowerCase();
+  const type = String(t.type || '').toLowerCase();
+  let text = (t.innerText || (type !== 'password' && t.value) || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  if (!text) {
+    const img = t.querySelector && t.querySelector('img[alt],img[title],svg title,[aria-label]');
+    text = img ? (img.getAttribute?.('alt') || img.getAttribute?.('title') || img.getAttribute?.('aria-label') || img.textContent || '').trim().slice(0, 80) : '';
+  }
+  let hrefHint = '';
+  try { if (t.href) { const u = new URL(t.href, location.href); hrefHint = (u.hostname + u.pathname).slice(0, 60); } } catch (_) {}
+  return JSON.stringify({
+    tag, type, text, placeholder: attr('placeholder'), aria: attr('aria-label'), title: attr('title'),
+    alt: attr('alt'), role: attr('role'), href: hrefHint, origin: location.origin,
+  });
+}'''
+
 VISION_FILL_JS = r'''JSON.stringify(((payload) => {
   const x = Number(payload.x);
   const y = Number(payload.y);
@@ -5317,6 +5338,32 @@ class BrowserWorker:
                     'frameUrl': frame.url, 'valueLength': length,
                     'error': None if length in (-1, len(text)) else f'typed {length} of {len(text)} characters'}
         return None
+
+    async def label_omni_boxes(self, page, elements, offset_x=0.0, offset_y=0.0):
+        """Attach the DOM element under each box centre (CDP hit test: sees into cross-origin iframes),
+        so a text model can choose among Omni boxes. Best effort; failures leave label=None."""
+        try:
+            await page.send(uc.cdp.dom.enable())
+            await page.send(uc.cdp.dom.get_document(depth=0))
+        except Exception:
+            return
+        for element in elements:
+            element['label'] = None
+            try:
+                cx, cy = element['center']
+                backend_id, _frame_id, _node_id = await page.send(uc.cdp.dom.get_node_for_location(
+                    x=int(round(cx - offset_x)), y=int(round(cy - offset_y)),
+                    include_user_agent_shadow_dom=False, ignore_pointer_events_none=True))
+                remote = await page.send(uc.cdp.dom.resolve_node(backend_node_id=backend_id))
+                if not remote or not remote.object_id:
+                    continue
+                res, _ = await page.send(uc.cdp.runtime.call_function_on(
+                    function_declaration=OMNI_BOX_LABEL_FN, object_id=remote.object_id, return_by_value=True))
+                label = json.loads(res.value) if res and isinstance(res.value, str) else None
+                if label:
+                    element['label'] = {k: v for k, v in label.items() if v}
+            except Exception:
+                continue
 
     async def call_omniparser(self, screenshot_path, image_size=None):
         endpoint = urllib.parse.urlparse(
@@ -8972,6 +9019,10 @@ class BrowserWorker:
                         capture_backend=capture_backend,
                     )
                 omni_meta = {'contentRect': [left, top, right, bottom], **omni_params}
+                if os.environ.get('PI_NODRIVER_OMNI_LABELS', '1') == '1':
+                    label_top = float(top) if measured else float(toolbar_height)
+                    await self.label_omni_boxes(page, elements, offset_x=float(left if measured else 0),
+                                                offset_y=label_top)
                 annotated_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-omniparse-'))
                 annotated = annotated_dir / 'annotated.png'
                 self.annotate_omni_candidates(clean, annotated, elements)
@@ -8979,10 +9030,18 @@ class BrowserWorker:
                 for element in elements:
                     center = element['center']
                     box = element['box']
+                    label = element.get('label') or {}
+                    desc = ' '.join(filter(None, [
+                        label.get('tag', ''), label.get('type', ''),
+                        json.dumps(label['text'], ensure_ascii=False) if label.get('text') else '',
+                        f"placeholder={json.dumps(label['placeholder'], ensure_ascii=False)}" if label.get('placeholder') else '',
+                        f"aria-label={json.dumps(label['aria'], ensure_ascii=False)}" if label.get('aria') else '',
+                    ]))
                     lines.append(
                         f"id={element.get('id')} center=({center[0]:g},{center[1]:g}) "
                         f"box=({box[0]:g},{box[1]:g},{box[2]:g},{box[3]:g}) "
                         f"confidence={element['confidence']:g}"
+                        + (f" dom=<{desc}>" if desc else '')
                     )
                 coordinate_note = (
                     'Coordinates are exact Xvfb screenshot pixels.'
