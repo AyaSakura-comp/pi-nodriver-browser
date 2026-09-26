@@ -210,7 +210,7 @@ class NodriverWorker {
       try {
         unlinkSync(SOCKET);
       } catch {}
-      const screen = process.env.PI_NODRIVER_SCREEN || "500x1000x24";
+      const screen = process.env.PI_NODRIVER_SCREEN || (process.env.PI_NODRIVER_FRAME_WIDTH === "390" ? "500x1000x24" : "1366x768x24");
       const env = { ...process.env };
       delete env.WAYLAND_DISPLAY;
       child = spawn(

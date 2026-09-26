@@ -94,11 +94,11 @@ The `pi-nodriver-browser` installer deliberately does not clone, modify, start, 
 
 | Mode | Initial identity | Automatic block retry | Viewport and input |
 |---|---|---|---|
-| `auto` | Android Chrome | One fresh native Linux target after a strong CAPTCHA, challenge, access-denied, or HTTP 429 signal | 390x844 mobile metrics; touch emulation on |
-| `android` | Android Chrome | Disabled | 390x844 mobile metrics; touch emulation on |
-| `linux` | Native Linux Chrome | Not applicable; opens directly | 390x844 mobile metrics; touch emulation on |
+| `auto` (default) | Native Linux Chrome | Not applicable; opens directly in desktop mode | 1280x720 desktop metrics; touch emulation off; DSF 1.0 |
+| `android` | Android Chrome | Disabled | 390x844 mobile metrics; touch emulation on; DSF 3.0 |
+| `linux` | Native Linux Chrome | Not applicable; opens directly | 1280x720 desktop metrics; touch emulation off; DSF 1.0 |
 
-The worker stores non-default choices by `session_id`; switching back to `auto` removes the override. Every `open` response includes `browserMode`, `identityUsed`, and `fallbackReason`, allowing the caller to distinguish forced Linux from automatic `linux-fallback`. Identity mode changes user-agent behavior only—mobile metrics and touch emulation remain invariants in every mode.
+The worker stores non-default choices by `session_id`; switching back to `auto` removes the override. Every `open` response includes `browserMode`, `identityUsed`, and `fallbackReason`, allowing the caller to distinguish forced Linux from automatic `linux-fallback`. Default operation uses native Linux desktop Chrome (`1280x720` content viewport, `1366x768` Xvfb display, deviceScaleFactor 1.0, mobile mode off, touch emulation off). When switched to `android`, mobile metrics and touch emulation are enabled for responsive mobile testing.
 
 ## Ref and Frame Model
 

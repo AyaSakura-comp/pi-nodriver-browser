@@ -22,9 +22,13 @@ GOOGLE_REDIRECT_PATHS = {'/url', '/goto'}
 TOUCH_LAB_HOST = 'aya.crayfish-monitor.ts.net'
 TOUCH_LAB_PATH_PREFIX = '/touch-trace'
 POPUP_TIMEOUT_MAX_MS = 2000
-INTERACTIVE_FRAME_WIDTH = 390
-INTERACTIVE_FRAME_HEIGHT = 844
-DESKTOP_FIT_LAYOUT_WIDTH = 1280
+DEFAULT_FRAME_WIDTH = 1280
+DEFAULT_FRAME_HEIGHT = 720
+DEFAULT_DESKTOP_WIDTH = 1280
+
+INTERACTIVE_FRAME_WIDTH = int(os.environ.get('PI_NODRIVER_FRAME_WIDTH', str(DEFAULT_FRAME_WIDTH)))
+INTERACTIVE_FRAME_HEIGHT = int(os.environ.get('PI_NODRIVER_FRAME_HEIGHT', str(DEFAULT_FRAME_HEIGHT)))
+DESKTOP_FIT_LAYOUT_WIDTH = int(os.environ.get('PI_NODRIVER_DESKTOP_WIDTH', str(DEFAULT_DESKTOP_WIDTH)))
 
 
 def is_google_lens_surface(url: str) -> bool:
@@ -43,19 +47,40 @@ def is_google_lens_surface(url: str) -> bool:
 
 
 def identity_viewport_metrics(identity):
+    frame_width = int(os.environ.get('PI_NODRIVER_FRAME_WIDTH', str(INTERACTIVE_FRAME_WIDTH)))
+    frame_height = int(os.environ.get('PI_NODRIVER_FRAME_HEIGHT', str(INTERACTIVE_FRAME_HEIGHT)))
+    desktop_width = int(os.environ.get('PI_NODRIVER_DESKTOP_WIDTH', str(DESKTOP_FIT_LAYOUT_WIDTH)))
     if identity in {'linux', 'linux-fallback'}:
-        scale = INTERACTIVE_FRAME_WIDTH / DESKTOP_FIT_LAYOUT_WIDTH
+        scale = frame_width / desktop_width
         return {
-            'width': DESKTOP_FIT_LAYOUT_WIDTH,
-            'height': round(INTERACTIVE_FRAME_HEIGHT / scale),
+            'width': desktop_width,
+            'height': round(frame_height / scale),
             'deviceScaleFactor': 1.0,
             'mobile': False,
             'touch': False,
-            'scale': scale,
+            'scale': scale if abs(scale - 1.0) > 1e-4 else None,
+        }
+    if identity == 'android':
+        return {
+            'width': 390 if frame_width >= 1000 else frame_width,
+            'height': 844 if frame_height != 844 and frame_width >= 1000 else frame_height,
+            'deviceScaleFactor': 3.0,
+            'mobile': True,
+            'touch': True,
+            'scale': None,
+        }
+    if frame_width >= 1000:
+        return {
+            'width': frame_width,
+            'height': frame_height,
+            'deviceScaleFactor': 1.0,
+            'mobile': False,
+            'touch': False,
+            'scale': None,
         }
     return {
-        'width': INTERACTIVE_FRAME_WIDTH,
-        'height': INTERACTIVE_FRAME_HEIGHT,
+        'width': frame_width,
+        'height': frame_height,
         'deviceScaleFactor': 3.0,
         'mobile': True,
         'touch': True,

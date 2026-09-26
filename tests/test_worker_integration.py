@@ -3965,13 +3965,13 @@ class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(metrics['mobile'])
         self.assertFalse(metrics['touch'])
-        self.assertAlmostEqual(metrics['scale'], 390 / 1280)
+        self.assertIsNone(metrics['scale'])
         set_metrics.assert_called_once_with(
             width=1280,
-            height=2770,
+            height=720,
             device_scale_factor=1.0,
             mobile=False,
-            scale=390 / 1280,
+            scale=None,
         )
         set_touch.assert_called_once_with(enabled=False)
         self.assertEqual(
@@ -5208,7 +5208,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             self.assertFalse(identity_result['mobileMode'])
             self.assertFalse(identity_result['touchEmulation'])
             self.assertEqual(identity_result['layoutWidth'], 1280)
-            self.assertEqual(identity_result['frameWidth'], 390)
+            self.assertEqual(identity_result['frameWidth'], 1280)
         finally:
             self.command('browser-mode-switch auto')
             server.shutdown()

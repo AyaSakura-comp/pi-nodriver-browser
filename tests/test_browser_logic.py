@@ -13,15 +13,27 @@ from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, V
 
 
 class IdentityViewportMetricsTests(unittest.TestCase):
-    def test_linux_identity_uses_desktop_layout_scaled_into_mobile_sized_frame(self):
+    def test_linux_identity_defaults_to_desktop_1280x720_metrics(self):
         metrics = identity_viewport_metrics('linux')
 
         self.assertEqual(metrics['width'], 1280)
-        self.assertEqual(metrics['height'], 2770)
+        self.assertEqual(metrics['height'], 720)
         self.assertEqual(metrics['deviceScaleFactor'], 1.0)
         self.assertFalse(metrics['mobile'])
         self.assertFalse(metrics['touch'])
-        self.assertAlmostEqual(metrics['scale'], 390 / 1280)
+        self.assertIsNone(metrics['scale'])
+
+    def test_linux_identity_supports_mobile_scaled_override(self):
+        try:
+            os.environ['PI_NODRIVER_FRAME_WIDTH'] = '390'
+            os.environ['PI_NODRIVER_FRAME_HEIGHT'] = '844'
+            metrics = identity_viewport_metrics('linux')
+            self.assertEqual(metrics['width'], 1280)
+            self.assertEqual(metrics['height'], 2770)
+            self.assertAlmostEqual(metrics['scale'], 390 / 1280)
+        finally:
+            os.environ.pop('PI_NODRIVER_FRAME_WIDTH', None)
+            os.environ.pop('PI_NODRIVER_FRAME_HEIGHT', None)
 
     def test_linux_fallback_uses_same_desktop_fit_metrics(self):
         self.assertEqual(

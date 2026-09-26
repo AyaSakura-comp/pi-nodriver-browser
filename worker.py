@@ -3792,10 +3792,12 @@ class BrowserWorker:
                 pass
             try:
                 ext_path = Path(__file__).resolve().parent / 'stealth-extension'
-                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', '500,1000')
+                def_frame_w = os.environ.get('PI_NODRIVER_FRAME_WIDTH', '1280')
+                def_frame_h = os.environ.get('PI_NODRIVER_FRAME_HEIGHT', '720')
+                default_window_size = f'{def_frame_w},{def_frame_h}'
+                window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', default_window_size)
                 b_args = [
                     '--ozone-platform=x11',
-                    '--start-maximized',
                     '--window-position=0,0',
                     f'--window-size={window_size}',
                     '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,PasswordLeakDetection',
@@ -3811,6 +3813,8 @@ class BrowserWorker:
                     '--disable-search-engine-choice-screen',
                     '--deny-permission-prompts',
                 ]
+                if os.environ.get('PI_NODRIVER_START_MAXIMIZED', '1' if window_size in ('500,1000', '500, 1000') else '0') == '1':
+                    b_args.insert(1, '--start-maximized')
                 if ext_path.is_dir():
                     b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
                 self.browser = await uc.start(
@@ -7025,11 +7029,17 @@ class BrowserWorker:
                 self.linux_origin_reason(session_id, target_url)
                 if browser_mode == 'auto' else None
             )
-            effective_mode = (
-                'linux' if browser_mode == 'linux' or origin_route_reason is not None
-                else 'android'
+            frame_w = int(os.environ.get('PI_NODRIVER_FRAME_WIDTH', '1280'))
+            frame_h = int(os.environ.get('PI_NODRIVER_FRAME_HEIGHT', '720'))
+            auto_identity = os.environ.get(
+                'PI_NODRIVER_AUTO_IDENTITY',
+                'linux'
             )
-            identity_used = 'linux' if effective_mode == 'linux' else 'android'
+            effective_mode = (
+                'android' if browser_mode == 'android'
+                else ('linux' if browser_mode in ('linux', 'auto') or origin_route_reason is not None else auto_identity)
+            )
+            identity_used = 'android' if effective_mode == 'android' else 'linux'
             fallback_reason = None
             routes_before_open = dict(self.origin_linux_routes.get(session_id, {}))
 
@@ -7199,25 +7209,34 @@ class BrowserWorker:
                     'layoutWidth': viewport_metrics['width'],
                     'layoutHeight': viewport_metrics['height'],
                     'viewportScale': viewport_metrics['scale'],
-                    'frameWidth': 390,
-                    'frameHeight': 844,
+                    'frameWidth': viewport_metrics['width'] if viewport_metrics.get('scale') is None else int(os.environ.get('PI_NODRIVER_FRAME_WIDTH', '1280')),
+                    'frameHeight': viewport_metrics['height'] if viewport_metrics.get('scale') is None else int(os.environ.get('PI_NODRIVER_FRAME_HEIGHT', '720')),
                 }
             snapshot_text = format_snapshot(elements or [])
             identity_text = {
                 'android': 'Android Chrome',
                 'linux': (
                     'native Linux Chrome (origin-scoped auto route)'
-                    if browser_mode == 'auto' else
-                    'native Linux Chrome (forced mode)'
+                    if browser_mode == 'auto' and origin_route_reason is not None else
+                    ('native Linux Chrome (forced mode)' if browser_mode == 'linux' else 'native Linux Chrome')
                 ),
                 'linux-fallback': 'native Linux Chrome fallback after Android gate',
             }[identity_used]
-            layout_text = (
-                'mobile viewport 390x844; touch emulation on'
-                if viewport_metrics['mobile'] else
-                f'desktop-fit layout {viewport_metrics["width"]}x{viewport_metrics["height"]} '
-                'scaled into 390x844; mobile mode off; touch emulation off'
-            )
+            frame_w = int(os.environ.get('PI_NODRIVER_FRAME_WIDTH', '1280'))
+            frame_h = int(os.environ.get('PI_NODRIVER_FRAME_HEIGHT', '720'))
+            if viewport_metrics.get('scale'):
+                layout_text = (
+                    f'desktop-fit layout {viewport_metrics["width"]}x{viewport_metrics["height"]} '
+                    f'scaled into {frame_w}x{frame_h}; mobile mode off; touch emulation off'
+                )
+            elif viewport_metrics['mobile']:
+                layout_text = (
+                    f'mobile viewport {viewport_metrics["width"]}x{viewport_metrics["height"]}; touch emulation on'
+                )
+            else:
+                layout_text = (
+                    f'desktop viewport {viewport_metrics["width"]}x{viewport_metrics["height"]}; mobile mode off; touch emulation off'
+                )
             return {
                 'text': (
                     f'Opened {page.url or parts[1]} ({identity_text}; {layout_text})'
@@ -7239,8 +7258,8 @@ class BrowserWorker:
                 'layoutWidth': viewport_metrics['width'],
                 'layoutHeight': viewport_metrics['height'],
                 'viewportScale': viewport_metrics['scale'],
-                'frameWidth': 390,
-                'frameHeight': 844,
+                'frameWidth': viewport_metrics['width'] if viewport_metrics.get('scale') is None else frame_w,
+                'frameHeight': viewport_metrics['height'] if viewport_metrics.get('scale') is None else frame_h,
             }
 
         if action == 'snapshot':
