@@ -1320,3 +1320,14 @@ class CrossOriginIframeSnapshotTests(unittest.TestCase):
         from browser_logic import format_snapshot
         out = format_snapshot([{'ref': 'e1', 'tag': 'iframe', 'frameSrc': 'https://a.example', 'crossOrigin': False}])
         self.assertNotIn('Cross-origin iframe content', out)
+
+
+class CrossOriginFrameListedTests(unittest.TestCase):
+    def test_hint_hidden_when_frame_controls_are_listed(self):
+        from browser_logic import format_snapshot
+        out = format_snapshot([
+            {'ref': 'e90', 'tag': 'iframe', 'frameSrc': 'https://account.momoshop.com.tw', 'crossOrigin': True},
+            {'ref': 'e92', 'tag': 'input', 'controlType': 'password', 'frame': 'account.momoshop.com.tw'},
+        ])
+        self.assertIn('frame="account.momoshop.com.tw"', out)
+        self.assertNotIn('Cross-origin iframe content', out)

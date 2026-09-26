@@ -1409,7 +1409,14 @@ def format_snapshot(elements: list[dict]) -> str:
         lines.append(line)
     if not lines:
         return '(no interactive elements)'
-    if any(item.get('tag') == 'iframe' and item.get('crossOrigin') for item in elements):
+    def _host(value):
+        return str(value or '').split('://')[-1].split('/')[0]
+    unread = [
+        item for item in elements
+        if item.get('tag') == 'iframe' and item.get('crossOrigin')
+        and not any(str(other.get('frame') or '').startswith(_host(item.get('frameSrc'))) for other in elements if other is not item)
+    ]
+    if unread:
         lines.append(
             'Cross-origin iframe content (e.g. a login overlay on another subdomain) exists but is not listed here. '
             'Its inputs and buttons are real: use vision-mark omni, then vision-click <x> <y> / vision-fill <x> <y> "text".'

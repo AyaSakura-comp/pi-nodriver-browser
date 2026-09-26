@@ -677,6 +677,7 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 | `PI_NODRIVER_OMNI_IMAGE_SIZE` | dynamic | Force the OmniParser input size instead of the dynamic value. |
 | `PI_NODRIVER_OMNI_LIMIT` | dynamic | Force the candidate cap; by default one per ~16k px² of page content, 30–80 (desktop ≈ 51, mobile 30). |
 | `PI_NODRIVER_OMNI_THRESHOLD` | service default | Override the detector confidence threshold per request. |
+| `PI_NODRIVER_CROSS_ORIGIN_FRAMES` | `1` | `snapshot -i` also lists controls inside visible cross-origin iframes (e.g. login overlays on another subdomain) via CDP isolated worlds; their refs carry `frame="host"` and `activate`/`fill`/`type`/`select`/`check` run inside that frame (click coordinates offset by the iframe position). Set `0` to disable. Out-of-process (cross-site) iframes are not covered yet. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
 | `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM and vision mouse long presses. |

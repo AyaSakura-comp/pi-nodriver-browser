@@ -528,7 +528,7 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
   visit(document);
 
   return entries.map(({ el, frames }, index) => {
-    const ref = `e${index + 1}`;
+    const ref = `e${index + 1 + (__PI_REF_OFFSET__)}`;
     el.setAttribute('data-pi-ref', ref);
     if (fullPage) el.setAttribute('data-pi-full-page', 'true');
     const frame = frames.map(item => {
@@ -632,8 +632,8 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
   });
 })(__PI_FULL_PAGE__))'''
 
-SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'false')
-FULL_SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'true')
+SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'false').replace('__PI_REF_OFFSET__', '0')
+FULL_SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'true').replace('__PI_REF_OFFSET__', '0')
 
 ACCESS_GATE_PROBE_JS = r'''JSON.stringify((() => {
   const visible = el => {
@@ -5149,7 +5149,7 @@ class BrowserWorker:
 
     async def stale_ref_recovery(self, session_id, ref):
         page = await self.require_page(session_id)
-        elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+        elements = await self.snapshot_elements(page, session_id)
         output_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-stale-'))
         output = output_dir / 'snapshot.jpg'
         screenshot_timeout = float(os.environ.get('PI_NODRIVER_SCREENSHOT_TIMEOUT', '30'))
@@ -5613,9 +5613,15 @@ class BrowserWorker:
             'expectedOptionText': expected_option_text,
             'expectedOptionValue': expected_option_value,
         }, ensure_ascii=False)
-        result = json.loads(await page.evaluate(
-            REF_ACTION_JS.replace('__PI_REF_ACTION_REQUEST__', request)
-        ))
+        script = REF_ACTION_JS.replace('__PI_REF_ACTION_REQUEST__', request)
+        frame = self.frame_for_ref(session_id, ref)
+        if frame is not None:
+            try:
+                result = json.loads(await self.frame_evaluate(page, frame['frameId'], script))
+            except Exception:
+                result = {'found': False}
+        else:
+            result = json.loads(await page.evaluate(script))
         if not result.get('found'):
             raise self.stale_ref_error(session_id, ref)
         self.semantic_target_resolved(session_id)
@@ -5845,10 +5851,108 @@ class BrowserWorker:
             await asyncio.sleep(0.05)
         raise TimeoutError(f'iframe for {ref} did not settle within {timeout_sec:g} seconds')
 
+    async def cross_origin_frames(self, page, full=False):
+        """Visible child frames the top-document snapshot cannot enter (different security origin),
+        with the iframe's content-box offset in top-level viewport CSS pixels."""
+        try:
+            tree = await page.send(uc.cdp.page.get_frame_tree())
+            top_origin = tree.frame.security_origin
+        except Exception:
+            return []
+        found = []
+
+        def walk(node, parent_origin, parent_taken):
+            for child in node.child_frames or []:
+                origin = child.frame.security_origin
+                # a frame same-origin with an included parent is reached by that parent's snapshot
+                take = origin != top_origin and not (parent_taken and origin == parent_origin)
+                if take:
+                    found.append(child.frame)
+                walk(child, origin, take or parent_taken)
+
+        walk(tree, top_origin, False)
+        frames = []
+        try:
+            await page.send(uc.cdp.dom.enable())
+            await page.send(uc.cdp.dom.get_document(depth=0))
+        except Exception:
+            return []
+        try:
+            vw, vh = json.loads(await page.evaluate('JSON.stringify([window.innerWidth, window.innerHeight])'))
+        except Exception:
+            vw, vh = 100000, 100000
+        for frame in found:
+            try:
+                owner = await page.send(uc.cdp.dom.get_frame_owner(frame_id=frame.id_))
+                backend_id = owner[0] if isinstance(owner, tuple) else owner
+                model = await page.send(uc.cdp.dom.get_box_model(backend_node_id=backend_id))
+                quad = model.content
+                xs, ys = quad[0::2], quad[1::2]
+                left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+            except Exception:
+                continue
+            if right - left < 40 or bottom - top < 40:
+                continue                      # tracking pixels / sync frames
+            if not full and (bottom <= 0 or top >= vh or right <= 0 or left >= vw):
+                continue
+            frames.append({'frameId': frame.id_, 'origin': frame.security_origin,
+                           'url': frame.url, 'offset': (left, top)})
+        return frames
+
+    async def frame_evaluate(self, page, frame_id, expression):
+        """Evaluate in an isolated world of a (cross-origin) child frame; returns the JSON-string value."""
+        ctx = await page.send(uc.cdp.page.create_isolated_world(frame_id=frame_id, world_name='pi-frame'))
+        res, exc = await page.send(uc.cdp.runtime.evaluate(
+            expression=expression, context_id=ctx, return_by_value=True, await_promise=True))
+        if exc is not None:
+            raise ValueError(f'frame evaluation failed: {getattr(exc, "text", exc)}')
+        return res.value
+
+    async def snapshot_elements(self, page, session_id=None, full=False):
+        """Top-document snapshot plus the controls inside visible cross-origin iframes (login overlays,
+        payment widgets). Their refs continue the numbering and are routed back to the frame later."""
+        elements = json.loads(await page.evaluate(FULL_SNAPSHOT_JS if full else SNAPSHOT_JS)) or []
+        frame_refs = {}
+        if os.environ.get('PI_NODRIVER_CROSS_ORIGIN_FRAMES', '1') == '1':
+            for frame in await self.cross_origin_frames(page, full=full):
+                script = (SNAPSHOT_JS_TEMPLATE
+                          .replace('__PI_FULL_PAGE__', 'true' if full else 'false')
+                          .replace('__PI_REF_OFFSET__', str(len(elements))))
+                try:
+                    inner = json.loads(await self.frame_evaluate(page, frame['frameId'], script)) or []
+                except Exception:
+                    continue
+                host = urllib.parse.urlparse(frame['origin']).hostname or frame['origin']
+                for item in inner:
+                    item['frame'] = host + (f" > {item['frame']}" if item.get('frame') else '')
+                    frame_refs[item['ref']] = frame
+                elements.extend(inner)
+        if session_id is not None:
+            self.frame_refs = getattr(self, 'frame_refs', {})
+            self.frame_refs[session_id] = frame_refs
+        return elements
+
+    def frame_for_ref(self, session_id, ref):
+        return (getattr(self, 'frame_refs', {}).get(session_id) or {}).get(str(ref).removeprefix('@'))
+
     async def resolve_click_target(self, page, kind, value, session_id=None):
         request = json.dumps({'kind': kind, 'value': value}, ensure_ascii=False)
         script = CLICK_TARGET_JS.replace('__PI_CLICK_REQUEST__', request)
-        result = json.loads(await page.evaluate(script))
+        frame = self.frame_for_ref(session_id, value) if kind == 'ref' and session_id is not None else None
+        if frame is not None:
+            try:
+                result = json.loads(await self.frame_evaluate(page, frame['frameId'], script))
+            except Exception:
+                result = {'found': False}
+            if result.get('found'):
+                # frame-local viewport coordinates -> top-level viewport coordinates
+                fresh = next((f for f in await self.cross_origin_frames(page, full=True)
+                              if f['frameId'] == frame['frameId']), frame)
+                result['x'] = float(result['x']) + fresh['offset'][0]
+                result['y'] = float(result['y']) + fresh['offset'][1]
+                result['frameOrigin'] = frame['origin']
+        else:
+            result = json.loads(await page.evaluate(script))
         if not result.get('found'):
             if kind == 'ref':
                 if session_id is not None:
@@ -7283,7 +7387,7 @@ class BrowserWorker:
                         await page.sleep(0.3)
                     except Exception:
                         pass
-                elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+                elements = await self.snapshot_elements(page, session_id)
             except (Exception, asyncio.CancelledError):
                 self.restore_linux_routes(session_id, routes_before_open)
                 async with self.tab_management_lock:
@@ -7447,7 +7551,7 @@ class BrowserWorker:
             if is_full:
                 self.vision_guard.invalidate(session_id)
                 self.omni_previews.pop(session_id, None)
-                elements = json.loads(await page.evaluate(FULL_SNAPSHOT_JS))
+                elements = await self.snapshot_elements(page, session_id, full=True)
                 self.snapshot_required_sessions.discard(session_id)
                 return {
                     'text': format_snapshot(elements or []),
@@ -7463,7 +7567,7 @@ class BrowserWorker:
                     'screenshotPath': str(output),
                     'count': 0,
                 }
-            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            elements = await self.snapshot_elements(page, session_id)
             self.snapshot_required_sessions.discard(session_id)
             return {'text': format_snapshot(elements or []), 'action': action, 'count': len(elements or [])}
 
@@ -8387,7 +8491,7 @@ class BrowserWorker:
             else:
                 await self.wait_for_dom_settle(page)
             await self.wait_for_page_ready(page)
-            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            elements = await self.snapshot_elements(page, session_id)
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
             return {
@@ -8475,7 +8579,7 @@ class BrowserWorker:
             await page.evaluate(event_dispatch_js)
             await self.wait_for_page_ready(page)
 
-            elements = json.loads(await page.evaluate(SNAPSHOT_JS))
+            elements = await self.snapshot_elements(page, session_id)
             self.snapshot_required_sessions.discard(session_id)
             snapshot_text = format_snapshot(elements or [])
             file_basenames = [Path(f).name for f in resolved_files]
