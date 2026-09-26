@@ -19,6 +19,96 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 - [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
 - [Bad UI Seven-Level Benchmark](benchmarks/bad-ui/README.md) — portable end-to-end Pi agent challenge for low-contrast, tiny, native, and non-semantic controls across forced Omni, hybrid CDP+Omni, and CDP+manual-vision modes.
 
+## Google Lens local-image search
+
+### One-shot entry (preferred)
+
+Use the standalone **`image_search({"path":"/absolute/path/image.png"})`** tool, or
+`browser("image-search '/absolute/path/image.png'")`. A single call validates the
+image, opens the previously verified `https://www.google.com/imghp?hl=en` entry in
+Linux desktop mode, prepares the camera dialog, uploads once and returns up to 20
+labeled `@lens-…` candidates. No prerequisite web search, mode switch, open, or
+manual camera clicks. It replaces this session's active tab; other sessions and
+the session's configured mode are unchanged. The flow is bounded to 40 seconds;
+consent overlays are not dismissed and gates do not trigger identity fallback.
+
+Natural requests such as **「搜圖」「找原圖」「找同款」＋圖片** route to this tool
+through its prompt guidelines, without requiring the words Google Lens. The
+agent needs the exact local attachment path and authorization to send that image
+to Google. Ambiguous/private-photo requests require clarification; this tool is
+not for face identification. It never auto-selects the first match: inspect the
+returned evidence and, if needed, use `google-lens-select @lens-…`.
+
+On a blocked, empty or uncertain outcome, **do not retry the upload or click
+around**; use `google-lens-results` to observe without another upload or stop.
+Transport replay is disabled for `image-search`, including noncanonical action
+spellings. Offline coverage: `tests/test_image_search.py` (orchestration, gates,
+mode restoration, cancellation/timeout, registration, quoting and no replay).
+
+### Parallel images
+
+For multiple authorized images, use one batch rather than separate single-image
+calls (separate calls still share the extension's execution queue):
+
+```text
+image_search_batch({"paths":["/absolute/red.png","/absolute/blue.png"],"concurrency":2})
+```
+
+The equivalent browser command is `image-search-batch` followed by that JSON.
+Accepts 1–3 distinct paths, default concurrency 2, maximum 3. Validate all files
+before any upload. Each job has its own managed tab, private state and opaque
+`searchId`; returned entries preserve input order and include the path, status,
+refs and relative `startedAt`/`finishedAt` times. Tabs share Chrome's profile and
+cookies, **not** separate login identities. The caller's main tab and configured
+browser mode are not replaced. Failures are reported per image, without retries.
+The batch has a 60-second deadline; unfinished jobs are cancelled and reported
+as uncertain rather than silently re-uploaded.
+
+Use only the ID/ref pair returned for the intended image:
+
+```text
+browser("image-search-results search-…")
+browser("image-search-select search-… @lens-…")
+```
+
+Selection focuses the corresponding tab, navigates to that exact result, and
+returns destination evidence labeled with its `searchId` and input path. Do not
+use `google-lens-select` for batch refs. Choose at most one destination per search:
+after navigation, other refs from that search are expired. Cross-owner IDs,
+wrong-image refs and closed/evicted tabs fail closed rather than falling back to
+the caller's main tab. Similarity is not proof of identity, original source or
+license.
+
+Retained batch tabs are capped at three per owning session. **Starting another
+batch expires and closes that owner's previous batch**; session cleanup also
+closes its batch tabs. Other sessions are unaffected. Active jobs are protected
+from normal LRU eviction; completed tabs can be evicted under the global tab
+limit, in which case their follow-ups fail safely. Cancelled batches drain their
+jobs and close only their owned tabs.
+
+Offline contracts: `tests/test_image_search_batch.py` covers actual coroutine
+overlap, concurrency limits, per-image pairing/failures, ID/ref isolation,
+expiry, cancellation/deadline, cleanup and transport no-replay.
+
+### Low-level commands (manual workflows only)
+
+1. Use `web_search` or `google_search` to discover an **exact** Google Images URL; never construct one. The verified desktop workflow uses `browser-mode-switch linux` before opening that returned URL (Lens does not change identity mode itself). `google-lens` can prepare the upload dialog by activating a unique visible **Search by image / 以圖搜尋** semantic camera button once. If preparation is unavailable, inspect snapshot refs; `click-js @eN` is an explicit semantic alternative when native activation does not expose the dialog. The `lens.google` marketing site is not an upload surface and is not allowlisted.
+2. Run `google-lens "/absolute/path/to/public image.png"`. This sends the file to Google: only use the user's explicitly authorized, non-private image. Paths must be absolute (or begin with `~/`), quoted if needed, readable regular files, and valid PNG/JPEG/WEBP/GIF matching the extension, at most 20 MiB and 40 megapixels. Paths are parsed with `shlex`, not executed by a shell.
+3. Compare returned **title, exact URL and snippet** with the requested subject. Run `google-lens-select @lens-...` using the matching candidate's full literal ref. Never select the first result just because it is first. Selection opens that observed link in the same tab and returns destination title/URL/text; it does not guess the original source behind a Google preview URL.
+4. Use `google-lens-results` to inspect without uploading, including after an inconclusive upload. Pending-upload freshness is retained across observation, errors and cancellation: unchanged pre-upload candidates remain inconclusive and cannot acquire selectable refs. Refs are session- and document-bound and fail closed on removed nodes or changed titles/URLs. Re-list and reassess after a stale result, rather than retrying its old ref.
+
+The upload command accepts no destination URL or arbitrary upload ref. It requires a supported HTTPS Google surface (`lens.google.com`, or the root/search/image surfaces on `www.google.com` and `images.google.com`), Lens text context, exactly one enabled image input, and a Google form target. It does not reuse the permissive generic `upload` command. CDP dispatches the upload once, without duplicate synthetic change events. Consent detection reads the current document independently of result payloads and is rechecked before upload/selection. Consent, access, CAPTCHA and login gates stop the operation; **no bypass, automatic consent acceptance, identity fallback, navigation replay, or upload retry** occurs in these commands. A timeout, cancellation or lost connection may mean the upload already happened: **do not re-upload**. Quoted or escaped action spellings also cannot trigger transport replay; noncanonical action tokens conservatively disable retries. Resolve gates manually or stop.
+
+Result extraction is deliberately conservative: up to 20 rendered, labeled image/heading links, with duplicate URLs and Google navigation links excluded. Observed Google `/goto`, `/url` and `/imgres` result links retain their exact opaque hrefs; they are never decoded or rewritten. Layouts without reliable links, unsupported regional hosts, cross-origin frames and localized consent text not recognized by the gate probe can require manual inspection. Use existing semantic refs first; `vision-mark omni` / guarded `vision-click` is available for ordinary controls without reliable semantic targets, never for gates or ambiguous result selection. The Lens command itself does not automate vision. Isolated source verification with the non-private red-circle fixture demonstrated automatic dialog preparation and upload on desktop-mode Google Images (Traditional Chinese and English), candidate extraction, and selection of matching result #5 with destination evidence. Layouts and gates still vary; the independent verification lane should recheck its own session.
+
+Offline checks (no browser):
+
+```bash
+RUN_BROWSER_INTEGRATION=0 .venv/bin/python -m unittest discover -s tests -p test_google_lens.py -v
+RUN_BROWSER_INTEGRATION=0 .venv/bin/python -m unittest discover -s tests -p test_image_search.py -v
+RUN_BROWSER_INTEGRATION=0 .venv/bin/python -m unittest discover -s tests -q
+```
+
 ## 🧩 Dependent Project: OmniParser
 
 [Microsoft OmniParser](https://github.com/microsoft/OmniParser) is an **external dependent project** used by the default visual fallback. It is not vendored, forked, or installed by `pi-nodriver-browser`; it keeps its own repository, model weights, Python environment, service lifecycle, and license.
@@ -88,9 +178,9 @@ flowchart TB
 ### Key Architectural Subsystems:
 
 #### 1. Client-Daemon IPC & Session Isolation
-* **Zero-Spawning Overhead**: A single persistent Python daemon (`worker.py`) runs in the background. Pi commands connect via Unix Domain Socket (`nodriver-browser.sock`), avoiding the 2–3s cold-start penalty of launching Chrome on every turn.
+* **Zero-Spawning Overhead**: A single persistent Python daemon (`worker.py`) runs in the background. Pi commands connect via Unix Domain Socket (`nodriver-browser.sock`), avoiding the 2–3s cold-start penalty of launching Chrome on every turn. Before tab-creating operations, the daemon probes its Chrome DevTools connection and atomically relaunches Chrome if the browser process exited while the daemon remained alive.
 * **Per-Session Tab Routing**: Each Pi conversation maintains its own isolated `session_id` mapping. Session tabs, active viewports, and downloads operate independently without cross-session interference.
-* **Session-scoped Browser Identity Mode**: `browser-mode-switch auto|android|linux` reports or changes the identity used by subsequent `open` commands in only the calling session. It does not reload or modify the current tab. `auto` is the default: navigation starts with Android Chrome and strong CAPTCHA/challenge URLs or copy, localized robot checks, access-denied titles, and HTTP 429 pages cause exactly one retry in a fresh target using Chrome's native Linux identity. `android` disables that automatic retry; `linux` opens directly with the native Linux identity. Every mode retains the 390x844 mobile viewport and touch emulation. The result reports `browserMode`, `identityUsed`, and `fallbackReason`.
+* **Session-scoped Browser Identity Mode**: `browser-mode-switch auto|android|linux` reports or changes the session-scoped identity used by subsequent `open` commands in only the calling session. It does not reload or modify the current tab. `auto` starts each new origin with Android Chrome. A strong CAPTCHA/access/login gate retries in a fresh native-Linux target and pins only that origin to Linux for the rest of the Pi session; different origins still start Android. Unexpected post-click login gates reopen the pre-click URL without replaying the click. Explicit login clicks are not treated as fallback triggers. New popup targets keep their first-request native Linux identity rather than being replayed as Android, which avoids duplicating POST, OAuth, payment, or one-time URL side effects. `android` disables fallback for normal opens; `linux` opens directly with native Linux identity. Android uses 390x844 mobile metrics and touch. Linux and Linux fallback disable mobile mode and touch, render a 1280px-wide desktop layout, and scale it into the same 390x844 physical frame. Results report the identity, origin route, layout dimensions, scale, and input mode.
 * **Non-Blocking Worker Queue**: Long-running page loads and crawls execute asynchronously; concurrent Pi subagents can query status without blocking.
 
 #### 2. Stealth & Challenge-Detection Subsystem (`stealth-extension`)
@@ -198,7 +288,7 @@ Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` →
 1. **`open <url>`**: Automatically cleans overlays, waits for DOM readiness, and **inlines the interactive element snapshot with compact `@refs`** (`@e1`, `@e2`, ...) directly into the turn-1 return payload.
 2. **`fill-submit @e1 "query"`**: Atomically clears the literal target ref, dispatches cancellation-aware keyboard and change events, requires an associated form, executes `form.requestSubmit()`, auto-settles the resulting page, and returns the updated DOM snapshot in turn 2. It never guesses or clicks an unrelated fallback button.
 
-> **Literal ref syntax:** If a snapshot prints `@e16`, send exactly `click @e16`. Never send `click <@e16>`; angle brackets in generic notation are placeholders, not characters to type. The parser accepts the older wrapped form only as a compatibility fallback.
+> **Literal ref syntax:** If a snapshot prints `@e16`, send exactly `activate @e16`. Never send `activate <@e16>`; angle brackets in generic notation are placeholders, not characters to type. The plain `click` command has been removed; `vision-click` remains the guarded visual-coordinate action.
 >
 > **Form safety:** `fill`, `type`, and `fill-submit` reject `<label>` refs and non-text controls instead of typing into whichever field was previously focused. Hidden native checkbox/radio controls remain actionable through their visible label proxy, and snapshots expose `control`, `checked`, `required`, and `disabled` state so optional marketing consent can be audited before submission.
 
@@ -208,18 +298,18 @@ See [Semantic Browser Actions: Technical Design, Workflow, and Architecture](doc
 
 `snapshot -i` recursively traverses accessible same-origin iframes and labels nested controls with `frame="…"`. `fill`, `type`, `select`, `fill-submit`, and `click-js` resolve those refs inside their owning frame instead of querying only the top document. The agent must use this priority order:
 
-1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `click`).
+1. `snapshot -i` and an exact `@ref` (`fill`, `select`, or `activate`).
 2. Semantic fallback with `click-text` or `click-css`.
 3. Direct DOM fallback with `click-js @ref`.
 4. For canvas or inaccessible visual-only controls, use the mandatory vision-correct sequence directly: `screenshot` → inspect image → `vision-mark <x> <y>` → inspect the marked image → re-mark until correct → `vision-click <preview-token>`.
 
-Raw `click <x> <y>` remains blocked, but no deliberately failed semantic clicks are required before `vision-mark` or `vision-click`.
+The plain `click` command is removed entirely. Use `activate @ref` for semantic refs; no deliberately failed semantic action is required before `vision-mark` or `vision-click`.
 
 `vision-mark` interprets `x y` directly in the returned screenshot's pixel coordinate system and draws a high-contrast mouse cursor onto a copied PNG outside the untrusted page; its upper-left red tip is the exact click hotspot. When the screenshot and input backend are Xvfb, `vision-click` dispatches that exact 1:1 screen pixel with no viewport scaling or duplicated toolbar offset. CDP fallback separately uses the stored visual-viewport conversion. It returns a one-time token tied to the session, active tab, loader/document, URL, scroll/visual viewport, rendered-image hash, and a short TTL. Immediately before mouse dispatch, `vision-click` brings the tab forward, captures the viewport again, and requires the trusted state and clean screenshot hash to match. A newer marker or any mismatch permanently invalidates the older token. A full-page overview (`snapshot -i --full` or `screenshot --full`) intentionally cannot arm coordinate confirmation because scaled document coordinates are not current-viewport interaction coordinates.
 
 ### 2. Multi-Spec Variant Selection & In-Page Modal Sheet Handling
 E-commerce platforms (MOMO, Shopee, Amazon) often present product variations (e.g. 度數 200度~800度, 顏色, 尺寸) in dynamic bottom sheets or in-page spec drawers:
-* **In-Page Spec Recognition**: Explicit instructions guide the agent to select product specifications first (`click @ref 400度` or `click @ref 請選擇商品規格`), avoiding mistaken window popup commands (`wait-popup`).
+* **In-Page Spec Recognition**: Explicit instructions guide the agent to select product specifications first (`activate @ref` for options such as `400度` or `請選擇商品規格`), avoiding mistaken window popup commands (`wait-popup`).
 * **Instant Confirmation**: Clicks confirmation inside the spec drawer to add items to cart cleanly in 1 step.
 
 ### 3. Native CDP Multi-File & Image Upload Subsystem (`upload`)
@@ -228,12 +318,13 @@ Modern Single-Page Applications (SPAs) frequently hide raw `<input type="file">`
 * **CDP Native Injection**: Calls `DOM.setFileInputFiles` with local absolute paths.
 * **Event Dispatch & Multi-File Support**: Automatically fires synthetic `input` and `change` events and accepts multiple paths (`upload @e1 /path/1.png /path/2.pdf`) in a single invocation.
 
-### 4. Smart Nested Container Scroll Penetration (`scroll`)
+### 4. DOM-Targeted Nested Container Scrolling (`scroll`)
 Chat interfaces (Gemini, ChatGPT, Claude), data tables, and modern SPAs often lock the outer `window` (`overflow: hidden`) and place conversations inside nested `<div style="overflow-y: auto">` containers.
-* **Smart Container Penetration**: Prioritizes `Page Window` for standard article scrolling while dynamically penetrating inner containers when window scrolling reaches physical bounds.
-* **Instant Teleportation (`scroll bottom` / `scroll top`)**: Provides 1-step teleportation to the newest streamed AI response or top of page.
-* **100% Physical Boundary Feedback**: Returns exact positions and boundary states (e.g. `Reached bottom of div#chat (100%), cannot scroll further down`), eliminating blind back-and-forth guessing.
-* **`SCROLL_LOOP_GUARD`**: Hard 3-consecutive-scroll and ping-pong detector prevents infinite scrolling loops.
+* **DOM-First Positioning**: Run `snapshot -i --full`, select an offscreen `@ref`, and use `scroll to @ref`; `scrollIntoView()` moves the owning nested containers as needed.
+* **Explicit Destinations Only**: Vertical scrolling requires a DOM ref, text anchor, absolute pixel position, percentage, `top`, or `bottom`; relative vertical movement is unavailable.
+* **Instant Teleportation (`scroll bottom` / `scroll top`)**: Provides 1-step positioning at the newest streamed AI response or top of page.
+* **100% Physical Boundary Feedback**: Returns exact positions and boundary states for the selected container.
+* **`SCROLL_LOOP_GUARD`**: Stops three consecutive scroll commands without an intervening interaction.
 
 ### 5. DOM Image Discovery, Parallel Delivery & Cross-Origin Rendering
 * **Rendered-DOM Image Sidecar**: `get text`, `get images`, and every successful crawl extract ranked image metadata from the already-rendered DOM before returning clean text. Candidates combine ordered Open Graph image blocks, Twitter fallback, bounded Schema.org JSON-LD image traversal, `img.currentSrc` / `src` / `srcset`, common lazy-load attributes, `<figure>` captions, dimensions, visibility, and video posters. Exact URLs are deduplicated; tiny tracking pixels plus obvious logos, icons, avatars, sprites, placeholders, badges, and other utility assets are rejected. No image bytes are downloaded during discovery.
@@ -246,7 +337,7 @@ Chat interfaces (Gemini, ChatGPT, Claude), data tables, and modern SPAs often lo
 * **Bounded Async Fetching**: One absolute asyncio timeout (`PI_NODRIVER_IMAGE_FETCH_TIMEOUT`, 15 positive finite seconds by default) covers DNS, numeric-address connect and TLS, request drain, status line, all headers, every redirect, and the complete body. Status and individual header lines are limited to 8 KiB, response headers to 64 KiB and 100 fields, redirects to 3, and decoded transfer bytes to `PI_NODRIVER_IMAGE_MAX_BYTES` (20 MiB by default). The HTTP/1.0/1.1 parser supports validated `Content-Length`, chunked transfer coding, and connection-close bodies; it rejects conflicting or malformed framing and non-identity content encoding. Body reads use chunks of at most 64 KiB.
 * **Cancellation Semantics**: Cancellation of DNS, connect/TLS, status/header parsing, or body reads propagates promptly and closes any active stream. `loop.getaddrinfo` may leave its already-running platform resolver call in the event loop executor after the await is cancelled; that residual call has no fetch side effects and is neither awaited nor allowed to connect. A cancelled Pillow decode thread may finish in the background but cannot write a file. File writes use an exclusively created path and inode-aware cleanup, receive a cancellation signal, and get a bounded cleanup wait; an old writer cannot unlink a later same-name replacement. Releasing the cancelled task also releases the daemon session lock and client queue normally.
 * **Decode Limits**: Only PNG, JPEG, GIF, and WebP are accepted. Before full frame loading, decoded metadata is limited to 8192 pixels in either dimension (`PI_NODRIVER_IMAGE_MAX_WIDTH`, `PI_NODRIVER_IMAGE_MAX_HEIGHT`), 100 frames (`PI_NODRIVER_IMAGE_MAX_FRAMES`), and 40,000,000 cumulative frame pixels (`PI_NODRIVER_IMAGE_MAX_TOTAL_PIXELS`). These settings and the byte cap must be positive integers. Every accepted frame is fully loaded; PNG chunks and CRCs plus terminal JPEG/GIF/WebP container structure are checked. Every accepted format is decoded and re-encoded into a canonical PNG/JPEG/GIF/WebP container before saving, preventing Pillow-tolerated malformed or duplicate-chunk source bytes from being attached. MIME type and dimensions come from image bytes, not response headers.
-* **Browser Command Parity**: `fetch-image <url>` exposes single-image delivery through the `browser` command interface. `get images` inspects the active page without repeating page text, while `get text` returns both text and the same candidate sidecar.
+* **Browser Command Parity**: `fetch-image <url>` exposes single-image delivery through the `browser` command interface. `get images` inspects the active page without repeating page text, while `get text` returns both text and the same candidate sidecar. For an open HTTP(S) or local `file://` PDF, `get text` copies/downloads the source, extracts its text, and saves all embedded images with sendable `[[image: ...]]` markers.
 * **Cross-Origin Rendering**: Live external images can still be embedded via `![alt](image_url)` or `<img src="..." referrerpolicy="no-referrer" />`; the fetched-image path is preferred when the image must be delivered reliably through PiWeb or Discord.
 
 ### 6. Context-Aware Autonomous Intent Routing
@@ -255,20 +346,26 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 * **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
-### 7. Per-Session Open Loop Guard
+### 7. Search-Only URL Provenance Guard & Open Loop Guard
+Every HTTP(S) `open` must use an exact URL returned earlier in the same session by a successful `google_search` or `web_search` result. User-supplied, remembered, page-derived, modified, and guessed URLs are not valid provenance. The extension records search-result URLs and blocks every other HTTP(S) open with `URL_PROVENANCE_GUARD`; local non-HTTP fixture URLs remain available for development. Browser-native search uses `google-search {"searches":[{"direction":"official","query":"search terms"}]}`.
+
 To prevent a runaway agent from repeatedly opening the same site, each session may attempt at most **2 consecutive `open` actions to the same origin**. The 3rd same-origin `open` returns `OPEN_LOOP_GUARD` without launching a tab. A valid non-`open` browser action or a different-origin `open` resets the streak, while unsupported commands do not; for multiple same-site URLs, prefer one batched `crawl` call.
+
+`NO_PROGRESS_GUARD` fingerprints meaningful page content and interaction state before and after mutating browser actions. The fingerprint covers URL, title, visible text, form values and selections, focus, dimensions, and window/nested-container scroll positions without returning sensitive form values to the model. If two consecutive action attempts leave that state unchanged, the second attempt is blocked and the counter resets. A real page-state change resets the counter immediately; observation-only commands do not count as attempts. This stops loops such as repeatedly pressing Backspace after a field is already empty.
 
 ### 8. Global Tab LRU
 Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Each tab stores an immutable creation time and a `time.monotonic()` last-activity timestamp. Every page operation refreshes activity; when a new tab needs capacity, the least-recently-used inactive tab is closed first. Registry and download-routing state is removed only after Chrome confirms closure, preventing failed closes from bypassing the cap or leaking stale frame ownership. A CDP target quarantined after a preflight timeout remains in the registry until Chrome confirms it has disappeared or normal LRU eviction closes it. Tabs belonging to commands currently running and sessions with in-progress downloads are protected. If every tab is protected, creation fails with `TAB_LIMIT` instead of exceeding the cap. Crawl creation uses the same registry and a bounded semaphore.
 
 ### 9. Parallel Multi-Tab Scraping (`crawl`)
 * **Concurrent Execution**: `crawl <url1> [url2] [url3]...` launches parallel background tabs via `asyncio.gather`.
-* **Text + Image Sidecar**: Each tab returns clean `document.body.innerText` plus bounded, ranked `imageCandidates`; the candidate evaluation reuses the rendered page and does not issue image downloads.
+* **Text + Image Sidecar**: Each HTML tab returns clean `document.body.innerText` plus bounded, ranked `imageCandidates`; the candidate evaluation reuses the rendered page and does not issue image downloads.
+* **Direct PDF Crawl**: Direct PDF URLs are downloaded through Chrome's authenticated network context, parsed with Poppler `pdftotext`, and have embedded images extracted with `pdfimages`. Source, plaintext, aggregate image bytes, image count, subprocess time, and extraction concurrency all have configurable limits; image extraction is best-effort and does not discard successfully extracted text.
+* **Temporary LLM Wiki for Large PDFs**: PDF text above 12,000 characters (configurable with `PI_NODRIVER_PDF_INLINE_MAX_CHARS`) is split into overlapping chunks and indexed in a restrictive-permission, per-session SQLite FTS5 wiki. Supplemental CJK character bigrams support unsegmented CJK questions while normal lexical search remains available. The full text is withheld from model context, and PDF artifacts are removed at session shutdown without touching ordinary downloads.
 * **Desktop RWD Guarantee**: Each tab is forced to a **1920x1080 Full-Desktop Viewport** (`mobile=False`) via CDP to prevent mobile CSS from hiding tables and sidebars.
 * **Fast-Path DOM Poller**: 80ms polling frequency returns page text as soon as `document.readyState` is interactive, averaging **~0.32s to 0.46s per page**.
 
 ### 10. Multi-Directional Parallel Google Search (`google_search`)
-* **Multi-Directional Queries**: Dispatches up to **4 directional queries in parallel** (e.g. official docs, troubleshooting, benchmark comparisons) in a single turn via `google-search <json>`.
+* **Multi-Directional Queries**: Dispatches up to **4 directional queries in parallel** (e.g. official docs, troubleshooting, benchmark comparisons) in a single turn via `google-search {"searches":[{"direction":"official","query":"search terms"}]}`.
 * **Zero External API Cost & Ultra-Low Latency**: Directly leverages persistent Chromium inside Xvfb with hardware stealth, achieving **~0.82s median latency**.
 * **Clean DOM Card Extraction**: Evaluates `GOOGLE_RESULTS_JS` directly on the rendered Google SERP to extract un-redirected URLs, `h3` titles, and clean snippets (`[data-sncf="1"], .VwiC3b`).
 * **Stealth & Anti-Bot Protection**: Backed by `stealth.js` (coherent native WebGL/plugins, bot flag removal) with automated interception of `unusual traffic` / `verify you are human` challenges.
@@ -284,9 +381,9 @@ Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Ea
 * **Execution Trace**:
   1. `browser("open https://24h.pchome.com.tw/")` ➔ Opened homepage with instant `@refs`.
   2. `browser("fill-submit @e6 牙膏")` ➔ 1-step atomic search form submission.
-  3. `browser("click @e52")` ➔ Navigated to DARLIE 好來 雙重功效牙膏 (2+1 超值組).
-  4. `browser("click @e60")` ➔ Clicked "加入購物車" (Add to Cart).
-  5. `browser("click @e9")` ➔ Navigated to Cart Page (`https://ecssl.pchome.com.tw/fsrwd/cart`).
+  3. `browser("activate @e52")` ➔ Navigated to DARLIE 好來 雙重功效牙膏 (2+1 超值組).
+  4. `browser("activate @e60")` ➔ Activated "加入購物車" (Add to Cart).
+  5. `browser("activate @e9")` ➔ Navigated to Cart Page (`https://ecssl.pchome.com.tw/fsrwd/cart`).
   6. `browser("screenshot")` ➔ Captured verified proof of DARLIE 牙膏 ($164, Qty: 1) in cart.
 * **Total Execution Time**: **75.84s** (100% autonomous with 0 scroll loops).
 
@@ -296,9 +393,9 @@ Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Ea
 * **Goal**: Navigate to MOMO prescription swimming goggles (Product 8524087), select "400度" specification, click "加入購物車", and report status.
 * **Execution Trace**:
   1. `browser("open https://www.momoshop.com.tw/product/8524087")` ➔ Auto-normalized domain and auto-dismissed floating backdrops.
-  2. `browser("click @e20")` ➔ Expanded 「請選擇商品規格」 bottom sheet drawer.
-  3. `browser("click @e39")` ➔ Selected 「400度」 directly in 1 turn (0 scroll loops).
-  4. `browser("click @e35")` ➔ Clicked "加入購物車".
+  2. `browser("activate @e20")` ➔ Expanded 「請選擇商品規格」 bottom sheet drawer.
+  3. `browser("activate @e39")` ➔ Selected 「400度」 directly in 1 turn (0 scroll loops).
+  4. `browser("activate @e35")` ➔ Activated "加入購物車".
   5. MOMO server triggered 302 redirect to `/mymomo/login.momo` (mandatory member login policy).
   6. Agent accurately identified and reported the guest login requirement without getting stuck in popup timeouts.
 * **Total Execution Time**: **95.56s** (Clean execution, down from 260s+ infinite hanging).
@@ -310,9 +407,9 @@ Chrome is capped at **20 tabs globally** by default (`PI_NODRIVER_MAX_TABS`). Ea
 * **Execution Trace**:
   1. `browser("open https://24h.pchome.com.tw/")` ➔ Opened store.
   2. `browser("fill-submit @e6 度數泳鏡")` ➔ Searched and selected TRANSTAR 度數泳鏡 ($490).
-  3. `browser("click @e58")` ➔ Selected spec option `黑-200度`.
-  4. `browser("click @e62")` ➔ Clicked "加入購物車" (Guest cart supported).
-  5. `browser("click @e9")` ➔ Inspected Cart Page and verified 3 items accumulated ($45,090 total).
+  3. `browser("activate @e58")` ➔ Selected spec option `黑-200度`.
+  4. `browser("activate @e62")` ➔ Activated "加入購物車" (Guest cart supported).
+  5. `browser("activate @e9")` ➔ Inspected Cart Page and verified 3 items accumulated ($45,090 total).
 * **Total Execution Time**: **272.50s** (100% autonomous completion).
 
 ---
@@ -481,16 +578,20 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 
 | Command | Syntax | Output & Behavior | Viewport Scope |
 |---|---|---|---|
-| **`open`** | `open <url> [timeout_seconds]` | Navigates using the calling session's browser identity mode, with a configurable timeout (default 10s or `PI_NODRIVER_OPEN_TIMEOUT`; e.g. `open <url> 4` or `4s`), while always retaining the 390x844 mobile viewport and touch emulation. Hanging navigations abort cleanly via CDP `Page.stopLoading` and restore previous tabs. Then **auto-dismisses blocking banners** and **automatically returns an interactive `@refs` snapshot**, including `browserMode`, `identityUsed`, and `fallbackReason`. Per session, the 3rd consecutive same-origin agent open is blocked; an automatic fallback is not another agent open. | Interactive Tab (500x1000 / 390x844 mobile viewport) |
-| **`browser-mode-switch`** | `browser-mode-switch [auto\|android\|linux]` | With no argument, reports the session-scoped mode. `auto` uses Android first with one native Linux retry after a strong block; `android` forces Android with no fallback; `linux` opens directly with the native Linux identity. The setting affects subsequent `open` commands only and never disables mobile metrics or touch emulation. | Session Scope |
+| **`open`** | `open <url> [timeout_seconds]` | Navigates using the session identity mode. Android uses 390x844 mobile metrics; Linux uses a mobile-disabled 1280px desktop layout scaled into the 390x844 frame. In `auto`, strong CAPTCHA/access/login gates pin only the affected origin to fresh-target Linux while other origins remain Android. Hanging navigations abort cleanly and restore previous tabs. Returns an interactive `@refs` snapshot plus identity, origin route, layout, scale, and fallback metadata. | Interactive Tab (500x1000 outer window / 390x844 content frame) |
+| **`browser-mode-switch`** | `browser-mode-switch [auto\|android\|linux]` | With no argument, reports the session mode. `auto` starts new origins on Android and remembers Linux only for origins that trigger a strong gate; explicitly setting `auto` clears learned origin routes. `android` forces mobile metrics and touch; `linux` opens with native Linux identity, `mobile=False`, touch disabled, and desktop-fit scaling. | Session Scope |
 | **`fill-submit`** | `fill-submit @e1 "query"` | **Atomic search**: Clears, types, submits form, auto-settles, returns results DOM | Interactive Tab |
+| **`google-lens`** | `google-lens "/absolute/image.png"` | Upload one explicitly authorized non-private image on the already-open Google Lens dialog; returns candidate evidence, never auto-selects | Interactive Tab |
+| **`google-lens-results`** | `google-lens-results` | Observe up to 20 linked image candidates with title, exact URL, snippet and session/document-bound `@lens-` refs; no upload | Interactive Tab |
+| **`google-lens-select`** | `google-lens-select @lens-...` | Open the exact chosen result URL, after checking node/title/URL identity, and return destination evidence | Interactive Tab |
 | **`upload`** | `upload @e1 <file1> [file2]...` | **Atomic file upload**: Injects local files via CDP into the literal file input, button, or dropzone ref | Interactive Tab |
 | **`fetch-image` / `fetch_image`** | `fetch-image <http(s)://image-url>` | Fetches and validates one direct image URL, saves it in the session-isolated download directory, and returns an inline image plus a `[[image: <path>]]` delivery marker. | Session Scope |
 | **`fetch_images`** | `fetch_images({ urls: [...] })` | Fetches up to four selected direct images concurrently, preserves partial success, and returns exact delivery markers without reinjecting image bytes into the next model turn. | Session Scope |
-| **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** returning clean text plus ranked `imageCandidates`, with 3.0s circuit breaker and anti-bot challenge detection. | 1920x1080 Full-Desktop CDP Override |
+| **`crawl`** | `crawl <url1> [url2]...` | **Parallel multi-tab crawl** returning HTML text/image candidates or PDF extraction results. Large PDF text becomes a temporary wiki instead of entering model context. | 1920x1080 Full-Desktop CDP Override |
+| **`pdf-query` / `pdf_query`** | `pdf_query({ query, wikiId?, limit? })` | Queries the active temporary PDF wiki and returns only the best matching chunks (maximum 6); defaults to the latest large PDF in the session. | Session Scope |
 | **`snapshot -i`** | `snapshot -i` | Returns compact `@refs` plus checkbox/radio `checked`, `required`, and `disabled` state in the current viewport | Interactive Tab |
 | **`snapshot -i --full`** | `snapshot -i --full` | Returns full-page interactive DOM elements with `@refs` and `offscreen="true"` attributes | Interactive Tab |
-| **`click`** | `click @e16` | Clicks the literal snapshot ref; raw coordinate form is blocked | Interactive Tab |
+| **`activate`** | `activate @e16` | Activates the literal snapshot ref. The plain `click` command is removed. | Interactive Tab |
 | **`long-press`** | `long-press @e16 [duration]` | **DOM Long Press**: Long presses literal ref for `duration` (e.g. `2s`, `1.5s`, `1500ms`, `2`, default `1000ms`) with **human-like $\pm 2$px micro-drift** and **automatic 50% live midway screenshot** (`isTrusted: true`). | Interactive Tab |
 | **`vision-mark omni`** | `vision-mark omni` | Runs OmniParser V3, removes Chrome-toolbar candidates (`center y < 90`), ranks by confidence, and returns at most 15 numbered page regions with exact screenshot-pixel centers | Interactive Tab |
 | **`vision-mark`** | `vision-mark <x> <y>` | Draws a high-contrast mouse cursor whose upper-left red tip is the screenshot-pixel click hotspot; returns a one-time preview token | Interactive Tab |
@@ -504,9 +605,9 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 | **`find-option`** | `find-option <keywords>` | Searches every native dropdown internally with Unicode-normalized fuzzy token ranking, returning only the top labelled `@ref`/option-index candidates | Interactive Tab |
 | **`select`** | `select @e43 <query\|--index=N --fingerprint=HASH>` | Selects from the literal dropdown ref; ambiguous queries return candidates instead of guessing, and the complete indexed command from `find-option` verifies the option has not changed | Interactive Tab |
 | **`press`** | `press <key>` | Dispatches only control keys such as Enter, Tab, Space, or Backspace. Enter field text with `fill @e6 "text"` or `type @e6 "text"`. | Interactive Tab |
-| **`scroll`** | `scroll <down|up|top|bottom|left|right> [px]` | **Smart container scroll**: Penetrates nested chat/table containers with 100% boundary feedback | Interactive Tab |
+| **`scroll`** | `scroll to <@ref|text|pixels|percentage>` / `scroll <top|bottom>` | **DOM-targeted scroll**: choose an offscreen ref from `snapshot -i --full`; relative vertical movement is unavailable | Interactive Tab |
 | **`get`** | `get text|images|url|title [@ref]` | `get text` returns innerText plus ranked image candidates; `get images` returns only candidate metadata; URL/title behavior is unchanged. | Interactive Tab |
-| **`screenshot`** | `screenshot [--full]` | **Default**: Captures current Xvfb window (`500x1000` with Chrome UI, 1:1 coordinates for visual check & `vision-mark`).<br>**`--full`**: Captures entire scrollable long page via CDP specifically to assist non-vision DOM browser clicks (`@ref`, `click-text`). | Interactive Tab |
+| **`screenshot`** | `screenshot [--full] [--png]` | **Default**: Captures current viewport as lightweight JPG (`500x1000` with Chrome UI, 1:1 coordinates for visual checks, `vision-mark`, & user delivery).<br>**`--full`**: Captures entire scrollable long page via CDP (default JPG, or `--png`). | Interactive Tab |
 | **`dismiss overlays`** | `dismiss overlays` | Safely dismisses cookie banners and modal overlays | Interactive Tab |
 | **`close`** | `close` | Closes active session tab | Session Scope |
 | **`shutdown`** | `shutdown` | Stops persistent daemon and closes Chrome cleanly; subsequent commands auto-spawn a fresh daemon | Global Daemon Scope |
@@ -530,7 +631,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 ### 📸 Screenshot & Interaction Guide
 
 - **預設截圖 (`screenshot`)**：
-  - **適用情境**：使用者要求截圖、檢視當前可視範圍、檢查表單狀態、或進行 `vision-mark` 座標校準。
+  - **適用情境**：**使用者要求傳截圖**（優先傳送當前畫面的 JPG）、檢視當前可視範圍、檢查表單狀態、或進行 `vision-mark` 座標校準。回傳路徑可直接透過 `[[image: <path>]]` 傳送給使用者。
+  - **JPG 輕量輸出**：預設產出 `.jpg` 格式，大幅縮小傳輸體積與載入延遲（亦可加 `--png` 取得 PNG）。
   - **運作機制**：直接從 Xvfb 擷取 `500x1000` 實體視窗畫面（包含 Chrome 分頁標籤、網址列與 1:1 實體像素座標）。
   - **Wayland / Ozone X11 強制隔離**：啟動時自動從環境變數過濾 `WAYLAND_DISPLAY` 並傳遞 `--ozone-platform=x11`，防止 Linux 桌面環境下 Chrome 誤連 Wayland 造成 Xvfb 擷取出未繪製的純黑空圖。
   - **多 Session 條件式聚焦 (`bring_to_front`)**：只有目標 session tab 與目前作用中 tab 不同時才切到前景；同一 tab 的連續截圖、Omni 偵測與點擊驗證不會重複搶焦點，因此原生 dropdown/menu 等 transient UI 能保持展開。
@@ -539,7 +641,7 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
   - **適用情境**：**視覺長佈局檢查**。當頁面很長且 Agent 需要一眼掌握全頁排版、結構時使用。如需直接取得全頁互動元素與 `@refs`，請使用 `snapshot -i --full`。
   - **運作機制**：透過 Chrome Blink CDP 引擎在記憶體中拼接長圖，不提供 X11 物理座標（不能用於座標點擊）。
 - **整頁 DOM 元素清單 (`snapshot -i --full`)**：
-  - **適用情境**：一次取得全網頁所有可互動元素之 `@refs`，可直接 `click @ref`、`fill @ref` 或 `scroll to @ref`，超越可視範圍的元素會標註 `offscreen="true"`。
+  - **適用情境**：一次取得全網頁所有可互動元素之 `@refs`，可直接 `activate @ref`、`fill @ref` 或 `scroll to @ref`，超越可視範圍的元素會標註 `offscreen="true"`。
 - **原生 Chrome UI 彈窗淨化**：
   - 預設注入 `--simulate-outdated-no-au="Tue, 31 Dec 2099 23:59:59 GMT"` 與 `--check-for-update-interval=31536000`，徹底防止 Chrome 跳出「Can't update Chrome / Relaunch to update」原生桌面氣泡彈窗遮擋右上角頁面內容與選單。
   - **全面抑制儲存密碼與自動填入彈窗**：透過 profile Preferences 預先寫入 `credentials_enable_service: false`、`password_manager_enabled: false`、`password_manager_leak_detection: false`、以及關閉 `autofill`（表單、地址、信用卡），並搭配啟動參數 `--password-store=basic`、`--disable-save-password-bubble`、`--disable-single-click-autofill`，杜絕登入或填表時出現「Save password?」或自動填入下拉選單遮擋網頁畫面。
@@ -548,6 +650,8 @@ Visible text outranks an unrelated exact `value`, numeric/model tokens require t
 ---
 
 ### Default Interaction Strategy
+
+**Selective automatic screenshots (default on):** successful `open`, `activate`, `click-text/css/js`, `vision-click`, `select`, `press`, `fill-submit`, `scroll`, `dismiss`, `switch`, and popup-wait actions attach a current-viewport image alongside their unchanged text/refs. Existing response images are reused. `snapshot`, `get`, option inspection, and `fill`/`type` do not add images. Capture is best-effort with a three-second timeout: failure does not invalidate a completed action. These images are context only and do not authorize coordinate clicks. Set `PI_NODRIVER_AUTO_SCREENSHOT=0` in the worker environment to disable this behavior. Images may contain visible page data; typing is excluded but subsequent actions may still show that data.
 
 The deployed default is **CDP/DOM semantic actions first, OmniParser fallback second**. Semantic refs, `find-option`, and `select` provide the fastest path for ordinary controls; `vision-mark omni` is the default fallback for visual-only or non-semantic controls. Manual screenshot marking remains available and configurable, but is not the default.
 
@@ -573,6 +677,16 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 | `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
 | `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix domain socket path for daemon IPC. |
+| `PI_NODRIVER_PDF_MAX_BYTES` | `104857600` | Maximum authenticated source-PDF bytes. |
+| `PI_NODRIVER_PDF_TEXT_MAX_BYTES` | `33554432` | Maximum extracted plaintext bytes per PDF. |
+| `PI_NODRIVER_PDF_IMAGES_MAX_BYTES` | `134217728` | Maximum aggregate extracted-image bytes per PDF. |
+| `PI_NODRIVER_PDF_IMAGES_MAX_COUNT` | `100` | Maximum extracted image count per PDF. |
+| `PI_NODRIVER_PDF_MAX_CONCURRENCY` | `2` | Maximum concurrent Poppler extraction pipelines. |
+| `PI_NODRIVER_PDF_EXTRACTION_TIMEOUT` | `60` | Total extraction deadline, including semaphore queue time and both Poppler phases. |
+| `PI_NODRIVER_PDF_QUEUE_TIMEOUT` | `5` | Maximum wait for a Poppler extraction slot. |
+| `PI_NODRIVER_PDF_TEXT_TIMEOUT` | `40` | `pdftotext` phase timeout in seconds, clamped to the total extraction deadline. |
+| `PI_NODRIVER_PDF_IMAGES_TIMEOUT` | `15` | Best-effort `pdfimages` and image-validation phase timeout, clamped to the remaining total deadline. |
+| `PI_NODRIVER_PDF_INLINE_MAX_CHARS` | `12000` | Text above this size is indexed in a temporary wiki instead of returned inline. |
 
 ---
 
@@ -582,6 +696,8 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 * Linux (x86_64 or aarch64)
 * Google Chrome or Chromium installed (`google-chrome`, `google-chrome-stable`, or `chromium`)
 * `xvfb-run` and `python3` (3.10+)
+* Poppler command-line tools `pdftotext` and `pdfimages` (usually the `poppler-utils` package)
+* Python's `sqlite3` module built with SQLite FTS5 support (the installer reports a clear warning when unavailable)
 * [Pi coding agent](https://github.com/badlogic/pi-mono)
 * For the default Omni visual fallback: a separately installed and running [Microsoft OmniParser](https://github.com/microsoft/OmniParser) service compatible with the local `/parse` contract. This is an external dependent project, not an installer-managed Python package. Use `PI_NODRIVER_VISION_FALLBACK=manual` when it is intentionally absent.
 
@@ -593,7 +709,7 @@ cd pi-nodriver-browser
 ```
 
 The installer will:
-1. Validate system dependencies (`python3`, `xvfb-run`, `google-chrome`).
+1. Validate core system dependencies (`python3`, `xvfb-run`, `google-chrome`) and diagnose missing PDF tools or SQLite FTS5 without blocking non-PDF installation.
 2. Create an isolated Python venv and install dependencies (`nodriver==0.50.3`, `Pillow==12.3.0`, `idna==3.10`).
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
 4. Automatically disable conflicting legacy browser packages.

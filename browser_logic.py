@@ -22,6 +22,45 @@ GOOGLE_REDIRECT_PATHS = {'/url', '/goto'}
 TOUCH_LAB_HOST = 'aya.crayfish-monitor.ts.net'
 TOUCH_LAB_PATH_PREFIX = '/touch-trace'
 POPUP_TIMEOUT_MAX_MS = 2000
+INTERACTIVE_FRAME_WIDTH = 390
+INTERACTIVE_FRAME_HEIGHT = 844
+DESKTOP_FIT_LAYOUT_WIDTH = 1280
+
+
+def is_google_lens_surface(url: str) -> bool:
+    """Fail closed to supported Google surfaces; this never constructs a URL."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != 'https' or parsed.username or parsed.password
+                or parsed.port not in (None, 443)):
+            return False
+        if parsed.hostname == 'lens.google.com':
+            return True
+        return (parsed.hostname in {'www.google.com', 'images.google.com'}
+                and parsed.path in {'', '/', '/search', '/imghp', '/imgres'})
+    except (TypeError, ValueError):
+        return False
+
+
+def identity_viewport_metrics(identity):
+    if identity in {'linux', 'linux-fallback'}:
+        scale = INTERACTIVE_FRAME_WIDTH / DESKTOP_FIT_LAYOUT_WIDTH
+        return {
+            'width': DESKTOP_FIT_LAYOUT_WIDTH,
+            'height': round(INTERACTIVE_FRAME_HEIGHT / scale),
+            'deviceScaleFactor': 1.0,
+            'mobile': False,
+            'touch': False,
+            'scale': scale,
+        }
+    return {
+        'width': INTERACTIVE_FRAME_WIDTH,
+        'height': INTERACTIVE_FRAME_HEIGHT,
+        'deviceScaleFactor': 3.0,
+        'mobile': True,
+        'touch': True,
+        'scale': None,
+    }
 
 
 def parse_popup_timeout_ms(value: str | None) -> int:
@@ -73,6 +112,53 @@ def detect_access_block(url: str, title: str, text: str) -> str | None:
         or normalized_text.startswith(('access denied', 'request blocked', '403 forbidden'))
     ):
         return 'access denied'
+    return None
+
+
+def normalize_origin(url: str) -> str | None:
+    """Return Chromium-compatible HTTP(S) origin serialization for routing."""
+    origin = OpenActionGuard.origin(url)
+    if re.fullmatch(r'https?://[^/]+', origin):
+        return origin
+    return None
+
+
+def is_auth_url(url: str) -> bool:
+    """Return whether a URL path itself is an explicit authentication destination."""
+    try:
+        path = urllib.parse.urlsplit(url).path.casefold()
+    except (TypeError, ValueError):
+        return False
+    return bool(re.search(
+        r'/(?:login|log-in|signin|sign-in|sign_in|signup|sign-up|register|'
+        r'member/login|membercenter|account/login|auth/login|users/sign_in|'
+        r'oauth(?:/authorize)?|oauth2/authorize|o/oauth2/v2/auth|login/oauth|'
+        r'authorize|saml|sso)(?:[;/]|$)',
+        path,
+    ))
+
+
+def detect_access_gate(
+    url: str,
+    title: str,
+    text: str,
+    *,
+    captcha_widget: bool = False,
+    visible_password: bool = False,
+    visible_account: bool = False,
+    login_dialog: bool = False,
+    login_form: bool = False,
+) -> str | None:
+    """Classify only strong access/login gates; incidental login copy is ignored."""
+    blocked = detect_access_block(url, title, text)
+    if blocked is not None:
+        return blocked
+    if captcha_widget:
+        return 'captcha widget'
+    if login_dialog or login_form:
+        return 'login gate'
+    if visible_password and is_auth_url(url):
+        return 'login gate'
     return None
 
 
@@ -1031,7 +1117,7 @@ def parse_dismiss_options(parts: list[str]) -> str:
 
 
 REF_FIRST_ARGUMENT_ACTIONS = {
-    'click', 'click-js', 'download', 'download-info', 'fill', 'fill-submit',
+    'activate', 'click-js', 'download', 'download-info', 'fill', 'fill-submit',
     'fill_submit', 'select', 'type', 'upload',
 }
 
@@ -1060,7 +1146,7 @@ def is_semantic_click_attempt(parts: list[str]) -> bool:
     if not parts:
         return False
     action = parts[0].lower()
-    if action in {'click', 'click-js', 'long-press', 'longpress', 'press-hold'}:
+    if action in {'activate', 'click-js', 'long-press', 'longpress', 'press-hold'}:
         return len(parts) in (2, 3) and parts[1].startswith('@') and len(parts[1]) > 1
     if action in {'click-text', 'click-css'}:
         return len(parts) >= 2 and bool(' '.join(parts[1:]).strip())

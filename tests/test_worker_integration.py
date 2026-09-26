@@ -16,6 +16,7 @@ import unittest
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
+from PIL import Image
 from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,35 @@ MARKER = '__PI_NODRIVER__'
 class QuietSimpleHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
+
+
+def write_pdf_fixture(path):
+    image_buffer = io.BytesIO()
+    Image.new('RGB', (2, 2), (220, 40, 30)).save(image_buffer, format='JPEG')
+    jpeg = image_buffer.getvalue()
+    content = b'BT /F1 18 Tf 72 720 Td (PDF extraction fixture text) Tj ET\nq 40 0 0 40 72 640 cm /Im1 Do Q\n'
+    objects = [
+        b'<< /Type /Catalog /Pages 2 0 R >>',
+        b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 5 0 R >> >> /Contents 6 0 R >>',
+        b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        b'<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + str(len(jpeg)).encode() + b' >>\nstream\n' + jpeg + b'\nendstream',
+        b'<< /Length ' + str(len(content)).encode() + b' >>\nstream\n' + content + b'endstream',
+    ]
+    document = bytearray(b'%PDF-1.4\n%fixture\n')
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(document))
+        document.extend(f'{index} 0 obj\n'.encode())
+        document.extend(obj)
+        document.extend(b'\nendobj\n')
+    xref = len(document)
+    document.extend(f'xref\n0 {len(objects) + 1}\n'.encode())
+    document.extend(b'0000000000 65535 f \n')
+    for offset in offsets[1:]:
+        document.extend(f'{offset:010d} 00000 n \n'.encode())
+    document.extend(f'trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode())
+    path.write_bytes(document)
 
 
 class FakeTarget:
@@ -116,9 +146,16 @@ class AccessBlockPollingUnitTests(unittest.IsolatedAsyncioTestCase):
                 self.calls += 1
                 if self.calls == 1:
                     raise RuntimeError('execution context was destroyed')
-                if script == 'document.title':
-                    return 'Security check'
-                return '您是人還是機器人？'
+                return json.dumps({
+                    'url': self.url,
+                    'title': 'Security check',
+                    'text': '您是人還是機器人？',
+                    'captchaWidget': False,
+                    'visiblePassword': False,
+                    'visibleAccount': False,
+                    'loginDialog': False,
+                    'loginForm': False,
+                })
 
         reason = await BrowserWorker().detect_page_access_block(
             ReloadingPage(), 'https://example.test/booking',
@@ -126,6 +163,89 @@ class AccessBlockPollingUnitTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(reason, 'robot verification')
+
+
+class AccessGateRoutingUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auth_intent_uses_target_href_and_keeps_unexpected_vision_gates_enabled(self):
+        from worker import BrowserWorker
+
+        self.assertTrue(BrowserWorker.action_explicitly_requests_login(
+            'activate', ['activate', '@e1'],
+            {'text': 'Activated @e1 (link: )', 'targetHref': 'https://shop.example/member/login'},
+        ))
+        self.assertTrue(BrowserWorker.action_explicitly_requests_login(
+            'vision-click', ['vision-click', '10', '20'],
+            {'text': 'Vision click', 'targetAriaLabel': '會員登入'},
+        ))
+        self.assertFalse(BrowserWorker.action_explicitly_requests_login(
+            'vision-click', ['vision-click', '10', '20'],
+            {'text': 'Vision click', 'targetHref': 'https://shop.example/cart'},
+        ))
+        self.assertTrue(BrowserWorker.action_explicitly_requests_login(
+            'activate', ['activate', '@e2'],
+            {'text': 'Activated icon', 'targetAriaLabel': 'Continue with Google'},
+        ))
+        self.assertTrue(BrowserWorker.action_explicitly_requests_login(
+            'activate', ['activate', '@e3'],
+            {'text': 'Activated icon', 'targetHref': 'https://accounts.example/o/oauth2/v2/auth'},
+        ))
+
+    async def test_post_action_cancellation_rolls_back_new_origin_routes(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(
+            url='https://login.example/member/login',
+            evaluate=AsyncMock(return_value=json.dumps({
+                'url': 'https://login.example/member/login',
+                'title': '會員登入',
+                'text': '會員登入',
+                'captchaWidget': False,
+                'visiblePassword': True,
+                'visibleAccount': True,
+                'loginDialog': False,
+                'loginForm': True,
+            })),
+        )
+        worker.pages['session-a'] = page
+        original_routes = {
+            f'https://origin-{index}.example': 'existing gate' for index in range(32)
+        }
+        worker.origin_linux_routes['session-a'] = dict(original_routes)
+        worker._execute = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.maybe_fallback_after_action(
+                'session-a', 'activate', ['activate', '@e1'],
+                {'text': 'Activated @e1 (button: 加入購物車)'},
+                'https://shop.example/product', 'android',
+            )
+
+        self.assertEqual(worker.origin_linux_routes['session-a'], original_routes)
+
+    async def test_post_probe_cancellation_restores_origin_routes(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(url='https://shop.example/product')
+        worker.pages['session-a'] = page
+        original_routes = {'https://existing.example': 'captcha widget'}
+        worker.origin_linux_routes['session-a'] = dict(original_routes)
+        worker.detect_page_access_gate = AsyncMock(
+            side_effect=['login gate', asyncio.CancelledError()]
+        )
+        worker._execute = AsyncMock(return_value={
+            'text': 'Linux product', 'url': page.url, 'identityUsed': 'linux'
+        })
+
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.maybe_fallback_after_action(
+                'session-a', 'activate', ['activate', '@e1'],
+                {'text': 'Activated @e1 (button: 加入購物車)'},
+                page.url, 'android',
+            )
+
+        self.assertEqual(worker.origin_linux_routes['session-a'], original_routes)
 
 
 class CloseFailingPage(FakePage):
@@ -199,10 +319,10 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
                     return {'text': 'switched', 'action': 'switch'}
                 if command == 'get text':
                     return {'text': 'page text', 'action': 'get'}
-                if command == 'click @stale':
+                if command == 'activate @stale':
                     from worker import StaleRefError
                     raise StaleRefError('stale')
-                if command == 'click @guarded':
+                if command == 'activate @guarded':
                     raise ValueError('STALE_REF_GUARD: run snapshot -i')
                 if command == 'click-css #missing':
                     raise SemanticClickTargetError('DOM click target was unavailable')
@@ -238,7 +358,7 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
         from worker import StaleRefError
 
         with self.assertRaises(StaleRefError) as raised:
-            await self.worker.execute('click @stale', 'session-a')
+            await self.worker.execute('activate @stale', 'session-a')
 
         self.assertFalse(hasattr(raised.exception, 'vision_fallback_progress'))
 
@@ -252,7 +372,7 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
         response = await execute_request(self.worker, {
             'id': 1,
             'sessionId': 'session-a',
-            'command': 'click @stale',
+            'command': 'activate @stale',
         })
 
         self.assertTrue(response['ok'])
@@ -293,11 +413,683 @@ class SemanticClickFailureUnitTests(unittest.IsolatedAsyncioTestCase):
                 'session-a', state, 100, 200, '0123456789abcdef01234567', 'hash-a'
             )
 
-    async def test_raw_coordinate_failure_does_not_lock_vision(self):
-        with self.assertRaisesRegex(ValueError, 'DOM click failed'):
+    async def test_removed_click_does_not_lock_vision(self):
+        with self.assertRaisesRegex(ValueError, 'CLICK_REMOVED'):
             await self.worker.execute('click 20 30', 'session-a')
 
         self.worker.vision_fallback_guard.require_unlocked('session-a', self.context())
+
+
+class PdfExtractionUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_pdf_resource_uses_browser_credentials_and_writes_valid_pdf(self):
+        import nodriver as uc
+        from worker import BrowserWorker
+
+        pdf_bytes = b'%PDF-1.4\nfixture\n%%EOF\n'
+        page = SimpleNamespace(send=AsyncMock(side_effect=[
+            SimpleNamespace(frame=SimpleNamespace(id_=uc.cdp.page.FrameId('main-frame'))),
+            SimpleNamespace(
+                success=True,
+                stream=uc.cdp.io.StreamHandle('pdf-stream'),
+                http_status_code=200,
+                headers={'content-type': 'application/pdf'},
+            ),
+            (True, base64.b64encode(pdf_bytes).decode('ascii'), True),
+            None,
+        ]))
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / 'document.pdf'
+
+            result = await BrowserWorker().download_pdf_resource(
+                page, 'https://example.test/report.pdf', destination
+            )
+
+            self.assertEqual(result, destination.resolve())
+            self.assertEqual(destination.read_bytes(), pdf_bytes)
+            load_command = page.send.await_args_list[1].args[0]
+            request = next(load_command)
+            self.assertEqual(request['method'], 'Network.loadNetworkResource')
+            self.assertTrue(request['params']['options']['includeCredentials'])
+
+    async def test_get_text_extracts_the_open_pdf_and_returns_image_paths(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(
+            url='https://example.test/report.pdf',
+            target=FakeTarget('pdf-page'),
+            evaluate=AsyncMock(return_value='application/pdf'),
+        )
+        worker.pages['session-a'] = page
+        with tempfile.TemporaryDirectory() as temp:
+            worker.download_dir = Path(temp)
+            worker.download_pdf_resource = AsyncMock(side_effect=lambda _page, _url, path: path)
+            worker.extract_pdf_document = AsyncMock(return_value={
+                'text': 'Quarterly PDF body',
+                'imagePaths': ['/tmp/pdf-image-001.jpg', '/tmp/pdf-image-002.png'],
+                'imageCount': 2,
+            })
+
+            result = await worker._execute('get text', 'session-a')
+
+        self.assertEqual(result['pageText'], 'Quarterly PDF body')
+        self.assertEqual(result['contentType'], 'application/pdf')
+        self.assertEqual(result['pdfImagePaths'], [
+            '/tmp/pdf-image-001.jpg', '/tmp/pdf-image-002.png'
+        ])
+        self.assertEqual(result['imageCount'], 2)
+        self.assertIn('Extracted PDF images: 2', result['text'])
+        self.assertIn('[[image: /tmp/pdf-image-001.jpg]]', result['text'])
+
+    async def test_large_open_pdf_is_indexed_without_returning_full_text(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(
+            url='https://example.test/large-report.pdf',
+            target=FakeTarget('large-pdf-page'),
+            evaluate=AsyncMock(return_value='application/pdf'),
+        )
+        worker.pages['session-a'] = page
+        large_text = ('ordinary background material ' * 900) + (
+            'UNIQUE_NEEDLE GPU kernel latency improved by seventeen percent.'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            worker.download_dir = Path(temp)
+            worker.download_pdf_resource = AsyncMock(side_effect=lambda _page, _url, path: path)
+            worker.extract_pdf_document = AsyncMock(return_value={
+                'text': large_text,
+                'imagePaths': [],
+                'imageCount': 0,
+                'imageExtractionError': None,
+            })
+
+            indexed = await worker._execute('get text', 'session-a')
+            queried = await worker._execute(
+                'pdf-query {"query":"GPU kernel latency","limit":3}', 'session-a'
+            )
+
+        self.assertEqual(indexed['contentMode'], 'temp-wiki')
+        self.assertGreater(indexed['sourceChars'], 20000)
+        self.assertNotIn('UNIQUE_NEEDLE', indexed['text'])
+        self.assertLess(len(indexed['text']), 3000)
+        self.assertIn('GPU kernel latency improved', queried['text'])
+        self.assertLess(len(queried['text']), 10000)
+        self.assertEqual(queried['wikiId'], indexed['wikiId'])
+
+    async def test_extract_pdf_page_reads_an_open_local_file(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'local report.pdf'
+            write_pdf_fixture(pdf_path)
+            worker = BrowserWorker()
+            worker.download_dir = root / 'downloads'
+            page = SimpleNamespace(url=pdf_path.as_uri())
+
+            result = await worker.extract_pdf_page(page, 'session-a')
+
+            self.assertIn('PDF extraction fixture text', result['text'])
+            self.assertEqual(result['imageCount'], 1)
+            self.assertTrue(Path(result['pdfPath']).is_file())
+
+    async def test_pdf_image_failure_preserves_extracted_text(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            write_pdf_fixture(pdf_path)
+            real_which = __import__('shutil').which
+
+            def executable(name):
+                return '/bin/false' if name == 'pdfimages' else real_which(name)
+
+            with patch('worker.shutil.which', side_effect=executable):
+                result = await BrowserWorker().extract_pdf_document(
+                    pdf_path, root / 'extracted'
+                )
+
+            self.assertIn('PDF extraction fixture text', result['text'])
+            self.assertEqual(result['imageCount'], 0)
+            self.assertIn('pdfimages failed', result['imageExtractionError'])
+            result['pdfPath'] = str(pdf_path)
+            self.assertIn(
+                'PDF image extraction warning:',
+                BrowserWorker.format_pdf_extraction(result),
+            )
+
+    async def test_extract_pdf_document_returns_text_and_every_embedded_image(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            output_dir = root / 'extracted'
+            output_dir.mkdir()
+            (output_dir / 'image-999.png').write_bytes(b'stale image')
+            write_pdf_fixture(pdf_path)
+
+            result = await BrowserWorker().extract_pdf_document(pdf_path, output_dir)
+
+            self.assertIn('PDF extraction fixture text', result['text'])
+            self.assertEqual(result['imageCount'], 1)
+            self.assertEqual(len(result['imagePaths']), 1)
+            image_path = Path(result['imagePaths'][0])
+            self.assertTrue(image_path.is_file())
+            with Image.open(image_path) as extracted:
+                self.assertEqual(extracted.size, (2, 2))
+
+    async def test_pdf_images_are_validated_and_canonicalized_before_delivery(self):
+        from PIL.PngImagePlugin import PngInfo
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            image_buffer = io.BytesIO()
+            metadata = PngInfo()
+            metadata.add_text('unsafe-note', 'must not survive canonicalization')
+            Image.new('RGB', (3, 2), (10, 20, 30)).save(
+                image_buffer, format='PNG', pnginfo=metadata
+            )
+            extracted_bytes = image_buffer.getvalue()
+            worker = BrowserWorker()
+
+            async def fake_subprocess(command, *_args, **_kwargs):
+                if Path(command[0]).name == 'pdftotext':
+                    Path(command[-1]).write_text('validated text')
+                else:
+                    Path(f'{command[-1]}-000.png').write_bytes(extracted_bytes)
+                return 0, ''
+
+            worker.run_pdf_subprocess = AsyncMock(side_effect=fake_subprocess)
+            with patch('worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'):
+                result = await worker.extract_pdf_document(pdf_path, root / 'validated')
+
+            self.assertEqual(result['text'], 'validated text')
+            self.assertEqual(result['imageCount'], 1)
+            image_path = Path(result['imagePaths'][0])
+            self.assertEqual(image_path.name, 'image-safe-001.png')
+            self.assertNotEqual(image_path.read_bytes(), extracted_bytes)
+            self.assertNotIn(b'unsafe-note', image_path.read_bytes())
+            with Image.open(image_path) as image:
+                image.load()
+                self.assertEqual(image.size, (3, 2))
+
+    async def test_malformed_and_oversized_pdf_images_are_rejected_but_text_survives(self):
+        from worker import BrowserWorker
+
+        async def run_case(root, image_bytes, environment):
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            worker = BrowserWorker()
+
+            async def fake_subprocess(command, *_args, **_kwargs):
+                if Path(command[0]).name == 'pdftotext':
+                    Path(command[-1]).write_text('text remains available')
+                else:
+                    Path(f'{command[-1]}-000.png').write_bytes(image_bytes)
+                return 0, ''
+
+            worker.run_pdf_subprocess = AsyncMock(side_effect=fake_subprocess)
+            with patch('worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'):
+                with patch.dict(os.environ, environment):
+                    return await worker.extract_pdf_document(
+                        pdf_path, root / f'output-{len(environment)}'
+                    )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            malformed = await run_case(root, b'not a png', {})
+            oversized_buffer = io.BytesIO()
+            Image.new('RGB', (6, 2)).save(oversized_buffer, format='PNG')
+            oversized = await run_case(
+                root, oversized_buffer.getvalue(), {'PI_NODRIVER_IMAGE_MAX_WIDTH': '5'}
+            )
+
+        for result in (malformed, oversized):
+            self.assertEqual(result['text'], 'text remains available')
+            self.assertEqual(result['imagePaths'], [])
+            self.assertIn('PDF image extraction failed', result['imageExtractionError'])
+        self.assertIn('valid image', malformed['imageExtractionError'])
+        self.assertIn('width 6', oversized['imageExtractionError'])
+
+    async def test_pdf_text_and_aggregate_image_quotas_are_enforced(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            write_pdf_fixture(pdf_path)
+
+            with patch.dict(os.environ, {'PI_NODRIVER_PDF_TEXT_MAX_BYTES': '10'}):
+                with self.assertRaisesRegex(ValueError, 'byte quota'):
+                    await BrowserWorker().extract_pdf_document(pdf_path, root / 'text-limited')
+
+            with patch.dict(os.environ, {'PI_NODRIVER_PDF_IMAGES_MAX_BYTES': '1'}):
+                result = await BrowserWorker().extract_pdf_document(
+                    pdf_path, root / 'image-limited'
+                )
+
+            self.assertIn('PDF extraction fixture text', result['text'])
+            self.assertEqual(result['imagePaths'], [])
+            self.assertIn('byte quota', result['imageExtractionError'])
+
+    async def test_local_pdf_copy_rejects_growth_after_descriptor_stat(self):
+        from worker import BrowserWorker
+        import worker as worker_module
+
+        class GrowingReader:
+            def __init__(self, wrapped, source):
+                self.wrapped = wrapped
+                self.source = source
+                self.grew = False
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.wrapped.__exit__(*args)
+
+            def fileno(self):
+                return self.wrapped.fileno()
+
+            def read(self, size=-1):
+                data = self.wrapped.read(size)
+                if not self.grew:
+                    self.grew = True
+                    with self.source.open('ab') as output:
+                        output.write(b'growth')
+                return data
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'source.pdf'
+            destination = root / 'copied.pdf'
+            source.write_bytes(b'%PDF')
+            real_fdopen = os.fdopen
+
+            def fdopen(descriptor, mode='r', *args, **kwargs):
+                opened = real_fdopen(descriptor, mode, *args, **kwargs)
+                if mode == 'rb':
+                    return GrowingReader(opened, source)
+                return opened
+
+            with patch.object(worker_module, 'PDF_STREAM_CHUNK_BYTES', 4), patch(
+                'worker.os.fdopen', side_effect=fdopen
+            ):
+                with self.assertRaisesRegex(ValueError, 'byte limit'):
+                    BrowserWorker.copy_private_file(source, destination, 4)
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.glob('.*.tmp')), [])
+
+    async def test_pdf_phase_deadline_clamps_images_and_preserves_completed_text(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            worker = BrowserWorker()
+            phase_timeouts = {}
+
+            async def fake_subprocess(command, _output, timeout, *_args):
+                phase_timeouts[Path(command[0]).name] = timeout
+                if Path(command[0]).name == 'pdftotext':
+                    await asyncio.sleep(0.02)
+                    Path(command[-1]).write_text('text beat the shared deadline')
+                    return 0, ''
+                raise TimeoutError(f'pdfimages timed out after {timeout:g} seconds')
+
+            worker.run_pdf_subprocess = AsyncMock(side_effect=fake_subprocess)
+            environment = {
+                'PI_NODRIVER_PDF_EXTRACTION_TIMEOUT': '0.05',
+                'PI_NODRIVER_PDF_QUEUE_TIMEOUT': '0.01',
+                'PI_NODRIVER_PDF_TEXT_TIMEOUT': '0.04',
+                'PI_NODRIVER_PDF_IMAGES_TIMEOUT': '1',
+            }
+            with patch.dict(os.environ, environment), patch(
+                'worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'
+            ):
+                result = await worker.extract_pdf_document(pdf_path, root / 'deadline')
+
+            self.assertEqual(result['text'], 'text beat the shared deadline')
+            self.assertEqual(result['imagePaths'], [])
+            self.assertIn('timed out', result['imageExtractionError'])
+            self.assertLess(phase_timeouts['pdfimages'], 0.05)
+
+    async def test_pdf_semaphore_queue_wait_is_bounded(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            worker = BrowserWorker()
+            await worker.pdf_extraction_semaphore.acquire()
+            await worker.pdf_extraction_semaphore.acquire()
+            try:
+                with patch.dict(os.environ, {
+                    'PI_NODRIVER_PDF_QUEUE_TIMEOUT': '0.01',
+                    'PI_NODRIVER_PDF_EXTRACTION_TIMEOUT': '1',
+                }), patch(
+                    'worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'
+                ):
+                    with self.assertRaisesRegex(TimeoutError, 'queue timed out'):
+                        await worker.extract_pdf_document(pdf_path, root / 'queued')
+            finally:
+                worker.pdf_extraction_semaphore.release()
+                worker.pdf_extraction_semaphore.release()
+
+    async def test_pdf_image_timeout_preserves_extracted_text_and_returns_warning(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            worker = BrowserWorker()
+
+            async def fake_subprocess(command, *_args, **_kwargs):
+                if Path(command[0]).name == 'pdftotext':
+                    Path(command[-1]).write_text('text survived image timeout')
+                    return 0, ''
+                raise TimeoutError('pdfimages timed out after 1 seconds')
+
+            worker.run_pdf_subprocess = AsyncMock(side_effect=fake_subprocess)
+            with patch('worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'):
+                result = await worker.extract_pdf_document(pdf_path, root / 'timeout')
+
+            self.assertEqual(result['text'], 'text survived image timeout')
+            self.assertEqual(result['imageCount'], 0)
+            self.assertIn('timed out', result['imageExtractionError'])
+
+    async def test_pdf_artifacts_are_private_and_session_cleanup_preserves_downloads(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'fixture.pdf'
+            write_pdf_fixture(source)
+            worker = BrowserWorker()
+            worker.download_dir = root / 'downloads'
+            ordinary = worker.session_download_dir('session-a') / 'keep.csv'
+            ordinary.write_text('keep me')
+            page = SimpleNamespace(url=source.as_uri())
+
+            with patch.dict(os.environ, {'PI_NODRIVER_PDF_INLINE_MAX_CHARS': '1'}):
+                result = await worker.extract_pdf_page(page, 'session-a')
+
+            artifact_dir = Path(result['pdfPath']).parent
+            private_paths = [
+                artifact_dir,
+                Path(result['pdfPath']),
+                artifact_dir / 'document.txt',
+                Path(result['wikiPath']),
+                *map(Path, result['imagePaths']),
+            ]
+            self.assertEqual(private_paths[0].stat().st_mode & 0o777, 0o700)
+            for path in private_paths[1:]:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+
+            await worker.cleanup_pdf_session('session-a')
+
+            self.assertFalse(artifact_dir.exists())
+            self.assertEqual(ordinary.read_text(), 'keep me')
+            self.assertNotIn('session-a', worker.pdf_wikis)
+
+    async def test_cleanup_retains_failures_retries_and_continues_other_paths(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            worker = BrowserWorker()
+            worker.download_dir = root / 'downloads'
+            session_root = worker.session_download_dir('session-a')
+            failed = session_root / 'pdf-failed'
+            successful = session_root / 'pdf-successful'
+            failed.mkdir()
+            successful.mkdir()
+            worker.pdf_artifact_dirs['session-a'] = {
+                failed.resolve(), successful.resolve()
+            }
+            worker.pdf_wikis['session-a'] = {'wikiId': 'still-tracked'}
+            real_rmtree = __import__('shutil').rmtree
+
+            def flaky_rmtree(path):
+                if Path(path).name == 'pdf-failed':
+                    raise OSError('injected cleanup failure')
+                return real_rmtree(path)
+
+            with patch('worker.shutil.rmtree', side_effect=flaky_rmtree):
+                with self.assertRaisesRegex(RuntimeError, 'injected cleanup failure'):
+                    await worker.cleanup_pdf_session('session-a')
+
+            self.assertTrue(failed.exists())
+            self.assertFalse(successful.exists())
+            self.assertEqual(worker.pdf_artifact_dirs['session-a'], {failed.resolve()})
+            self.assertIn('session-a', worker.pdf_wikis)
+
+            await worker.cleanup_pdf_session('session-a')
+            self.assertFalse(failed.exists())
+            self.assertNotIn('session-a', worker.pdf_artifact_dirs)
+            self.assertNotIn('session-a', worker.pdf_wikis)
+
+    async def test_ensure_browser_restarts_after_chrome_connection_dies(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        stale = SimpleNamespace(
+            send=AsyncMock(side_effect=ConnectionError('chrome websocket closed')),
+            stop=Mock(),
+        )
+        fresh = SimpleNamespace(
+            send=AsyncMock(),
+            stop=Mock(),
+            add_handler=Mock(),
+        )
+        worker.browser = stale
+        worker.launched_browser = stale
+        worker.pages['session-a'] = object()
+
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                patch.dict(os.environ, {'PI_NODRIVER_PROFILE': temp}),
+                patch('worker.uc.start', AsyncMock(return_value=fresh)) as start,
+            ):
+                result = await worker.ensure_browser()
+
+        self.assertIs(result, fresh)
+        self.assertIs(worker.browser, fresh)
+        self.assertEqual(worker.pages, {})
+        stale.stop.assert_called_once()
+        start.assert_awaited_once()
+
+    async def test_concurrent_dead_browser_recovery_launches_once(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        probes = 0
+        both_probed = asyncio.Event()
+
+        async def fail_after_both_probe(*_args, **_kwargs):
+            nonlocal probes
+            probes += 1
+            if probes == 2:
+                both_probed.set()
+            await asyncio.wait_for(both_probed.wait(), timeout=0.2)
+            raise ConnectionError('chrome websocket closed')
+
+        stale = SimpleNamespace(send=AsyncMock(side_effect=fail_after_both_probe), stop=Mock())
+        fresh = SimpleNamespace(send=AsyncMock(), stop=Mock(), add_handler=Mock())
+        worker.browser = stale
+        worker.launched_browser = stale
+
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                patch.dict(os.environ, {'PI_NODRIVER_PROFILE': temp}),
+                patch('worker.uc.start', AsyncMock(return_value=fresh)) as start,
+            ):
+                first, second = await asyncio.gather(
+                    worker.ensure_browser(), worker.ensure_browser()
+                )
+
+        self.assertIs(first, fresh)
+        self.assertIs(second, fresh)
+        start.assert_awaited_once()
+        stale.stop.assert_called_once()
+
+    async def test_shutdown_waits_for_in_progress_browser_recovery(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        stale = SimpleNamespace(
+            send=AsyncMock(side_effect=ConnectionError('chrome websocket closed')),
+            stop=Mock(),
+        )
+        fresh = SimpleNamespace(send=AsyncMock(), stop=Mock(), add_handler=Mock())
+        worker.browser = stale
+        worker.launched_browser = stale
+        launch_started = asyncio.Event()
+        allow_launch = asyncio.Event()
+
+        async def delayed_start(**_kwargs):
+            launch_started.set()
+            await allow_launch.wait()
+            return fresh
+
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                patch.dict(os.environ, {'PI_NODRIVER_PROFILE': temp}),
+                patch('worker.uc.start', side_effect=delayed_start),
+            ):
+                recovery = asyncio.create_task(worker.ensure_browser())
+                await asyncio.wait_for(launch_started.wait(), timeout=0.2)
+                shutdown = asyncio.create_task(worker.shutdown_browser())
+                await asyncio.sleep(0)
+                allow_launch.set()
+                await asyncio.gather(recovery, shutdown)
+
+        self.assertIsNone(worker.browser)
+        fresh.stop.assert_called_once()
+
+    async def test_shutdown_continues_after_cleanup_errors(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.pdf_artifact_dirs = {'session-a': set(), 'session-b': set()}
+        worker.cleanup_pdf_session = AsyncMock(
+            side_effect=[RuntimeError('cleanup failed'), None]
+        )
+        browser = SimpleNamespace(send=AsyncMock(), stop=Mock())
+        worker.browser = browser
+        worker.launched_browser = browser
+
+        await worker.shutdown_browser()
+
+        self.assertEqual(
+            [call.args[0] for call in worker.cleanup_pdf_session.await_args_list],
+            ['session-a', 'session-b'],
+        )
+        browser.send.assert_awaited_once()
+        browser.stop.assert_called_once()
+        self.assertIsNone(worker.browser)
+
+    async def test_pdf_wiki_reports_missing_sqlite_fts5_clearly(self):
+        import sqlite3
+        from worker import BrowserWorker
+
+        database = Mock()
+        database.execute.side_effect = sqlite3.OperationalError('no such module: fts5')
+
+        with self.assertRaisesRegex(RuntimeError, 'SQLite with FTS5 enabled'):
+            BrowserWorker.ensure_sqlite_fts5(database)
+
+    async def test_pdf_wiki_retrieves_unsegmented_cjk_and_lexical_queries(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wiki = BrowserWorker.create_pdf_wiki(
+                root,
+                '本報告分析機器學習模型效能與延遲。\nOrdinary lexical GPU latency section.',
+                'https://example.test/cjk.pdf',
+                root / 'document.pdf',
+            )
+
+            cjk = BrowserWorker.query_pdf_wiki(wiki['wikiPath'], '機器學習模型效能')
+            lexical = BrowserWorker.query_pdf_wiki(wiki['wikiPath'], 'GPU latency')
+
+            self.assertTrue(cjk)
+            self.assertIn('機器學習模型效能', cjk[0]['text'])
+            self.assertTrue(lexical)
+            self.assertIn('GPU latency', lexical[0]['text'])
+
+    async def test_pdf_extraction_concurrency_is_limited(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {'PI_NODRIVER_PDF_MAX_CONCURRENCY': '1'}
+        ):
+            root = Path(temp)
+            pdf_path = root / 'fixture.pdf'
+            pdf_path.write_bytes(b'%PDF fixture')
+            worker = BrowserWorker()
+            active = 0
+            maximum_active = 0
+
+            async def fake_subprocess(command, *_args, **_kwargs):
+                nonlocal active, maximum_active
+                active += 1
+                maximum_active = max(maximum_active, active)
+                try:
+                    await asyncio.sleep(0.01)
+                    if Path(command[0]).name == 'pdftotext':
+                        Path(command[-1]).write_text('bounded extraction')
+                    return 0, ''
+                finally:
+                    active -= 1
+
+            worker.run_pdf_subprocess = AsyncMock(side_effect=fake_subprocess)
+            with patch('worker.shutil.which', side_effect=lambda name: f'/usr/bin/{name}'):
+                await asyncio.gather(*(
+                    worker.extract_pdf_document(pdf_path, root / f'output-{index}')
+                    for index in range(3)
+                ))
+
+            self.assertEqual(maximum_active, 1)
+
+    async def test_cancelled_pdf_subprocess_is_killed_and_reaped(self):
+        from worker import BrowserWorker
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pid_path = root / 'pid'
+            worker = BrowserWorker()
+            task = asyncio.create_task(worker.run_pdf_subprocess(
+                ['/bin/sh', '-c', f'echo $$ > {pid_path}; sleep 30'],
+                root,
+                60,
+                1024,
+            ))
+            for _ in range(100):
+                if pid_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(pid_path.exists())
+            pid = int(pid_path.read_text())
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
 
 class ImageCandidateSidecarUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -1328,6 +2120,31 @@ class OmniParseCommandUnitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item['sourceId'] for item in filtered], [1])
 
+    def test_candidate_filter_rejects_oversized_containers_and_slivers(self):
+        from worker import BrowserWorker
+
+        elements = [
+            # Normal button
+            {'id': 1, 'confidence': 0.8, 'box': [10, 80, 50, 110], 'center': [30, 95]},
+            # Degenerate sliver (width < 3)
+            {'id': 2, 'confidence': 0.95, 'box': [10, 80, 11, 110], 'center': [10.5, 95]},
+            # Degenerate sliver (height < 3)
+            {'id': 3, 'confidence': 0.95, 'box': [10, 80, 50, 81], 'center': [30, 80.5]},
+            # Oversized full-width/full-height container (> 85% width & height)
+            {'id': 4, 'confidence': 0.99, 'box': [2, 10, 98, 155], 'center': [50, 82.5]},
+            # Oversized area container (> 60% total area)
+            {'id': 5, 'confidence': 0.98, 'box': [5, 10, 95, 130], 'center': [50, 70]},
+        ]
+        filtered = BrowserWorker.filter_omni_page_candidates(
+            elements,
+            min_y=76,
+            limit=20,
+            image_width=100,
+            image_height=160,
+            capture_backend='xvfb',
+        )
+        self.assertEqual([item['sourceId'] for item in filtered], [1])
+
     async def test_omniparse_rejects_state_change_during_screenshot_capture(self):
         from PIL import Image
         from browser_logic import VisionPageState
@@ -1486,7 +2303,7 @@ class OmniParseCommandUnitTests(unittest.IsolatedAsyncioTestCase):
         worker.native_click = AsyncMock(return_value=page)
         worker.track_clicked_page = AsyncMock(return_value=page)
 
-        await worker._execute('click @e1', session_id='session-a')
+        await worker._execute('activate @e1', session_id='session-a')
 
         self.assertNotIn('session-a', worker.omni_previews)
 
@@ -1596,6 +2413,50 @@ class OmniParseCommandUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['xvfb_screen_point'], (20.0, 30.0))
         self.assertNotIn('session-a', worker.omni_previews)
         self.assertEqual(result['omniElementId'], 0)
+
+    async def test_coordinate_vision_fill_focuses_and_evaluates_fill_script(self):
+        from browser_logic import VisionPageState
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = FakePage(FakeBrowser(), 'omni-fill-page')
+        worker.pages['session-a'] = page
+        state = VisionPageState(
+            'omni-fill-page', page.url, 390, 844,
+            visual_width=390, visual_height=844,
+        )
+        worker.omni_previews['session-a'] = {
+            'state': state,
+            'imageWidth': 100,
+            'imageHeight': 80,
+            'createdAt': time.monotonic(),
+            'captureBackend': 'xvfb',
+            'elements': [{'id': 1, 'center': [20.0, 30.0]}],
+        }
+        worker.vision_page_state = AsyncMock(return_value=state)
+        worker.configure_download_session = AsyncMock()
+        worker.track_clicked_page = AsyncMock(return_value=page)
+
+        async def click(*args, before_dispatch=None, **kwargs):
+            if before_dispatch:
+                await before_dispatch()
+            return page
+
+        worker.native_click = AsyncMock(side_effect=click)
+        page.evaluate = AsyncMock(return_value=json.dumps({
+            'ok': True, 'tag': 'input', 'id': 'user-input', 'sensitive': False
+        }))
+
+        result = await worker._execute(
+            'vision-fill 20 30 "admin_user"', session_id='session-a'
+        )
+
+        worker.native_click.assert_awaited_once()
+        self.assertEqual(page.evaluate.await_count, 2)
+        self.assertIn('"admin_user"', result['text'])
+        self.assertEqual(result['value'], 'admin_user')
+        self.assertEqual(result['omniElementId'], 1)
+        self.assertNotIn('session-a', worker.omni_previews)
 
 
 class VisionMarkerRenderingUnitTests(unittest.TestCase):
@@ -2783,6 +3644,59 @@ class DropdownOutputUnitTests(unittest.TestCase):
 
 
 class WorkerGuardUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_click_command_is_removed_with_exact_replacements(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r'CLICK_REMOVED.*activate @e42.*vision-click <x> <y>',
+        ):
+            await worker.execute('click @e42', session_id='session-a')
+
+    def test_second_consecutive_unchanged_interaction_is_blocked(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.record_page_progress('session-a', 'press', 'same-state', 'same-state')
+
+        with self.assertRaisesRegex(ValueError, 'NO_PROGRESS_GUARD'):
+            worker.record_page_progress('session-a', 'press', 'same-state', 'same-state')
+
+    def test_changed_page_state_resets_no_progress_counter(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        worker.record_page_progress('session-a', 'press', 'state-a', 'state-a')
+        worker.record_page_progress('session-a', 'fill', 'state-a', 'state-b')
+        worker.record_page_progress('session-a', 'press', 'state-b', 'state-b')
+
+        self.assertEqual(worker.no_progress_counts['session-a'], 1)
+
+    async def test_execute_applies_no_progress_guard_to_repeated_backspace(self):
+        from browser_logic import VisionFallbackContext
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(url='https://example.test/form', _pi_identity_used='android')
+        worker.pages['session-a'] = page
+        worker.page_progress_fingerprint = AsyncMock(
+            side_effect=['unchanged', 'unchanged', 'unchanged', 'unchanged']
+        )
+        worker.bounded_vision_fallback_context = AsyncMock(
+            return_value=VisionFallbackContext('target', page.url, 'loader')
+        )
+        worker._execute = AsyncMock(return_value={'text': 'Pressed Backspace', 'action': 'press'})
+        worker.maybe_fallback_after_action = AsyncMock(
+            side_effect=lambda _sid, _action, _parts, result, _url, _identity: result
+        )
+        worker.attach_action_screenshot = AsyncMock()
+
+        await worker.execute('press Backspace', session_id='session-a')
+        with self.assertRaisesRegex(ValueError, 'NO_PROGRESS_GUARD'):
+            await worker.execute('press Backspace', session_id='session-a')
+
     def test_worker_blocks_third_consecutive_open(self):
         from worker import BrowserWorker
 
@@ -2888,13 +3802,16 @@ class BenchmarkActionPolicyTests(unittest.TestCase):
             ['open', 'file:///tmp/levels.html'],
             ['vision-mark', 'omni'],
             ['vision-click', '120', '240'],
+            ['vision-fill', '120', '240', 'test'],
         )
         for parts in allowed:
             validate_benchmark_action_policy(parts, 'forced-omni')
 
         for parts in (
-            ['screenshot'], ['snapshot', '-i'], ['click', '@e1'],
+            ['screenshot'], ['snapshot', '-i'], ['click', '@e1'], ['activate', '@e1'],
+            ['fill', '@e1', 'hello'], ['type', '@e1', 'hello'],
             ['vision-mark', '120', '240'], ['vision-click', 'preview-token'],
+            ['vision-fill', 'preview-token', 'hello'],
             ['scroll', 'down'],
         ):
             with self.assertRaisesRegex(ValueError, 'BENCHMARK_ACTION_POLICY'):
@@ -2906,9 +3823,11 @@ class BenchmarkActionPolicyTests(unittest.TestCase):
         validate_benchmark_action_policy(['snapshot', '-i'], 'hybrid')
         validate_benchmark_action_policy(['vision-mark', 'omni'], 'hybrid')
         validate_benchmark_action_policy(['vision-click', '120', '240'], 'hybrid')
+        validate_benchmark_action_policy(['vision-fill', '120', '240', 'test'], 'hybrid')
         for parts in (
             ['screenshot'], ['vision-mark', '120', '240'],
-            ['vision-click', 'preview-token'], ['vision-mark-drag', '1', '2', '3', '4'],
+            ['vision-click', 'preview-token'], ['vision-fill', 'preview-token', 'test'],
+            ['vision-mark-drag', '1', '2', '3', '4'],
             ['vision-drag', 'preview-token'], ['vision-long-press', 'preview-token'],
             ['vision-longpress', 'preview-token'],
         ):
@@ -2991,7 +3910,76 @@ class OpenTimeoutUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(worker.pages['session-a'], previous)
 
 
+class ScreenshotFormatUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_screenshot_defaults_to_jpg_for_viewport_and_full(self):
+        from worker import BrowserWorker
+        from PIL import Image
+
+        worker = BrowserWorker()
+        worker.browser = FakeBrowser()
+        page = FakePage(worker.browser, 'tab-shot')
+        page.save_screenshot = AsyncMock()
+
+        async def fake_save(output, format='jpeg', full_page=False):
+            img = Image.new('RGB', (100, 100), color=(100, 150, 200))
+            img.save(output)
+
+        page.save_screenshot.side_effect = fake_save
+        worker.pages['session-a'] = page
+        worker.register_tab(page, 'session-a')
+        worker.vision_page_state = AsyncMock(return_value=SimpleNamespace())
+
+        with patch.dict(os.environ, {'PI_NODRIVER_XVFB_FORWARD_CLICK': '0'}):
+            res_viewport = await worker._execute('screenshot', session_id='session-a')
+            self.assertTrue(Path(res_viewport['screenshotPath']).is_file())
+            self.assertEqual(Path(res_viewport['screenshotPath']).suffix, '.jpg')
+            self.assertIn('JPG', res_viewport['text'])
+
+            res_full = await worker._execute('screenshot --full', session_id='session-a')
+            self.assertTrue(Path(res_full['screenshotPath']).is_file())
+            self.assertEqual(Path(res_full['screenshotPath']).suffix, '.jpg')
+            self.assertIn('JPG', res_full['text'])
+
+            res_png = await worker._execute('screenshot --png', session_id='session-a')
+            self.assertTrue(Path(res_png['screenshotPath']).is_file())
+            self.assertEqual(Path(res_png['screenshotPath']).suffix, '.png')
+
+
 class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_linux_identity_applies_non_mobile_desktop_fit_metrics(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        page = SimpleNamespace(send=AsyncMock())
+        with (
+            patch(
+                'worker.uc.cdp.emulation.set_device_metrics_override',
+                return_value='metrics-command',
+            ) as set_metrics,
+            patch(
+                'worker.uc.cdp.emulation.set_touch_emulation_enabled',
+                return_value='touch-command',
+            ) as set_touch,
+        ):
+            metrics = await worker.apply_identity_viewport(page, 'linux')
+
+        self.assertFalse(metrics['mobile'])
+        self.assertFalse(metrics['touch'])
+        self.assertAlmostEqual(metrics['scale'], 390 / 1280)
+        set_metrics.assert_called_once_with(
+            width=1280,
+            height=2770,
+            device_scale_factor=1.0,
+            mobile=False,
+            scale=390 / 1280,
+        )
+        set_touch.assert_called_once_with(enabled=False)
+        self.assertEqual(
+            [call.args[0] for call in page.send.await_args_list],
+            ['metrics-command', 'touch-command'],
+        )
+        self.assertFalse(page._is_mobile_mode)
+
     async def test_defaults_to_auto_and_switches_only_the_current_session(self):
         from worker import BrowserWorker
 
@@ -3016,6 +4004,7 @@ class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
         android = await worker._execute(
             'browser-mode-switch android', session_id='session-a'
         )
+        worker.origin_linux_routes['session-a'] = {'https://blocked.example': 'login gate'}
         automatic = await worker._execute(
             'browser-mode-switch auto', session_id='session-a'
         )
@@ -3023,6 +4012,7 @@ class BrowserModeSwitchUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(android['browserMode'], 'android')
         self.assertEqual(automatic['browserMode'], 'auto')
         self.assertNotIn('session-a', worker.browser_modes)
+        self.assertNotIn('session-a', worker.origin_linux_routes)
 
     async def test_public_action_bypasses_page_preflight_and_preserves_popup_state(self):
         from worker import BrowserWorker
@@ -4016,6 +5006,56 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertEqual(response['id'], request_id)
                 return response
 
+    def test_get_text_extracts_an_open_pdf(self):
+        with tempfile.TemporaryDirectory() as served:
+            served_root = Path(served)
+            write_pdf_fixture(served_root / 'open-report.pdf')
+            handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=served)
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            try:
+                pdf_url = f'http://127.0.0.1:{server.server_port}/open-report.pdf'
+                self.command(f'open {pdf_url}')
+
+                result = self.command('get text')
+
+                self.assertEqual(result['contentType'], 'application/pdf')
+                self.assertIn('PDF extraction fixture text', result['pageText'])
+                self.assertEqual(result['imageCount'], 1)
+                self.assertTrue(Path(result['pdfPath']).is_file())
+                self.assertTrue(Path(result['pdfImagePaths'][0]).is_file())
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+
+    def test_crawl_extracts_pdf_text_and_embedded_images(self):
+        with tempfile.TemporaryDirectory() as served:
+            served_root = Path(served)
+            write_pdf_fixture(served_root / 'report.pdf')
+            handler = functools.partial(QuietSimpleHTTPRequestHandler, directory=served)
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            try:
+                result = self.command(
+                    f'crawl http://127.0.0.1:{server.server_port}/report.pdf'
+                )
+
+                self.assertEqual(result['successCount'], 1, result)
+                pdf_result = result['results'][0]
+                self.assertEqual(pdf_result['contentType'], 'application/pdf')
+                self.assertIn('PDF extraction fixture text', pdf_result['text'])
+                self.assertEqual(pdf_result['imageCount'], 1)
+                self.assertTrue(Path(pdf_result['pdfImagePaths'][0]).is_file())
+                self.assertIn('Extracted PDF images: 1', result['text'])
+                self.assertIn(f"[[image: {pdf_result['pdfImagePaths'][0]}]]", result['text'])
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+
     def test_get_text_and_crawl_expose_ranked_image_candidates_from_rendered_dom(self):
         handler = functools.partial(
             QuietSimpleHTTPRequestHandler,
@@ -4114,7 +5154,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
         button_line = next(line for line in snapshot.splitlines() if 'Go now' in line)
         button_ref = button_line.split()[0]
-        self.command(f'click {button_ref}')
+        self.command(f'activate {button_ref}')
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
@@ -4126,7 +5166,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         page_text = self.command('get text')['text']
         self.assertIn('clicked', page_text)
 
-    def test_browser_mode_switch_linux_opens_directly_with_native_linux_identity(self):
+    def test_browser_mode_switch_linux_opens_with_native_linux_desktop_fit(self):
         requests = []
 
         class IdentityHandler(http.server.BaseHTTPRequestHandler):
@@ -4161,10 +5201,14 @@ class WorkerIntegrationTests(unittest.TestCase):
             self.assertNotIn('Android', page_agents[0])
 
             identity_fixture = (ROOT / 'tests/fixture_browser_identity.html').as_uri()
-            self.command(f'open {identity_fixture}')
+            identity_result = self.command(f'open {identity_fixture}')
             identity = self.command('get text')['text']
-            self.assertIn('touchPoints=1', identity)
-            self.assertIn('innerWidth=390', identity)
+            self.assertIn('touchPoints=0', identity)
+            self.assertIn('innerWidth=1280', identity)
+            self.assertFalse(identity_result['mobileMode'])
+            self.assertFalse(identity_result['touchEmulation'])
+            self.assertEqual(identity_result['layoutWidth'], 1280)
+            self.assertEqual(identity_result['frameWidth'], 390)
         finally:
             self.command('browser-mode-switch auto')
             server.shutdown()
@@ -4255,6 +5299,267 @@ class WorkerIntegrationTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
+
+    def test_auto_mode_routes_only_a_login_gated_origin_through_linux(self):
+        first_requests = []
+        second_requests = []
+
+        class UaGatedHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                first_requests.append((handler_self.path, user_agent))
+                if 'Android' in user_agent:
+                    body = (
+                        '<form><h1>會員登入後才能看商品</h1>'
+                        '<input name="member" autocomplete="username">'
+                        '<input type="password" autocomplete="current-password">'
+                        '<button type="button">登入</button></form>'
+                    )
+                else:
+                    body = '<h1>Linux product ready</h1><button>加入購物車</button>'
+                payload = f'<!doctype html><title>UA shop</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        class OtherOriginHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                second_requests.append((handler_self.path, user_agent))
+                payload = b'<!doctype html><title>Other</title><body><button>Continue</button></body>'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        first = http.server.ThreadingHTTPServer(('127.0.0.1', 0), UaGatedHandler)
+        second = http.server.ThreadingHTTPServer(('127.0.0.1', 0), OtherOriginHandler)
+        threads = [
+            threading.Thread(target=first.serve_forever, daemon=True),
+            threading.Thread(target=second.serve_forever, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            origin = f'http://127.0.0.1:{first.server_port}'
+            result = self.command(f'open {origin}/product')
+            self.assertEqual(result['identityUsed'], 'linux-fallback')
+            self.assertEqual(result['fallbackReason'], 'login gate')
+            self.assertEqual(result['browserMode'], 'auto')
+            self.assertEqual(result['originMode'], 'linux')
+            self.assertTrue(result['originPinnedLinux'])
+            self.assertIn('加入購物車', result['text'])
+
+            same_origin = self.command(f'open {origin}/next')
+            self.assertEqual(same_origin['identityUsed'], 'linux')
+            self.assertEqual(same_origin['browserMode'], 'auto')
+            self.assertEqual(same_origin['originMode'], 'linux')
+
+            other_origin = self.command(
+                f'open http://127.0.0.1:{second.server_port}/elsewhere'
+            )
+            self.assertEqual(other_origin['identityUsed'], 'android')
+            self.assertEqual(other_origin['originMode'], 'android')
+
+            product_agents = [ua for path, ua in first_requests if path == '/product']
+            self.assertEqual(len(product_agents), 2)
+            self.assertIn('Android', product_agents[0])
+            self.assertIn('X11; Linux x86_64', product_agents[1])
+            next_agents = [ua for path, ua in first_requests if path == '/next']
+            self.assertTrue(next_agents)
+            self.assertIn('X11; Linux x86_64', next_agents[0])
+            self.assertIn('Android', second_requests[0][1])
+        finally:
+            for server in (first, second):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+    def test_redirect_gate_pins_both_requested_and_gate_origins(self):
+        first_requests = []
+        second_requests = []
+
+        class ProductHandler(http.server.BaseHTTPRequestHandler):
+            login_url = ''
+
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                first_requests.append((handler_self.path, user_agent))
+                if 'Android' in user_agent:
+                    handler_self.send_response(302)
+                    handler_self.send_header('Location', type(handler_self).login_url)
+                    handler_self.end_headers()
+                    return
+                payload = b'<!doctype html><title>Product</title><body><button>Buy</button></body>'
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        class LoginOriginHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                second_requests.append((handler_self.path, user_agent))
+                if handler_self.path == '/login':
+                    body = (
+                        '<form><h1>會員登入</h1><input autocomplete="username">'
+                        '<input type="password"><button>登入</button></form>'
+                    )
+                else:
+                    body = '<button>Login-origin content</button>'
+                payload = f'<!doctype html><title>Login</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        first = http.server.ThreadingHTTPServer(('127.0.0.1', 0), ProductHandler)
+        second = http.server.ThreadingHTTPServer(('127.0.0.1', 0), LoginOriginHandler)
+        ProductHandler.login_url = f'http://127.0.0.1:{second.server_port}/login'
+        threads = [
+            threading.Thread(target=first.serve_forever, daemon=True),
+            threading.Thread(target=second.serve_forever, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            product_url = f'http://127.0.0.1:{first.server_port}/product'
+            result = self.command(f'open {product_url}')
+            self.assertEqual(result['identityUsed'], 'linux-fallback')
+            self.assertEqual(result['fallbackReason'], 'login gate')
+
+            gate_origin = self.command(
+                f'open http://127.0.0.1:{second.server_port}/content'
+            )
+            self.assertEqual(gate_origin['identityUsed'], 'linux')
+            content_agents = [ua for path, ua in second_requests if path == '/content']
+            self.assertEqual(len(content_agents), 1)
+            self.assertIn('X11; Linux x86_64', content_agents[0])
+        finally:
+            for server in (first, second):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+    def test_post_click_login_gate_reopens_in_linux_without_replaying_click(self):
+        requests = []
+
+        class ModalGateHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                requests.append((handler_self.path, user_agent))
+                if 'Android' in user_agent:
+                    body = (
+                        '<h1>Android product</h1><button id="cart" '
+                        'onclick="login.hidden=false">加入購物車</button>'
+                        '<div id="login" role="dialog" hidden><h2>會員登入</h2>'
+                        '<input autocomplete="username"><input type="password">'
+                        '<button>登入</button></div>'
+                    )
+                else:
+                    body = (
+                        '<h1>Linux product</h1><button id="cart" '
+                        'onclick="status.textContent=\'replayed\'">加入購物車</button>'
+                        '<output id="status">not-replayed</output>'
+                    )
+                payload = f'<!doctype html><title>Product</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), ModalGateHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}/product'
+            opened = self.command(f'open {url}')
+            self.assertEqual(opened['identityUsed'], 'android')
+            cart_ref = next(
+                line.split()[0] for line in opened['text'].splitlines()
+                if '加入購物車' in line
+            )
+
+            clicked = self.command(f'activate {cart_ref}')
+            self.assertEqual(clicked['identityUsed'], 'linux-fallback')
+            self.assertEqual(clicked['fallbackReason'], 'login gate')
+            self.assertTrue(clicked['originPinnedLinux'])
+            self.assertIn('加入購物車', clicked['text'])
+            self.assertIn('not-replayed', self.command('get text')['text'])
+            product_agents = [ua for path, ua in requests if path == '/product']
+            self.assertEqual(len(product_agents), 2)
+            self.assertIn('Android', product_agents[0])
+            self.assertIn('X11; Linux x86_64', product_agents[1])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_intentional_login_click_does_not_trigger_identity_fallback(self):
+        requests = []
+
+        class IntentionalLoginHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                requests.append((handler_self.path, user_agent))
+                body = (
+                    '<a id="loginButton" href="#login" aria-label="會員登入" '
+                    'onclick="event.preventDefault();login.hidden=false"><svg></svg></a>'
+                    '<div id="login" role="dialog" hidden><h2>會員登入</h2>'
+                    '<input autocomplete="username"><input type="password">'
+                    '<button>登入</button></div>'
+                )
+                payload = f'<!doctype html><title>Account</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), IntentionalLoginHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            opened = self.command(f'open http://127.0.0.1:{server.server_port}/account')
+            login_ref = next(
+                line.split()[0] for line in opened['text'].splitlines()
+                if '會員登入' in line
+            )
+            clicked = self.command(f'activate {login_ref}')
+            self.assertNotIn('fallbackReason', clicked)
+            page_requests = [ua for path, ua in requests if path == '/account']
+            self.assertEqual(len(page_requests), 1)
+            self.assertIn('Android', page_requests[0])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_open_waits_for_asynchronously_rendered_android_challenge(self):
         requests = []
@@ -4347,30 +5652,32 @@ class WorkerIntegrationTests(unittest.TestCase):
         fixture_url = (ROOT / 'tests/fixture_viewport.html').as_uri()
         self.command(f'open {fixture_url}')
 
+        full_snapshot = self.command('snapshot -i --full')['text']
+        middle_ref = next(line for line in full_snapshot.splitlines() if 'Middle viewport action' in line).split()[0]
+        bottom_ref = next(line for line in full_snapshot.splitlines() if 'Bottom viewport action' in line).split()[0]
+
         top_snapshot = self.command('snapshot -i')['text']
         self.assertIn('Top viewport action', top_snapshot)
         self.assertNotIn('Middle viewport action', top_snapshot)
         self.assertNotIn('Bottom viewport action', top_snapshot)
         top_ref = next(line for line in top_snapshot.splitlines() if 'Top viewport action' in line).split()[0]
-        self.command(f'click {top_ref}')
+        self.command(f'activate {top_ref}')
         self.assertIn('top-clicked', self.command('get text')['text'])
 
-        self.command('scroll down 1000')
+        self.command(f'scroll to {middle_ref}')
         middle_snapshot = self.command('snapshot -i')['text']
         self.assertNotIn('Top viewport action', middle_snapshot)
         self.assertIn('Middle viewport action', middle_snapshot)
         self.assertNotIn('Bottom viewport action', middle_snapshot)
-        middle_ref = next(line for line in middle_snapshot.splitlines() if 'Middle viewport action' in line).split()[0]
-        self.command(f'click {middle_ref}')
+        self.command(f'activate {middle_ref}')
         self.assertIn('middle-clicked', self.command('get text')['text'])
 
-        self.command('scroll down 1000')
+        self.command(f'scroll to {bottom_ref}')
         bottom_snapshot = self.command('snapshot -i')['text']
         self.assertNotIn('Top viewport action', bottom_snapshot)
         self.assertNotIn('Middle viewport action', bottom_snapshot)
         self.assertIn('Bottom viewport action', bottom_snapshot)
-        bottom_ref = next(line for line in bottom_snapshot.splitlines() if 'Bottom viewport action' in line).split()[0]
-        self.command(f'click {bottom_ref}')
+        self.command(f'activate {bottom_ref}')
         self.assertIn('bottom-clicked', self.command('get text')['text'])
 
     def test_main_frame_fill_preserves_per_character_input_semantics(self):
@@ -4395,16 +5702,26 @@ class WorkerIntegrationTests(unittest.TestCase):
             line for line in snapshot.splitlines()
             if '<label>' in line and 'Profile name' in line
         ).split()[0]
+        orphan_ref = next(
+            line for line in snapshot.splitlines()
+            if '<label>' in line and 'Orphan unassociated label' in line
+        ).split()[0]
         self.command(f'fill {phone_ref} 0000000000')
 
-        rejected = self.command_raw(f'fill {label_ref} "Pi Qwen"')
+        # Label with associated input forwards fill to its control
+        forwarded = self.command(f'fill {label_ref} "Pi Qwen"')
+        self.assertIn('Pi Qwen', forwarded['text'])
 
+        # Label without associated input is rejected
+        rejected = self.command_raw(f'fill {orphan_ref} "Fail Text"')
         self.assertFalse(rejected['ok'])
         self.assertIn('not text-editable', rejected['error'])
+
         updated = self.command('snapshot -i')['text']
         phone_line = next(line for line in updated.splitlines() if 'Phone number' in line)
+        profile_line = next(line for line in updated.splitlines() if 'Profile name' in line and '<input>' in line)
         self.assertIn('"0000000000"', phone_line)
-        self.assertNotIn('Pi Qwen', phone_line)
+        self.assertIn('"Pi Qwen"', profile_line)
 
     def test_password_fill_and_snapshot_do_not_echo_the_secret(self):
         self.open_form_safety_fixture()
@@ -4417,7 +5734,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
         filled = self.command(f'fill {password_ref} "{secret}"')
         updated = self.command('snapshot -i')['text']
-        clicked = self.command(f'click {password_ref}')
+        clicked = self.command(f'activate {password_ref}')
         js_clicked = self.command(f'click-js {password_ref}')
 
         self.assertNotIn(secret, filled['text'])
@@ -4440,7 +5757,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
         filled = self.command(f'fill {password_ref} "{secret}"')
         updated = self.command('snapshot -i')['text']
-        clicked = self.command(f'click {password_ref}')
+        clicked = self.command(f'activate {password_ref}')
         js_clicked = self.command(f'click-js {password_ref}')
 
         for output in (filled['text'], updated, clicked['text'], js_clicked['text']):
@@ -4480,7 +5797,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         ).split()[0]
         secret = 'prefilled-private-test-password'
 
-        clicked = self.command(f'click {password_ref}')
+        clicked = self.command(f'activate {password_ref}')
         updated = self.command('snapshot -i')['text']
 
         self.assertNotIn(secret, snapshot)
@@ -4789,11 +6106,11 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('control="checkbox"', disabled_line)
         self.assertIn('checked="true"', disabled_line)
         self.assertIn('disabled="true"', disabled_line)
-        disabled_click = self.command_raw(f'click {disabled_line.split()[0]}')
+        disabled_click = self.command_raw(f'activate {disabled_line.split()[0]}')
         self.assertFalse(disabled_click['ok'])
         self.assertIn('disabled', disabled_click['error'])
 
-        self.command(f'click {terms_line.split()[0]}')
+        self.command(f'activate {terms_line.split()[0]}')
         updated = self.command('snapshot -i')['text']
         updated_terms = next(line for line in updated.splitlines() if 'Required terms' in line)
         self.assertIn('checked="true"', updated_terms)
@@ -4930,7 +6247,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             if 'Select exactly: ' in line
         )
 
-        self.command(f'click {reorder_ref}')
+        self.command(f'activate {reorder_ref}')
         stale = self.command_raw(exact_command)
 
         self.assertFalse(stale['ok'])
@@ -5063,8 +6380,8 @@ class WorkerIntegrationTests(unittest.TestCase):
             shrink_ref = next(line for line in snapshot.splitlines() if 'Shrink configurator' in line).split()[0]
             child_ref = next(line for line in snapshot.splitlines() if 'Offscreen 9950X3D control' in line).split()[0]
 
-            self.command(f'click {shrink_ref}')
-            blocked = self.command_raw(f'click {child_ref}')
+            self.command(f'activate {shrink_ref}')
+            blocked = self.command_raw(f'activate {child_ref}')
 
             self.assertTrue(blocked['ok'])
             self.assertEqual(blocked['action'], 'stale-ref-recovery')
@@ -5092,7 +6409,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertIn('offscreen="true"', bottom_line)
 
         bottom_ref = bottom_line.split()[0]
-        self.command(f'click {bottom_ref}')
+        self.command(f'activate {bottom_ref}')
         self.assertIn('bottom-clicked', self.command('get text')['text'])
 
     def test_download_info_describes_a_snapshot_target_without_clicking(self):
@@ -5143,7 +6460,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             self.command(f'open http://127.0.0.1:{server.server_port}/fixture.html')
             snapshot = self.command('snapshot -i')['text']
             download_ref = next(line for line in snapshot.splitlines() if 'Download sample report' in line).split()[0]
-            self.command(f'click {download_ref}')
+            self.command(f'activate {download_ref}')
 
             result = self.command('wait-download 5000')
 
@@ -5207,7 +6524,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         button_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
 
         started = time.monotonic()
-        self.command(f'click {button_ref}')
+        self.command(f'activate {button_ref}')
 
         self.assertLess(time.monotonic() - started, 0.75)
         self.assertIn('clicked', self.status())
@@ -5218,9 +6535,49 @@ class WorkerIntegrationTests(unittest.TestCase):
         button_ref = next(line for line in snapshot.splitlines() if 'Start noisy updates' in line).split()[0]
 
         started = time.monotonic()
-        self.command(f'click {button_ref}')
+        self.command(f'activate {button_ref}')
 
         self.assertLess(time.monotonic() - started, 0.9)
+
+    def test_popup_keeps_native_linux_identity_without_replaying_its_request(self):
+        popup_requests = []
+
+        class PopupIdentityHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                user_agent = handler_self.headers.get('User-Agent', '')
+                if handler_self.path == '/popup':
+                    popup_requests.append(user_agent)
+                    identity = 'Android popup' if 'Android' in user_agent else 'Linux popup'
+                    body = f'<h1>{identity}</h1><button>Continue</button>'
+                else:
+                    body = '<button onclick="window.open(\'/popup\', \'_blank\')">Open popup</button>'
+                payload = f'<!doctype html><title>Popup identity</title><body>{body}</body>'.encode()
+                handler_self.send_response(200)
+                handler_self.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler_self.send_header('Content-Length', str(len(payload)))
+                handler_self.end_headers()
+                handler_self.wfile.write(payload)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), PopupIdentityHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            opened = self.command(f'open http://127.0.0.1:{server.server_port}/')
+            popup_ref = next(
+                line.split()[0] for line in opened['text'].splitlines()
+                if 'Open popup' in line
+            )
+            self.command(f'activate {popup_ref}')
+            self.assertIn('Linux popup', self.command('get text')['text'])
+            self.assertEqual(len(popup_requests), 1)
+            self.assertIn('X11; Linux x86_64', popup_requests[0])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_click_switches_to_a_new_tab_without_fixed_two_second_wait(self):
         self.open_fixture()
@@ -5228,7 +6585,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         link_ref = next(line for line in snapshot.splitlines() if 'Open report' in line).split()[0]
 
         started = time.monotonic()
-        result = self.command(f'click {link_ref}')
+        result = self.command(f'activate {link_ref}')
 
         self.assertLess(time.monotonic() - started, 1.25)
         self.assertIn('fixture_new_tab.html', result['url'])
@@ -5238,11 +6595,11 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
         popup_snapshot = self.command('snapshot -i')['text']
         complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete login' in line).split()[0]
 
-        result = self.command(f'click {complete_ref}')
+        result = self.command(f'activate {complete_ref}')
 
         self.assertIn('fixture.html', result['url'])
         self.assertIn('oauth-complete', self.status())
@@ -5251,7 +6608,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
 
         result = self.command('wait-popup 100')
 
@@ -5261,7 +6618,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
         popup_snapshot = self.command('snapshot -i')['text']
         nested_ref = next(line for line in popup_snapshot.splitlines() if 'Open nested OAuth' in line).split()[0]
         self.command(f'click-js {nested_ref}')
@@ -5285,7 +6642,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
 
         result = self.command('switch opener')
 
@@ -5296,10 +6653,10 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
         popup_snapshot = self.command('snapshot -i')['text']
         complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
-        self.command(f'click {complete_ref}')
+        self.command(f'activate {complete_ref}')
         time.sleep(1)
 
         page_text = self.status()
@@ -5310,10 +6667,10 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
         popup_snapshot = self.command('snapshot -i')['text']
         complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
-        self.command(f'click {complete_ref}')
+        self.command(f'activate {complete_ref}')
         time.sleep(1)
 
         result = self.command('wait-popup-close 100')
@@ -5324,10 +6681,10 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         popup_ref = next(line for line in snapshot.splitlines() if 'Open OAuth login' in line).split()[0]
-        self.command(f'click {popup_ref}')
+        self.command(f'activate {popup_ref}')
         popup_snapshot = self.command('snapshot -i')['text']
         complete_ref = next(line for line in popup_snapshot.splitlines() if 'Complete delayed login' in line).split()[0]
-        self.command(f'click {complete_ref}')
+        self.command(f'activate {complete_ref}')
 
         result = self.command('wait-popup-close 2000')
 
@@ -5339,7 +6696,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         snapshot = self.command('snapshot -i')['text']
         button_ref = next(line for line in snapshot.splitlines() if 'Open delayed report' in line).split()[0]
 
-        result = self.command(f'click {button_ref}')
+        result = self.command(f'activate {button_ref}')
 
         self.assertIn('fixture_new_tab.html', result['url'])
         self.assertIn('New tab report ready', self.status())
@@ -5356,7 +6713,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         snapshot = self.command('snapshot -i')['text']
         button_ref = next(line for line in snapshot.splitlines() if 'Open named report' in line).split()[0]
 
-        result = self.command(f'click {button_ref}')
+        result = self.command(f'activate {button_ref}')
 
         self.assertIn('fixture_new_tab.html', result['url'])
         self.assertIn('New tab report ready', self.status())
@@ -5370,7 +6727,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         snapshot = self.command('snapshot -i')['text']
         form_ref = next(line for line in snapshot.splitlines() if 'Open named report' in line).split()[0]
 
-        result = self.command(f'click {form_ref}')
+        result = self.command(f'activate {form_ref}')
 
         self.assertIn('fixture_new_tab.html', result['url'])
         self.assertIn('New tab report ready', self.status())
@@ -5380,14 +6737,14 @@ class WorkerIntegrationTests(unittest.TestCase):
         snapshot = self.command('snapshot -i')['text']
         custom_lines = [line for line in snapshot.splitlines() if 'Custom checkout' in line]
         self.assertEqual(len(custom_lines), 1)
-        self.command(f'click {custom_lines[0].split()[0]}')
+        self.command(f'activate {custom_lines[0].split()[0]}')
         self.assertIn('custom-clicked', self.status())
 
     def test_snapshot_and_ref_click_support_open_shadow_dom(self):
         self.open_fixture()
         snapshot = self.command('snapshot -i')['text']
         shadow_line = next(line for line in snapshot.splitlines() if 'Shadow action' in line)
-        self.command(f'click {shadow_line.split()[0]}')
+        self.command(f'activate {shadow_line.split()[0]}')
         self.assertIn('shadow-clicked', self.status())
 
     def test_hidden_shadow_host_blocks_stale_semantic_ref(self):
@@ -5396,7 +6753,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         shadow_ref = next(line for line in snapshot.splitlines() if 'Shadow action' in line).split()[0]
         hide_ref = next(line for line in snapshot.splitlines() if 'Hide shadow host' in line).split()[0]
 
-        self.command(f'click {hide_ref}')
+        self.command(f'activate {hide_ref}')
         blocked = self.command_raw(f'click-js {shadow_ref}')
 
         self.assertFalse(blocked['ok'])
@@ -5424,7 +6781,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
         raw_click = self.command_raw('click 300 330')
         self.assertFalse(raw_click['ok'])
-        self.assertIn('VISION_CLICK_GUARD', raw_click['error'])
+        self.assertIn('CLICK_REMOVED', raw_click['error'])
         self.assertIn('vision-idle', self.command('get text')['text'])
 
         clean = self.command('screenshot')
@@ -5511,7 +6868,7 @@ class WorkerIntegrationTests(unittest.TestCase):
         snapshot = self.command('snapshot -i')['text']
         go_ref = next(line for line in snapshot.splitlines() if 'Go now' in line).split()[0]
         disable_ref = next(line for line in snapshot.splitlines() if 'Disable go' in line).split()[0]
-        self.command(f'click {disable_ref}')
+        self.command(f'activate {disable_ref}')
 
         disabled_result = self.command_raw(f'click-js {go_ref}')
         self.assertFalse(disabled_result['ok'])

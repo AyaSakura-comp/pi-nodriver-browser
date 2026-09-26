@@ -87,20 +87,44 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("'browser-mode-switch'", worker_source)
         self.assertIn('`browser-mode-switch`', readme_source)
         self.assertIn('session-scoped', readme_source)
+        self.assertIn('pins only that origin', extension_source)
+        self.assertIn('Unexpected post-click login gates', readme_source)
+        self.assertIn('origin_linux_routes', worker_source)
 
-    def test_mobile_profile_uses_android_chrome_identity_with_touch_emulation(self):
+    def test_identity_profiles_keep_android_mobile_and_make_linux_desktop_fit(self):
+        browser_logic_source = (ROOT / 'browser_logic.py').read_text()
         worker_source = (ROOT / 'worker.py').read_text()
         stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()
         open_action = worker_source.split("        if action == 'open':", 1)[1].split("        if action == 'mobile':", 1)[0]
 
-        self.assertIn("platform='Android'", open_action)
-        self.assertIn('user_agent_metadata=metadata', open_action)
-        self.assertIn('set_user_agent_override', open_action)
-        self.assertIn('set_touch_emulation_enabled(enabled=True)', open_action)
+        self.assertIn("platform='Android'", worker_source)
+        self.assertIn('user_agent_metadata=metadata', worker_source)
+        self.assertIn('set_user_agent_override', worker_source)
+        self.assertIn('apply_android_user_agent(page)', open_action)
+        self.assertIn("identity_viewport_metrics(identity)", worker_source)
+        self.assertIn("apply_identity_viewport(page, identity_used)", worker_source)
+        self.assertIn("'mobile': True", browser_logic_source)
+        self.assertIn("'touch': True", browser_logic_source)
+        self.assertIn("'mobile': False", browser_logic_source)
+        self.assertIn("'touch': False", browser_logic_source)
         self.assertNotIn('iPhone OS', open_action)
         self.assertNotIn('Safari/604.1', open_action)
         self.assertNotIn('NVIDIA GeForce RTX 4070', stealth_source)
         self.assertNotIn('fakePlugins', stealth_source)
+
+    def test_agent_guidance_and_runtime_exclude_relative_vertical_scrolling(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        self.assertNotIn('scroll down', extension_source.lower())
+        self.assertNotIn('scroll up', extension_source.lower())
+        self.assertNotIn('scroll <down|up', extension_source.lower())
+        self.assertNotIn('scroll <down|up', readme_source.lower())
+        self.assertNotIn("direction === 'down'", worker_source)
+        self.assertNotIn("direction === 'up'", worker_source)
+        self.assertIn('scroll to @ref', extension_source)
+        self.assertIn('snapshot -i --full', extension_source)
 
     def test_ref_guidance_uses_literal_examples_and_never_teaches_angle_wrapped_refs(self):
         extension_source = (ROOT / 'index.ts').read_text()
@@ -108,13 +132,15 @@ class InstallerTests(unittest.TestCase):
         readme_source = (ROOT / 'README.md').read_text()
 
         self.assertIn('REF SYNTAX IS LITERAL', extension_source)
-        self.assertIn("click @e16", extension_source)
+        self.assertIn("activate @e16", extension_source)
+        self.assertNotIn("  click @e16 -", extension_source)
+        self.assertIn("vision-click <x> <y>", extension_source)
         self.assertIn("fill @e6", extension_source)
         self.assertIn('never wrap refs in', extension_source)
         self.assertNotIn('<@ref>', extension_source)
         self.assertNotIn('<@ref>', readme_source)
         self.assertNotIn('usage: click <@ref>', worker_source)
-        self.assertIn('usage: click @e1', worker_source)
+        self.assertIn('usage: activate @e1', worker_source)
         self.assertIn('do not include < or >', worker_source)
         self.assertIn('To enter text, use fill or type with a literal ref', extension_source)
         self.assertNotIn('Press Enter, Tab, Space, Backspace, or text', extension_source)
@@ -129,7 +155,7 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn('three consecutive legitimate semantic', source)
             self.assertNotIn('VISION_FALLBACK_LOCKED', source)
         self.assertIn('vision-mark <x> <y>', extension_source)
-        self.assertIn('without deliberately failing semantic clicks', extension_source)
+        self.assertIn('without deliberately failing semantic actions', extension_source)
 
     def test_default_visual_fallback_is_configurable_and_prefers_omni(self):
         extension_source = (ROOT / 'index.ts').read_text()
@@ -161,6 +187,74 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('authoritative and may be used immediately', worker_source)
         self.assertIn('same origin', readme_source)
         self.assertNotIn('run snapshot -i once to unlock ref commands', extension_source)
+
+    def test_documents_two_attempt_no_progress_guard(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        worker_source = (ROOT / 'worker.py').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        for source in (extension_source, worker_source, readme_source):
+            self.assertIn('NO_PROGRESS_GUARD', source)
+        self.assertIn('NO_PROGRESS_LIMIT = 2', worker_source)
+        self.assertIn('page content', extension_source.lower())
+
+    def test_enforces_url_provenance_for_browser_open(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+
+        self.assertIn('URL_PROVENANCE_GUARD', extension_source)
+        self.assertIn('pi.on("tool_call"', extension_source)
+        self.assertIn('pi.on("tool_result"', extension_source)
+        self.assertIn('pi.on("input"', extension_source)
+        self.assertIn('google_search', extension_source)
+        self.assertIn('web_search', extension_source)
+        self.assertIn('Only URLs supplied verbatim by the user or returned by successful', extension_source)
+
+    def test_injects_url_provenance_rule_into_system_prompt(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+
+        self.assertIn('pi.on("before_agent_start"', extension_source)
+        self.assertIn('MANDATORY URL PROVENANCE RULE', extension_source)
+        self.assertIn('If the user supplied an exact HTTP(S) URL', extension_source)
+        self.assertIn('If search returns no usable parent URL, stop', extension_source)
+        self.assertIn('navigate through visible links', extension_source)
+
+    def test_registers_temporary_pdf_wiki_query_tool(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+
+        self.assertIn('name: "pdf_query"', extension_source)
+        self.assertIn('pdf-query ${JSON.stringify', extension_source)
+        self.assertIn('full PDF text is withheld', extension_source)
+        self.assertIn('query the temporary PDF wiki', extension_source)
+
+    def test_documents_pdf_crawl_text_and_embedded_image_extraction(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        for source in (extension_source, readme_source):
+            self.assertIn('PDF', source)
+            self.assertIn('embedded images', source)
+        self.assertIn('crawl supports direct PDF URLs', extension_source)
+        self.assertIn('get text extracts the open PDF', extension_source)
+
+    def test_installer_and_docs_diagnose_pdf_runtime_dependencies(self):
+        installer_source = (ROOT / 'install.sh').read_text()
+        readme_source = (ROOT / 'README.md').read_text()
+
+        for dependency in ('pdftotext', 'pdfimages', 'FTS5'):
+            self.assertIn(dependency, installer_source)
+            self.assertIn(dependency, readme_source)
+        self.assertIn('poppler-utils', installer_source)
+        self.assertIn('without blocking non-PDF installation', readme_source)
+        self.assertIn('await worker.cleanupSession(', (ROOT / 'index.ts').read_text())
+
+    def test_pdf_query_limit_schema_is_integer(self):
+        extension_source = (ROOT / 'index.ts').read_text()
+        pdf_tool = extension_source.split('name: "pdf_query"', 1)[1].split(
+            'name: "crawl"', 1
+        )[0]
+
+        self.assertIn('Type.Integer', pdf_tool)
+        self.assertNotIn('Type.Number', pdf_tool)
 
     def test_installs_parallel_image_delivery_and_incidental_crawl_image_guidance(self):
         extension_source = (ROOT / 'index.ts').read_text()

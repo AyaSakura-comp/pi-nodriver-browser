@@ -216,11 +216,11 @@ class LoopGuardTests(unittest.TestCase):
 
     def test_different_command_resets_the_counter(self):
         self.repeat('wait 3000', 2)
-        self.repeat('scroll down', 1)
+        self.repeat('scroll to 600', 1)
         self.repeat('wait 3000', 2)
 
     def test_state_changing_commands_may_repeat_freely(self):
-        self.repeat('scroll down', 10)
+        self.repeat('scroll to 600', 10)
         self.repeat('press Enter', 10)
 
     def test_guard_is_per_session(self):

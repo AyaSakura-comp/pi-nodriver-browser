@@ -43,7 +43,7 @@ SUPPORTED_ACTIONS = {
     'pdf-query', 'session-cleanup',
     'fill-submit', 'fill_submit', 'find-option', 'get', 'google-search', 'long-press', 'longpress', 'mobile', 'omniparse', 'open', 'press', 'press-hold', 'screenshot',
     'scroll', 'select', 'shutdown', 'snapshot', 'switch', 'touch-drift', 'type', 'upload',
-    'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
+    'vision-click', 'vision-drag', 'vision-fill', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
 # Strip WAYLAND_DISPLAY so Ozone/Chrome and child processes bind strictly to X11 under Xvfb
@@ -251,6 +251,14 @@ IMAGE_IPV4_TRANSLATABLE = ipaddress.ip_network('::ffff:0:0:0/96')
 # Commands that observe the page without changing it. Repeating one of these
 # verbatim cannot produce new information, so an identical repeat is a loop.
 NON_PROGRESSING_ACTIONS = {'wait', 'snapshot', 'screenshot', 'omniparse', 'vision-mark', 'get', 'downloads', 'download-info', 'find-option'}
+PAGE_PROGRESS_ACTIONS = {
+    'activate', 'click-css', 'click-js', 'click-text', 'close', 'dismiss', 'fill',
+    'fill-submit', 'fill_submit', 'long-press', 'longpress', 'open', 'press',
+    'press-hold', 'scroll', 'select', 'switch', 'touch-drift', 'type', 'upload',
+    'vision-click', 'vision-drag', 'vision-long-press', 'vision-longpress',
+    'wait-popup', 'wait-popup-close',
+}
+NO_PROGRESS_LIMIT = 2
 REPEAT_LIMIT = 3
 VISION_INVALIDATING_ACTIONS = {
     'activate', 'click-css', 'click-js', 'click-text', 'close', 'dismiss', 'download',
@@ -283,34 +291,52 @@ def validate_benchmark_action_policy(parts, policy):
             coordinate_click = all(math.isfinite(float(value)) for value in parts[1:])
         except ValueError:
             coordinate_click = False
+
+    coordinate_fill = False
+    if action == 'vision-fill' and len(parts) >= 4:
+        try:
+            coordinate_fill = all(math.isfinite(float(value)) for value in parts[1:3])
+        except ValueError:
+            coordinate_fill = False
+
     if policy == 'forced-omni':
         allowed = (
             action == 'open'
             or coordinate_click
+            or coordinate_fill
             or (action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni')
         )
     elif policy == 'semantic-manual':
         allowed = not (
             action in {'omniparse'}
             or (action == 'vision-mark' and len(parts) == 2 and parts[1].lower() == 'omni')
+            or (action == 'vision-click' and coordinate_click)
+            or (action == 'vision-fill' and coordinate_fill)
         )
     elif policy == 'hybrid':
         manual_mark = action == 'vision-mark' and not (
             len(parts) == 2 and parts[1].lower() == 'omni'
         )
         manual_click = action == 'vision-click' and not coordinate_click
+        manual_fill = action == 'vision-fill' and not coordinate_fill
         other_vision_action = action.startswith('vision-') and action not in {
-            'vision-click', 'vision-mark'
+            'vision-click', 'vision-mark', 'vision-fill'
         }
         allowed = (
             action != 'screenshot'
             and not manual_mark
             and not manual_click
+            and not manual_fill
             and not other_vision_action
         )
     else:
         raise ValueError(f'unknown benchmark action policy: {policy}')
     if not allowed:
+        if policy == 'forced-omni' and action in ('fill', 'type'):
+            raise ValueError(
+                'BENCHMARK_ACTION_POLICY: standard fill/type is not allowed in forced-omni mode. '
+                'Use vision-fill <x> <y> "text" with exact center coordinates from vision-mark omni.'
+            )
         raise ValueError(
             f'BENCHMARK_ACTION_POLICY: {action} is not allowed in {policy} mode'
         )
@@ -1404,24 +1430,45 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
     target.dispatchEvent(new view.Event('change', { bubbles: true, cancelable: true }));
   };
   const setText = (target, text, append = false) => {
-    if (target.tagName === 'LABEL') return { ok: false, mutated: false, complete: false };
     const view = target.ownerDocument.defaultView;
     const textInputTypes = new Set([
       'text', 'search', 'email', 'tel', 'url', 'password', 'number',
       'date', 'month', 'week', 'time', 'datetime-local'
     ]);
-    const editable = () => {
-      if (target.matches?.(':disabled') || target.getAttribute?.('aria-disabled') === 'true') {
-        return false;
+    const isControlEditable = el => Boolean(
+      el &&
+      el.tagName !== 'LABEL' &&
+      !el.matches?.(':disabled') &&
+      el.getAttribute?.('aria-disabled') !== 'true' && (
+        (el instanceof view.HTMLInputElement && !el.readOnly &&
+          textInputTypes.has(String(el.type || 'text').toLowerCase())) ||
+        (el instanceof view.HTMLTextAreaElement && !el.readOnly) ||
+        el.isContentEditable
+      )
+    );
+    if (!isControlEditable(target)) {
+      if (target.tagName === 'LABEL') {
+        const doc = target.ownerDocument;
+        const forId = target.getAttribute?.('for');
+        const associated = (forId ? doc.getElementById(forId) : null) ||
+                           target.control ||
+                           target.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+        if (associated && isControlEditable(associated)) {
+          target = associated;
+        } else if (forId) {
+          const byId = doc.getElementById(forId);
+          if (byId && isControlEditable(byId)) target = byId;
+        } else {
+          const adjacent = target.nextElementSibling?.matches?.('input, textarea') ? target.nextElementSibling :
+            target.parentElement?.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+          if (adjacent && isControlEditable(adjacent)) target = adjacent;
+        }
+      } else {
+        const nested = target.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+        if (nested && isControlEditable(nested)) target = nested;
       }
-      if (target instanceof view.HTMLInputElement) {
-        return !target.readOnly && textInputTypes.has(
-          String(target.type || 'text').toLowerCase()
-        );
-      }
-      if (target instanceof view.HTMLTextAreaElement) return !target.readOnly;
-      return target.isContentEditable;
-    };
+    }
+    const editable = () => isControlEditable(target);
     if (!editable()) return { ok: false, mutated: false, complete: false };
 
     let setValue;
@@ -1555,22 +1602,49 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
       'text', 'search', 'email', 'tel', 'url', 'password', 'number',
       'date', 'month', 'week', 'time', 'datetime-local'
     ]);
-    const editableAtRest = element.tagName !== 'LABEL' &&
-      !element.matches?.(':disabled') && element.getAttribute?.('aria-disabled') !== 'true' && (
-        (element instanceof elementView.HTMLInputElement && !element.readOnly &&
-          elementTextTypes.has(String(element.type || 'text').toLowerCase())) ||
-        (element instanceof elementView.HTMLTextAreaElement && !element.readOnly) ||
-        element.isContentEditable
-      );
-    if (!editableAtRest) {
+    const isControlEditable = el => Boolean(
+      el &&
+      el.tagName !== 'LABEL' &&
+      !el.matches?.(':disabled') &&
+      el.getAttribute?.('aria-disabled') !== 'true' && (
+        (el instanceof elementView.HTMLInputElement && !el.readOnly &&
+          elementTextTypes.has(String(el.type || 'text').toLowerCase())) ||
+        (el instanceof elementView.HTMLTextAreaElement && !el.readOnly) ||
+        el.isContentEditable
+      )
+    );
+    let targetControl = element;
+    if (!isControlEditable(targetControl)) {
+      if (element.tagName === 'LABEL') {
+        const doc = element.ownerDocument;
+        const forId = element.getAttribute?.('for');
+        const associated = (forId ? doc.getElementById(forId) : null) ||
+                           element.control ||
+                           element.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+        if (associated && isControlEditable(associated)) {
+          targetControl = associated;
+        } else if (forId) {
+          const byId = doc.getElementById(forId);
+          if (byId && isControlEditable(byId)) targetControl = byId;
+        } else {
+          const adjacent = element.nextElementSibling?.matches?.('input, textarea') ? element.nextElementSibling :
+            element.parentElement?.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+          if (adjacent && isControlEditable(adjacent)) targetControl = adjacent;
+        }
+      } else {
+        const nested = element.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+        if (nested && isControlEditable(nested)) targetControl = nested;
+      }
+    }
+    if (!isControlEditable(targetControl)) {
       return { found: true, ok: false, error: 'target is not text-editable; use an input, textarea, or contenteditable ref, never a label ref' };
     }
     const resolveSubmitForm = () => {
-      if (element instanceof elementView.HTMLInputElement ||
-          element instanceof elementView.HTMLTextAreaElement) {
-        return element.form || null;
+      if (targetControl instanceof elementView.HTMLInputElement ||
+          targetControl instanceof elementView.HTMLTextAreaElement) {
+        return targetControl.form || null;
       }
-      return element.closest?.('form') || null;
+      return targetControl.closest?.('form') || null;
     };
     const submitForm = request.action === 'fill-submit' ? resolveSubmitForm() : null;
     if (request.action === 'fill-submit' && !submitForm) {
@@ -1629,7 +1703,7 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
       }
     }
     let submissionExpectsNavigation = null;
-    const textResult = setText(element, request.value || '', request.action === 'type');
+    const textResult = setText(targetControl, request.value || '', request.action === 'type');
     if (!textResult.ok) {
       return { found: true, ok: false, error: 'target is not text-editable; use an input, textarea, or contenteditable ref, never a label ref' };
     }
@@ -1834,6 +1908,77 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   return { found: true, ok: false, error: `unsupported ref action: ${request.action}` };
 })(__PI_REF_ACTION_REQUEST__))'''
 
+VISION_FILL_JS = r'''JSON.stringify(((payload) => {
+  const x = Number(payload.x);
+  const y = Number(payload.y);
+  const text = String(payload.text ?? '');
+  let target = document.elementFromPoint(x, y);
+
+  const isInputLike = el => {
+    if (!el) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    return tag === 'input' || tag === 'textarea' || el.isContentEditable || el.getAttribute?.('contenteditable') === 'true';
+  };
+
+  if (!isInputLike(target)) {
+    const active = document.activeElement;
+    if (isInputLike(active) && active !== document.body) {
+      target = active;
+    } else if (target) {
+      target = target.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]') ||
+               target.closest?.('label')?.querySelector?.('input:not([type="hidden"]), textarea, [contenteditable="true"]') ||
+               target;
+    }
+  }
+
+  if (!target) return { ok: false, error: 'no element found at point' };
+
+  if (typeof target.focus === 'function') {
+    try { target.focus(); } catch (_) {}
+  }
+
+  const view = target.ownerDocument ? target.ownerDocument.defaultView : window;
+  const isInput = target instanceof view.HTMLInputElement || (target.tagName && target.tagName.toLowerCase() === 'input');
+  const isTextarea = target instanceof view.HTMLTextAreaElement || (target.tagName && target.tagName.toLowerCase() === 'textarea');
+  const isEditable = Boolean(target.isContentEditable || target.getAttribute?.('contenteditable') === 'true');
+
+  if (!isInput && !isTextarea && !isEditable) {
+    return { ok: false, error: `element <${target.tagName.toLowerCase()}> at (${x}, ${y}) is not an editable input` };
+  }
+
+  const isSensitive = isInput && String(target.type || '').toLowerCase() === 'password';
+
+  try {
+    target.dispatchEvent(new view.Event('beforeinput', { bubbles: true, cancelable: true }));
+  } catch (_) {}
+
+  if (isInput) {
+    const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(target, text);
+    else target.value = text;
+  } else if (isTextarea) {
+    const setter = Object.getOwnPropertyDescriptor(view.HTMLTextAreaElement.prototype, 'value')?.set;
+    if (setter) setter.call(target, text);
+    else target.value = text;
+  } else {
+    target.textContent = text;
+  }
+
+  try {
+    target.dispatchEvent(new view.Event('input', { bubbles: true, cancelable: true }));
+    target.dispatchEvent(new view.Event('change', { bubbles: true, cancelable: true }));
+  } catch (_) {}
+
+  return {
+    ok: true,
+    tag: target.tagName.toLowerCase(),
+    id: target.id || null,
+    name: target.getAttribute?.('name') || null,
+    type: target.getAttribute?.('type') || null,
+    sensitive: isSensitive
+  };
+})(__PI_VISION_FILL_PAYLOAD__))'''
+
 SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
   const docEl = document.scrollingElement || document.documentElement || document.body;
   const candidates = [];
@@ -1851,8 +1996,6 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
       curY,
       curX,
       totalScrollableY: maxY,
-      remainingDown: Math.max(0, maxY - curY),
-      remainingUp: curY,
       remainingRight: Math.max(0, maxX - curX),
       remainingLeft: curX,
       area: window.innerWidth * window.innerHeight
@@ -1881,8 +2024,6 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
           curY,
           curX,
           totalScrollableY: maxY,
-          remainingDown: Math.max(0, maxY - curY),
-          remainingUp: curY,
           remainingRight: Math.max(0, maxX - curX),
           remainingLeft: curX,
           area
@@ -1899,8 +2040,6 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
 
   const windowCandidate = candidates.find(c => c.isWindow);
   const windowHasRemaining = windowCandidate && (
-    (direction === 'down' && windowCandidate.remainingDown > 5) ||
-    (direction === 'up' && windowCandidate.remainingUp > 5) ||
     ((direction === 'bottom' || direction === 'to-bottom') && windowCandidate.totalScrollableY > 5) ||
     ((direction === 'top' || direction === 'to-top') && windowCandidate.totalScrollableY > 5) ||
     (direction === 'to' || direction === 'to-percent' || direction === 'to-text' || direction === 'to-ref')
@@ -1911,9 +2050,7 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
   } else {
     for (const c of candidates) {
       let available = 0;
-      if (direction === 'down') available = c.remainingDown;
-      else if (direction === 'up') available = c.remainingUp;
-      else if (direction === 'bottom' || direction === 'to-bottom') available = c.totalScrollableY;
+      if (direction === 'bottom' || direction === 'to-bottom') available = c.totalScrollableY;
       else if (direction === 'top' || direction === 'to-top') available = c.totalScrollableY;
       else if (direction === 'right') available = c.remainingRight;
       else if (direction === 'left') available = c.remainingLeft;
@@ -1943,13 +2080,7 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
   const maxY = isWindow ? Math.max(0, docEl.scrollHeight - window.innerHeight) : Math.max(0, target.scrollHeight - target.clientHeight);
   const maxX = isWindow ? Math.max(0, docEl.scrollWidth - window.innerWidth) : Math.max(0, target.scrollWidth - target.clientWidth);
 
-  if (direction === 'down') {
-    if (isWindow) { window.scrollBy(0, amount); }
-    else { target.scrollTop += amount; }
-  } else if (direction === 'up') {
-    if (isWindow) { window.scrollBy(0, -amount); }
-    else { target.scrollTop -= amount; }
-  } else if (direction === 'bottom' || direction === 'to-bottom') {
+  if (direction === 'bottom' || direction === 'to-bottom') {
     if (isWindow) { window.scrollTo(0, docEl.scrollHeight); }
     else { target.scrollTop = target.scrollHeight; }
   } else if (direction === 'top' || direction === 'to-top') {
@@ -2040,6 +2171,36 @@ SMART_SCROLL_JS = r'''JSON.stringify(((direction, amount, extra) => {
   };
 })(__DIRECTION__, __AMOUNT__, __EXTRA__))'''
 
+PAGE_PROGRESS_FINGERPRINT_JS = r'''(() => {
+  const root = document.documentElement;
+  const body = document.body;
+  const controls = Array.from(document.querySelectorAll('input,textarea,select,[contenteditable="true"]')).map((el, index) => {
+    const selected = el.tagName === 'SELECT'
+      ? Array.from(el.selectedOptions || [], option => `${option.value}:${option.textContent || ''}`)
+      : [];
+    return [index, el.tagName, el.type || '', el.value || '', Boolean(el.checked), selected,
+      el.getAttribute('aria-expanded') || '', el.getAttribute('aria-pressed') || '',
+      el.getAttribute('aria-selected') || '', el.textContent || ''];
+  });
+  const scrollers = Array.from(document.querySelectorAll('*'))
+    .filter(el => el.scrollTop || el.scrollLeft)
+    .map((el, index) => [index, el.tagName, el.id || '', el.scrollTop, el.scrollLeft]);
+  const active = document.activeElement;
+  const state = JSON.stringify({
+    url: location.href,
+    title: document.title,
+    text: body?.innerText || '',
+    dimensions: [root?.scrollWidth || 0, root?.scrollHeight || 0, window.innerWidth, window.innerHeight],
+    scroll: [window.scrollX || 0, window.scrollY || 0],
+    controls,
+    scrollers,
+    active: active ? [active.tagName, active.id || '', active.getAttribute('name') || '', active.getAttribute('data-pi-ref') || ''] : null,
+  });
+  let hash = 2166136261;
+  for (let i = 0; i < state.length; i++) hash = Math.imul(hash ^ state.charCodeAt(i), 16777619);
+  return `${(hash >>> 0).toString(16)}:${state.length}`;
+})()'''
+
 
 class BrowserWorker:
     def __init__(self):
@@ -2056,6 +2217,7 @@ class BrowserWorker:
         self.popup_just_closed = set()
         self.snapshot_required_sessions = set()
         self.repeated_commands = {}
+        self.no_progress_counts = {}
         self.open_action_guard = OpenActionGuard(limit=2)
         self.vision_guard = VisionCorrectnessGuard(
             ttl_seconds=float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
@@ -5030,9 +5192,22 @@ class BrowserWorker:
         )
         if endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost'}:
             raise ValueError('OmniParser endpoint must be a local HTTP URL')
-        payload = json.dumps({
+        payload_data = {
             'image_base64': base64.b64encode(Path(screenshot_path).read_bytes()).decode('ascii')
-        }).encode('utf-8')
+        }
+        omni_threshold = os.environ.get('PI_NODRIVER_OMNI_THRESHOLD')
+        if omni_threshold is not None:
+            try:
+                payload_data['threshold'] = float(omni_threshold)
+            except ValueError:
+                pass
+        omni_image_size = os.environ.get('PI_NODRIVER_OMNI_IMAGE_SIZE')
+        if omni_image_size is not None:
+            try:
+                payload_data['image_size'] = int(omni_image_size)
+            except ValueError:
+                pass
+        payload = json.dumps(payload_data).encode('utf-8')
 
         def request():
             connection = http.client.HTTPConnection(
@@ -5064,6 +5239,9 @@ class BrowserWorker:
     def filter_omni_page_candidates(
         elements, min_y=90, limit=15, *, image_width=None, image_height=None,
         capture_backend='xvfb',
+        max_area_ratio=0.6,
+        max_dimension_ratio=0.85,
+        min_box_size=3.0,
     ):
         if capture_backend not in {'xvfb', 'cdp'}:
             raise ValueError('Omni capture backend must be xvfb or cdp')
@@ -5086,7 +5264,9 @@ class BrowserWorker:
                 continue
             if center_x < 0 or center_y < effective_min_y or x1 < 0 or y1 < 0:
                 continue
-            if x2 <= x1 or y2 <= y1:
+            width = x2 - x1
+            height = y2 - y1
+            if width < min_box_size or height < min_box_size:
                 continue
             if image_width is not None and (
                 center_x >= image_width or x2 > image_width
@@ -5096,6 +5276,16 @@ class BrowserWorker:
                 center_y >= image_height or y2 > image_height
             ):
                 continue
+            if image_width is not None and image_height is not None:
+                box_area = width * height
+                total_area = float(image_width * image_height)
+                if total_area > 0 and box_area / total_area >= max_area_ratio:
+                    continue
+                if (
+                    width / float(image_width) >= max_dimension_ratio
+                    and height / float(image_height) >= max_dimension_ratio
+                ):
+                    continue
             candidate = dict(element)
             candidate['center'] = [center_x, center_y]
             candidate['box'] = [x1, y1, x2, y2]
@@ -6066,6 +6256,39 @@ class BrowserWorker:
             target_url = parts[1] if parts and len(parts) > 1 else None
             self.open_action_guard.record_failure(session_id, target_url)
 
+    async def page_progress_fingerprint(self, page):
+        if page is None:
+            return None
+        try:
+            fingerprint = await asyncio.wait_for(
+                page.evaluate(PAGE_PROGRESS_FINGERPRINT_JS), timeout=0.75
+            )
+        except (asyncio.CancelledError, _PreflightDeadlineExpired):
+            raise
+        except Exception:
+            return None
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        return f'{id(page)}:{fingerprint}'
+
+    def record_page_progress(self, session_id, action, before, after):
+        if action not in PAGE_PROGRESS_ACTIONS or before is None or after is None:
+            return
+        if before != after:
+            self.no_progress_counts.pop(session_id, None)
+            return
+        count = self.no_progress_counts.get(session_id, 0) + 1
+        self.no_progress_counts[session_id] = count
+        if count < NO_PROGRESS_LIMIT:
+            return
+        self.no_progress_counts.pop(session_id, None)
+        raise ValueError(
+            'NO_PROGRESS_GUARD: Page content and interaction state did not change after '
+            f'{NO_PROGRESS_LIMIT} consecutive action attempts. Stop retrying controls or keys. '
+            "Use 'snapshot -i --full' to choose a different DOM target, use fill to replace a field "
+            'in one operation, or stop and report that the page did not respond.'
+        )
+
     def track_repeat(self, session_id, action, parts):
         signature = ' '.join(parts)
         previous, count = self.repeated_commands.get(session_id, (None, 0))
@@ -6107,10 +6330,8 @@ class BrowserWorker:
 
             # Hook 1: Anti-Scroll Loop & Ping-Pong Circuit Breaker
             scroll_count = sum(1 for a in history if a.startswith('scroll-'))
-            has_ping_pong = ('scroll-down' in history and 'scroll-up' in history)
-            
-            if scroll_count >= 2 or has_ping_pong:
-                hints.append("⚠️ [CIRCUIT BREAKER: Back-and-forth scrolling detected. DO NOT scroll again. Use 'screenshot --full' to view the whole page at once, or stop and answer the user immediately with what you already have.]")
+            if scroll_count >= 2:
+                hints.append("⚠️ [CIRCUIT BREAKER: Repeated scrolling detected. Do not issue another scroll command. Use 'snapshot -i --full' to select a DOM ref, 'screenshot --full' to inspect the whole layout, or stop and answer with what you already have.]")
 
             # Hook 2: Search Result Reached Hook
             if any(k in url_lower for k in ['/search', 'searchkeyword', 'search.momo', 'pchome.com.tw/search', 'amazon.com/s', 'google.com/search']):
@@ -6124,7 +6345,7 @@ class BrowserWorker:
 
             # Hook 4: Secondary Tab / Review Trap Hook
             if any(k in url_lower for k in ['#reviews', 'tab=review', 'tab=explore', '#explore', 'customerreviews']):
-                hints.append("💡 [Guidance: Currently in secondary tab (Reviews/Explore). Use 'scroll up' or activate the main tab ref to return to product overview.]")
+                hints.append("💡 [Guidance: Currently in secondary tab (Reviews/Explore). Activate the main tab ref to return to product overview.]")
 
             # Hook 5: Overlay / App Banner Hint
             if action == 'snapshot' and any(k in text for k in ['立即體驗', '下載App', '下載 24h', 'Close overlay', 'aria-label="關閉"']):
@@ -6524,6 +6745,9 @@ class BrowserWorker:
                     self.popup_just_closed.add(session_id)
             except Exception:
                 pass
+        progress_before = None
+        if action in PAGE_PROGRESS_ACTIONS:
+            progress_before = await self.page_progress_fingerprint(self.pages.get(session_id))
         try:
             try:
                 if action == 'close':
@@ -6551,6 +6775,9 @@ class BrowserWorker:
         result = await self.maybe_fallback_after_action(
             session_id, action, parts, result, pre_action_url, pre_action_identity
         )
+        if action in PAGE_PROGRESS_ACTIONS:
+            progress_after = await self.page_progress_fingerprint(self.pages.get(session_id))
+            self.record_page_progress(session_id, action, progress_before, progress_after)
         if semantic_click or action in {
             'open', 'close', 'switch', 'wait-popup', 'wait-popup-close', 'vision-click'
         }:
@@ -6647,6 +6874,7 @@ class BrowserWorker:
             await self.cleanup_pdf_session(session_id)
             self.origin_linux_routes.pop(session_id, None)
             self.browser_modes.pop(session_id, None)
+            self.no_progress_counts.pop(session_id, None)
             return {
                 'text': 'Temporary PDF extraction artifacts cleaned for this session',
                 'action': action,
@@ -7602,6 +7830,186 @@ class BrowserWorker:
                 resp['midwayScreenshotPath'] = str(midway_path)
             return resp
 
+        if action == 'vision-fill':
+            page = await self.require_page(session_id)
+            is_coordinate_fill = False
+            if len(parts) >= 4:
+                try:
+                    cx = float(parts[1])
+                    cy = float(parts[2])
+                    is_coordinate_fill = math.isfinite(cx) and math.isfinite(cy)
+                except ValueError:
+                    is_coordinate_fill = False
+
+            if is_coordinate_fill:
+                x, y = float(parts[1]), float(parts[2])
+                raw_text = ' '.join(parts[3:])
+                if (raw_text.startswith('"') and raw_text.endswith('"')) or (
+                    raw_text.startswith("'") and raw_text.endswith("'")
+                ):
+                    text = raw_text[1:-1]
+                else:
+                    text = raw_text
+
+                preview = self.omni_previews.get(session_id)
+                if preview is None:
+                    raise ValueError(
+                        'OMNI_PREVIEW_REQUIRED: run vision-mark omni and inspect its numbered screenshot first'
+                    )
+                ttl = float(os.environ.get('PI_NODRIVER_VISION_PREVIEW_TTL', '30'))
+                if time.monotonic() - preview['createdAt'] > ttl:
+                    self.omni_previews.pop(session_id, None)
+                    raise ValueError('OMNI_PREVIEW_EXPIRED: run vision-mark omni again')
+                matched = next((
+                    element for element in preview['elements']
+                    if abs(float(element['center'][0]) - x) <= 0.51
+                    and abs(float(element['center'][1]) - y) <= 0.51
+                ), None)
+                if matched is None:
+                    raise ValueError(
+                        'OMNI_CENTER_REQUIRED: copy an exact center=(x,y) returned by vision-mark omni'
+                    )
+                click_x, click_y = map_screenshot_point_to_viewport(
+                    preview['state'], preview['imageWidth'], preview['imageHeight'], x, y,
+                    capture_backend=preview.get('captureBackend', 'cdp'),
+                    toolbar_height=preview.get('toolbarHeight', 0),
+                )
+                target_metadata = await self.point_target_metadata(page, click_x, click_y)
+                previous = page
+                await self.configure_download_session(session_id, page)
+
+                async def verify_omni_preview_before_fill():
+                    try:
+                        current_state = await self.vision_page_state(page)
+                        if current_state != preview['state']:
+                            raise ValueError(
+                                'OMNI_CONFIRMATION_REQUIRED: page changed; run vision-mark omni again'
+                            )
+                    finally:
+                        self.omni_previews.pop(session_id, None)
+
+                page = await self.native_click(
+                    page, click_x, click_y,
+                    before_dispatch=verify_omni_preview_before_fill,
+                    xvfb_screen_point=(x, y)
+                    if preview.get('captureBackend') == 'xvfb' else None,
+                )
+                page = await self.track_clicked_page(session_id, previous, page)
+                self.pages[session_id] = page
+
+                fill_payload = json.dumps({'x': click_x, 'y': click_y, 'text': text})
+                fill_res = json.loads(await page.evaluate(
+                    VISION_FILL_JS.replace('__PI_VISION_FILL_PAYLOAD__', fill_payload)
+                ))
+                if not fill_res.get('ok'):
+                    raise ValueError(fill_res.get('error') or f'Failed to fill input at ({x:g}, {y:g})')
+
+                displayed = '<redacted password>' if fill_res.get('sensitive') else json.dumps(
+                    text, ensure_ascii=False
+                )
+                return {
+                    'text': (
+                        f"OmniParser-confirmed fill on id={matched.get('id')} "
+                        f"at screenshot coordinates ({x:g}, {y:g}) with {displayed}\nURL: {page.url}"
+                    ),
+                    'action': 'vision-fill-omni',
+                    'url': page.url,
+                    'x': x,
+                    'y': y,
+                    'omniElementId': matched.get('id'),
+                    'value': text,
+                    'inputType': 'mouse-and-text',
+                    'backend': 'xvfb-or-cdp',
+                    **target_metadata,
+                }
+
+            # Manual token mode: vision-fill <token> <text>
+            if len(parts) < 3:
+                raise ValueError(
+                    'usage: vision-fill <x> <y> "text" (after vision-mark omni) or vision-fill <preview-token> "text" (after vision-mark)'
+                )
+            token = parts[1]
+            raw_text = ' '.join(parts[2:])
+            if (raw_text.startswith('"') and raw_text.endswith('"')) or (
+                raw_text.startswith("'") and raw_text.endswith("'")
+            ):
+                text = raw_text[1:-1]
+            else:
+                text = raw_text
+
+            marker = self.vision_guard.current_marker(session_id, token)
+            self.omni_previews.pop(session_id, None)
+            token = marker.token
+            target_metadata = await self.point_target_metadata(
+                page, marker.click_x, marker.click_y
+            )
+            previous = page
+            await self.configure_download_session(session_id, page)
+
+            async def verify_preview_immediately_before_fill():
+                current = None
+                try:
+                    before_state = await self.vision_page_state(page)
+                    current = await self.save_viewport_screenshot(
+                        page, 'pi-nodriver-vision-verify-'
+                    )
+                    current_state = await self.vision_page_state(page)
+                    if before_state != current_state:
+                        raise ValueError(
+                            'VISION_CONFIRMATION_REQUIRED: page changed during final visual verification; '
+                            'take a fresh screenshot and mark again'
+                        )
+                    self.vision_guard.consume_marker(
+                        session_id,
+                        current_state,
+                        token,
+                        self.screenshot_hash(current),
+                    )
+                except Exception:
+                    self.vision_guard.invalidate(session_id)
+                    raise
+                finally:
+                    if current is not None:
+                        current.unlink(missing_ok=True)
+                self.vision_guard.invalidate(session_id)
+
+            xvfb_screen_point = None
+            if marker.capture_backend == 'xvfb':
+                xvfb_screen_point = (marker.x, marker.y)
+
+            page = await self.native_click(
+                page, marker.click_x, marker.click_y,
+                before_dispatch=verify_preview_immediately_before_fill,
+                xvfb_screen_point=xvfb_screen_point,
+            )
+            page = await self.track_clicked_page(session_id, previous, page)
+            self.pages[session_id] = page
+
+            fill_payload = json.dumps({'x': marker.click_x, 'y': marker.click_y, 'text': text})
+            fill_res = json.loads(await page.evaluate(
+                VISION_FILL_JS.replace('__PI_VISION_FILL_PAYLOAD__', fill_payload)
+            ))
+            if not fill_res.get('ok'):
+                raise ValueError(fill_res.get('error') or f'Failed to fill input at marker ({marker.x:g}, {marker.y:g})')
+
+            displayed = '<redacted password>' if fill_res.get('sensitive') else json.dumps(
+                text, ensure_ascii=False
+            )
+            return {
+                'text': (
+                    f'Vision-confirmed fill executed at ({marker.x:g}, {marker.y:g}) '
+                    f'with {displayed}\nURL: {page.url}'
+                ),
+                'action': 'vision-fill',
+                'url': page.url,
+                'x': marker.x,
+                'y': marker.y,
+                'value': text,
+                'inputType': 'mouse-and-text',
+                'backend': 'xvfb-or-cdp',
+                **target_metadata,
+            }
+
         if action == 'activate':
             page = await self.require_page(session_id)
             if len(parts) != 2 or not parts[1].startswith('@'):
@@ -8009,14 +8417,24 @@ class BrowserWorker:
         if action == 'scroll':
             page = await self.require_page(session_id)
             history = self.scroll_history.setdefault(session_id, [])
-            raw_arg = parts[1].strip() if len(parts) > 1 else 'down'
+            if len(parts) < 2:
+                raise ValueError(
+                    "scroll requires an explicit target; use 'scroll to @ref', 'scroll to-text <text>', "
+                    "'scroll to <pixels|percentage%>', 'scroll top', or 'scroll bottom'"
+                )
+            raw_arg = parts[1].strip()
             raw_lower = raw_arg.lower()
 
             extra = ''
             direction = raw_lower
             amount = 600
 
-            if direction in ('down', 'up', 'left', 'right'):
+            if direction in ('up', 'down'):
+                raise ValueError(
+                    "relative vertical scrolling is unavailable; use 'snapshot -i --full' and "
+                    "'scroll to @ref', or choose an explicit text, pixel, percentage, top, or bottom target"
+                )
+            if direction in ('left', 'right'):
                 amount = int(parts[2]) if len(parts) > 2 else 600
             elif direction in ('top', 'to-top', 'bottom', 'to-bottom'):
                 amount = 0
@@ -8078,16 +8496,18 @@ class BrowserWorker:
                     amount = int(float(raw_arg))
                     direction = 'to'
                 except ValueError:
-                    raise ValueError(f'usage: scroll down|up|top|bottom|left|right|to [args]; invalid direction: {raw_arg}')
+                    raise ValueError(
+                        f'usage: scroll top|bottom|left|right|to [args]; invalid direction: {raw_arg}'
+                    )
 
             history.append(f'scroll-{direction}')
             scroll_count = sum(1 for a in history if a.startswith('scroll-'))
-            has_ping_pong = ('scroll-down' in history and 'scroll-up' in history)
-            if scroll_count >= 3 or has_ping_pong:
+            if scroll_count >= 3:
                 self.scroll_history[session_id] = []
                 raise ValueError(
-                    "SCROLL_LOOP_GUARD: Repeated back-and-forth scrolling detected (scrolled 3+ times without interacting). "
-                    "Stop scrolling. Use 'get text' to extract all text on the page in 1 step, or 'screenshot --full' to view the entire layout."
+                    "SCROLL_LOOP_GUARD: Repeated scrolling detected (3+ scroll commands without interacting). "
+                    "Use 'snapshot -i --full' to choose a DOM ref, 'get text' to extract the page, "
+                    "or 'screenshot --full' to inspect the entire layout."
                 )
 
             script = (
@@ -8344,10 +8764,15 @@ class BrowserWorker:
                     latency = float(parsed['latency'])
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError('OmniParser returned an invalid latency') from error
-                if not math.isfinite(latency) or latency < 0:
-                    raise ValueError('OmniParser returned an invalid latency')
+                toolbar_height = (
+                    float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                    if capture_backend == 'xvfb' else 0.0
+                )
+                omni_limit = int(os.environ.get('PI_NODRIVER_OMNI_LIMIT', '30'))
                 elements = self.filter_omni_page_candidates(
                     parsed.get('elements', []),
+                    min_y=toolbar_height,
+                    limit=omni_limit,
                     image_width=image_width,
                     image_height=image_height,
                     capture_backend=capture_backend,
@@ -8374,7 +8799,8 @@ class BrowserWorker:
                         f"OmniParser detected {len(elements)} interactive regions in "
                         f"{latency:g}s. {coordinate_note}\n"
                         + '\n'.join(lines)
-                        + '\nChoose the matching numbered box, then copy its exact center into vision-click <x> <y>.'
+                        + '\nChoose the matching numbered box: copy its exact center into vision-click <x> <y> to click, '
+                        + 'or into vision-fill <x> <y> "text" to enter text (standard DOM fill is disabled for visual targets; use vision-fill).'
                     ),
                     'action': 'vision-mark-omni' if action == 'vision-mark' else action,
                     'url': page.url,
@@ -8398,6 +8824,8 @@ class BrowserWorker:
                 'toolbarHeight': toolbar_height,
                 'createdAt': time.monotonic(),
                 'elements': elements,
+                'allowedActions': ['vision-click <x> <y>', 'vision-fill <x> <y> "text"'],
+                'fillPolicy': 'Standard DOM fill is disabled in visual mode; use vision-fill <x> <y> "text".',
             }
             return response
 

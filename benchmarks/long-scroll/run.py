@@ -71,7 +71,7 @@ def main():
 
 操作指引：
 - 頁面極長，嚴格禁止反覆上下小幅滾動（3次無互動滾動會觸發 SCROLL_LOOP_GUARD 報錯）。
-- 推薦使用 `get text`、`screenshot --full`、或直達跳捲指令（如 `scroll to 2600`、`scroll to-text "限時閃購"`、`scroll to-text "VIP 專屬優惠"`、`scroll 50%`、`scroll 85%`）快速前往目標，再用 click 完成點擊。
+- 推薦使用 `get text`、`screenshot --full`、或直達跳捲指令（如 `scroll to 2600`、`scroll to-text "限時閃購"`、`scroll to-text "VIP 專屬優惠"`、`scroll 50%`、`scroll 85%`）快速前往目標，再用 `activate @ref` 完成操作。
 
 完成後請輸出結果 JSON：
 {{"success": true或false, "secretCode": "取得的代碼", "notes": "操作總結"}}

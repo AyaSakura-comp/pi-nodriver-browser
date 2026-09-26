@@ -7,7 +7,8 @@
     "cartPlus",
     "tinyPlus",
     "toggle",
-    "coupon"
+    "coupon",
+    "modalLogin"
   ],
   "modes": [
     "forced-omni",

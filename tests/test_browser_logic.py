@@ -9,7 +9,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, detect_access_block, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, detect_access_block, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+
+
+class IdentityViewportMetricsTests(unittest.TestCase):
+    def test_linux_identity_uses_desktop_layout_scaled_into_mobile_sized_frame(self):
+        metrics = identity_viewport_metrics('linux')
+
+        self.assertEqual(metrics['width'], 1280)
+        self.assertEqual(metrics['height'], 2770)
+        self.assertEqual(metrics['deviceScaleFactor'], 1.0)
+        self.assertFalse(metrics['mobile'])
+        self.assertFalse(metrics['touch'])
+        self.assertAlmostEqual(metrics['scale'], 390 / 1280)
+
+    def test_linux_fallback_uses_same_desktop_fit_metrics(self):
+        self.assertEqual(
+            identity_viewport_metrics('linux-fallback'),
+            identity_viewport_metrics('linux'),
+        )
+
+    def test_android_identity_keeps_existing_mobile_metrics(self):
+        self.assertEqual(identity_viewport_metrics('android'), {
+            'width': 390,
+            'height': 844,
+            'deviceScaleFactor': 3.0,
+            'mobile': True,
+            'touch': True,
+            'scale': None,
+        })
 
 
 class AccessBlockDetectionTests(unittest.TestCase):
@@ -67,6 +95,105 @@ class AccessBlockDetectionTests(unittest.TestCase):
                 'Book a table and read our help article about avoiding captcha problems.',
             )
         )
+
+
+class AccessGateDetectionTests(unittest.TestCase):
+    def test_preserves_existing_access_block_reasons_and_detects_widgets(self):
+        self.assertEqual(
+            detect_access_gate(
+                'https://shop.example/product', 'Security check',
+                'Verify you are human', captcha_widget=True,
+            ),
+            'robot verification',
+        )
+        self.assertEqual(
+            detect_access_gate(
+                'https://shop.example/product', 'Product', '', captcha_widget=True,
+            ),
+            'captcha widget',
+        )
+
+    def test_detects_strong_login_forms_and_dialogs(self):
+        self.assertEqual(
+            detect_access_gate(
+                'https://shop.example/product', 'Product', '會員登入',
+                visible_password=True, visible_account=True, login_form=True,
+            ),
+            'login gate',
+        )
+        self.assertEqual(
+            detect_access_gate(
+                'https://shop.example/product', 'Product', 'Sign in to continue',
+                login_dialog=True,
+            ),
+            'login gate',
+        )
+
+    def test_rejects_incidental_login_copy_and_header_links(self):
+        self.assertIsNone(
+            detect_access_gate(
+                'https://shop.example/product', 'Product',
+                '登入後享優惠；需要協助請閱讀 CAPTCHA 說明。',
+            )
+        )
+        self.assertIsNone(
+            detect_access_gate(
+                'https://shop.example/product', 'Product', '會員登入',
+                visible_account=True,
+            )
+        )
+        self.assertIsNone(
+            detect_access_gate(
+                'https://shop.example/product', 'Checkout', 'Optional member login',
+                visible_account=True, visible_password=True,
+            )
+        )
+
+    def test_password_on_auth_path_is_a_gate_but_auth_urls_are_recognized(self):
+        self.assertTrue(is_auth_url('https://shop.example/member/login?next=%2Fcart'))
+        self.assertTrue(is_auth_url('https://shop.example/users/sign_in'))
+        self.assertTrue(is_auth_url('https://shop.example/oauth/authorize'))
+        self.assertTrue(is_auth_url('https://accounts.example/o/oauth2/v2/auth'))
+        self.assertTrue(is_auth_url('https://shop.example/oauth2/authorize'))
+        self.assertTrue(is_auth_url('https://shop.example/signup'))
+        self.assertFalse(is_auth_url('https://shop.example/product?loginBanner=1'))
+        self.assertEqual(
+            detect_access_gate(
+                'https://shop.example/member/login', '會員登入', '',
+                visible_password=True,
+            ),
+            'login gate',
+        )
+
+    def test_normalizes_http_origins_and_ignores_non_network_urls(self):
+        self.assertEqual(normalize_origin('https://SHOP.example:443/product'), 'https://shop.example')
+        self.assertEqual(normalize_origin('http://shop.example:8080/product'), 'http://shop.example:8080')
+        self.assertEqual(normalize_origin('https://[::1:8080]/'), 'https://[::1:8080]')
+        self.assertEqual(normalize_origin('https://[::1]:8080/'), 'https://[::1]:8080')
+        self.assertNotEqual(
+            normalize_origin('https://[::1:8080]/'),
+            normalize_origin('https://[::1]:8080/'),
+        )
+        self.assertEqual(
+            normalize_origin('https://bücher.example/product'),
+            normalize_origin('https://xn--bcher-kva.example/product'),
+        )
+        self.assertEqual(
+            normalize_origin('https://faß.de/product'),
+            normalize_origin('https://xn--fa-hia.de/product'),
+        )
+        self.assertEqual(normalize_origin('https://%65xample.com'), 'https://example.com')
+        self.assertEqual(normalize_origin('http://127.1'), 'http://127.0.0.1')
+        self.assertEqual(
+            normalize_origin('https://example.com\\@evil.com/'),
+            'https://example.com',
+        )
+        self.assertEqual(
+            normalize_origin('https://[::ffff:127.0.0.1]/'),
+            normalize_origin('https://[::ffff:7f00:1]/'),
+        )
+        self.assertIsNone(normalize_origin('file:///tmp/fixture.html'))
+        self.assertIsNone(normalize_origin('not a url'))
 
 
 class GoogleSearchLogicTests(unittest.TestCase):
@@ -183,7 +310,7 @@ class ParseCommandTests(unittest.TestCase):
 
     def test_normalizes_legacy_angle_wrapped_refs_in_ref_positions(self):
         cases = {
-            'click <@e16>': ['click', '@e16'],
+            'activate <@e16>': ['activate', '@e16'],
             'fill <@e6> hkhs7821@gmail.com': ['fill', '@e6', 'hkhs7821@gmail.com'],
             'fill-submit <@e2> "cat treats"': ['fill-submit', '@e2', 'cat treats'],
             'get text <@e4>': ['get', 'text', '@e4'],
@@ -200,10 +327,8 @@ class ParseCommandTests(unittest.TestCase):
         )
 
     def test_parses_scroll_commands(self):
-        self.assertEqual(parse_command('scroll down'), ['scroll', 'down'])
         self.assertEqual(parse_command('scroll bottom'), ['scroll', 'bottom'])
         self.assertEqual(parse_command('scroll top'), ['scroll', 'top'])
-        self.assertEqual(parse_command('scroll down 1000'), ['scroll', 'down', '1000'])
         self.assertEqual(parse_command('scroll to 1500'), ['scroll', 'to', '1500'])
         self.assertEqual(parse_command('scroll to 45%'), ['scroll', 'to', '45%'])
         self.assertEqual(parse_command('scroll 45%'), ['scroll', '45%'])
@@ -274,12 +399,13 @@ class VisionFallbackGuardTests(unittest.TestCase):
 
     def test_only_well_formed_semantic_clicks_count_as_attempts(self):
         accepted = [
-            ['click', '@e1'],
+            ['activate', '@e1'],
             ['click-js', '@e1'],
             ['click-text', 'Checkout'],
             ['click-css', '#checkout'],
         ]
         rejected = [
+            ['click', '@e1'],
             ['click', '20', '30'],
             ['click'],
             ['click-js', 'button'],

@@ -1,6 +1,6 @@
-# Bad UI Seven-Level Benchmark
+# Bad UI Eight-Level Benchmark
 
-This suite measures end-to-end Pi agent behavior on deliberately awkward browser controls rather than testing browser APIs in isolation. The 390px fixture advances through seven sequential targets:
+This suite measures end-to-end Pi agent behavior on deliberately awkward browser controls rather than testing browser APIs in isolation. The 390px fixture advances through eight sequential targets:
 
 1. low-contrast fake-ad close button (`adClose`)
 2. custom checkbox (`checkbox`)
@@ -9,6 +9,7 @@ This suite measures end-to-end Pi agent behavior on deliberately awkward browser
 5. tiny low-contrast plus button (`tinyPlus`)
 6. non-semantic toggle (`toggle`)
 7. input-like coupon control (`coupon`)
+8. modal overlay account and password input (`modalLogin`)
 
 ## Modes
 

@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / 'benchmarks' / 'bad-ui'
 EXPECTED_LEVELS = [
-    'adClose', 'checkbox', 'dropdown', 'cartPlus', 'tinyPlus', 'toggle', 'coupon'
+    'adClose', 'checkbox', 'dropdown', 'cartPlus', 'tinyPlus', 'toggle', 'coupon', 'modalLogin'
 ]
 
 
@@ -33,7 +33,7 @@ def write_fake_xvfb_run(directory):
 
 
 class BadUiBenchmarkTests(unittest.TestCase):
-    def test_manifest_and_fixture_declare_the_seven_sequential_levels(self):
+    def test_manifest_and_fixture_declare_the_eight_sequential_levels(self):
         manifest = json.loads((BENCHMARK / 'manifest.json').read_text())
         html = (BENCHMARK / 'levels.html').read_text()
 
@@ -47,6 +47,21 @@ class BadUiBenchmarkTests(unittest.TestCase):
         for level in EXPECTED_LEVELS:
             self.assertIn(f"complete('{level}')", html)
         self.assertIn('id="finish"', html)
+
+    def test_modal_login_level_eight_adversarial_contract(self):
+        html = (BENCHMARK / 'levels.html').read_text()
+        self.assertIn('data-level="modalLogin"', html)
+        self.assertIn('id="bad-login-user"', html)
+        self.assertIn('id="bad-login-pwd"', html)
+        self.assertIn('type="password"', html)
+        self.assertIn('for="bad-login-user"', html)
+        self.assertIn('for="bad-login-pwd"', html)
+        self.assertIn('id="badLoginSubmit"', html)
+        self.assertIn('id="badLoginClear"', html)
+        self.assertIn('id="fakeModalClose"', html)
+        self.assertIn('id="modalOverlay"', html)
+        self.assertIn('id="modalCard"', html)
+        self.assertIn('八關全破', html)
 
     def test_repository_docs_link_suite_and_ignore_generated_results(self):
         root_readme = (ROOT / 'README.md').read_text()

@@ -261,12 +261,12 @@ A fuzzy `select @ref <query>` remains available for a unique, high-confidence wi
 ### Preferred action order
 
 1. Run `snapshot -i` in the relevant viewport.
-2. Use the exact `@ref` with `click`, `fill`, `type`, `select`, or `fill-submit`.
+2. Use the exact `@ref` with `activate`, `fill`, `type`, `select`, or `fill-submit`.
 3. Use `click-text` or `click-css` when no useful ref is present.
 4. Use `click-js @ref` only when a DOM click is specifically required.
-5. For canvas or inaccessible visual-only content, use visual fallback directly without deliberately failing semantic clicks: run `screenshot`, inspect it, use its pixel coordinates with `vision-mark <x> <y>`, inspect and correct the marked image, then confirm only the latest token with `vision-click <preview-token>`.
+5. For canvas or inaccessible visual-only content, use visual fallback directly without deliberately failing semantic actions: run `screenshot`, inspect it, use its pixel coordinates with `vision-mark <x> <y>`, inspect and correct the marked image, then confirm only the latest token with `vision-click <preview-token>`.
 
-Raw `click <x> <y>` is blocked. `snapshot -i --full` is visual overview only: it deliberately returns no refs, invalidates pending coordinate previews, and must not be treated as a coordinate map.
+The plain `click` command is removed. Use `activate @ref` for semantic targets and guarded `vision-click` for visual coordinates. `snapshot -i --full` is visual overview only: it deliberately returns no refs, invalidates pending coordinate previews, and must not be treated as a coordinate map.
 
 ### Click resolution
 
@@ -297,7 +297,7 @@ sequenceDiagram
     Page->>Frame: inspect same-origin document
     Frame-->>Worker: @e3 button "產生擷取檔"
     Worker-->>Agent: semantic iframe ref
-    Agent->>Worker: click @e3
+    Agent->>Worker: activate @e3
     Worker->>Frame: frame-adjusted native click
     Frame-->>Page: generate HTML and PNG artifacts
 ```

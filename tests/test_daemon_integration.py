@@ -155,7 +155,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         overlay_url = (ROOT / 'tests/fixture_overlays.html').as_uri()
         self.command(f'open {fixture_url}', session_id='session-a')
         self.command('snapshot -i', request_id=2, session_id='session-a')
-        self.command('click @e2', request_id=3, session_id='session-a')
+        self.command('activate @e2', request_id=3, session_id='session-a')
         self.command(f'open {overlay_url}', request_id=4, session_id='session-b')
 
         session_a = self.command('get text', request_id=5, session_id='session-a')
@@ -190,7 +190,7 @@ class DaemonIntegrationTests(unittest.TestCase):
                 'snapshot -i', request_id=3, session_id='session-b'
             )['text']
             go_ref = next(line for line in snapshot_b.splitlines() if 'Go now' in line).split()[0]
-            self.command(f'click {go_ref}', request_id=4, session_id='session-b')
+            self.command(f'activate {go_ref}', request_id=4, session_id='session-b')
 
             session_a = self.command(
                 'wait-download 5000', request_id=5, session_id='session-a'
@@ -247,12 +247,12 @@ class DaemonIntegrationTests(unittest.TestCase):
         session_a_result = {}
 
         def click_delayed_popup():
-            session_a_result.update(self.command(f'click {delayed_ref}', request_id=5, session_id='session-a'))
+            session_a_result.update(self.command(f'activate {delayed_ref}', request_id=5, session_id='session-a'))
 
         popup_thread = threading.Thread(target=click_delayed_popup)
         popup_thread.start()
         time.sleep(0.45)
-        session_b = self.command(f'click {noisy_ref}', request_id=6, session_id='session-b')
+        session_b = self.command(f'activate {noisy_ref}', request_id=6, session_id='session-b')
         popup_thread.join(timeout=5)
 
         self.assertFalse(popup_thread.is_alive())
@@ -304,7 +304,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.command(f'open {overlay_url}', request_id=3)
         stale_ref = '@e999'
 
-        recovery = self.command_raw(f'click {stale_ref}', request_id=4)
+        recovery = self.command_raw(f'activate {stale_ref}', request_id=4)
 
         self.assertTrue(recovery['ok'])
         self.assertEqual(recovery['action'], 'stale-ref-recovery')
@@ -317,8 +317,8 @@ class DaemonIntegrationTests(unittest.TestCase):
         fresh_ref = next(
             line for line in recovery['text'].splitlines() if 'Next step' in line
         ).split()[0]
-        resumed = self.command(f'click {fresh_ref}', request_id=5)
-        self.assertIn('Clicked', resumed['text'])
+        resumed = self.command(f'activate {fresh_ref}', request_id=5)
+        self.assertIn('Activated', resumed['text'])
 
     def test_browser_survives_client_disconnect(self):
         fixture_url = (ROOT / 'tests/fixture.html').as_uri()

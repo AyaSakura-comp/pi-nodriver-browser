@@ -129,6 +129,25 @@ class ViewportScreenshotTests(unittest.IsolatedAsyncioTestCase):
             await worker.save_viewport_screenshot(page_b, 'session-b-')
             page_b.bring_to_front.assert_awaited_once()
 
+    async def test_save_viewport_screenshot_defaults_to_jpg_and_supports_png(self):
+        worker = BrowserWorker()
+        page = SimpleNamespace(bring_to_front=AsyncMock(), save_screenshot=AsyncMock())
+
+        async def fake_save(output, format='jpeg', full_page=False):
+            img = Image.new('RGB', (100, 100), color=(50, 60, 70))
+            img.save(output)
+
+        page.save_screenshot.side_effect = fake_save
+
+        with patch.dict(os.environ, {'PI_NODRIVER_XVFB_FORWARD_CLICK': '0'}):
+            jpg_out = await worker.save_viewport_screenshot(page, 'test-jpg-')
+            self.assertTrue(jpg_out.is_file())
+            self.assertEqual(jpg_out.suffix, '.jpg')
+
+            png_out = await worker.save_viewport_screenshot(page, 'test-png-', format='png')
+            self.assertTrue(png_out.is_file())
+            self.assertEqual(png_out.suffix, '.png')
+
 
 if __name__ == '__main__':
     unittest.main()

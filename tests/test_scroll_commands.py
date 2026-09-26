@@ -11,6 +11,16 @@ class ScrollCommandTests(unittest.IsolatedAsyncioTestCase):
         self.worker.require_page = AsyncMock(return_value=self.mock_page)
         self.worker.wait_for_page_ready = AsyncMock()
 
+    async def test_rejects_relative_vertical_scroll_directions(self):
+        for command in ('scroll up', 'scroll up 600', 'scroll down', 'scroll down 600'):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, 'relative vertical scrolling is unavailable'):
+                    await self.worker.execute(command, 'sess_no_relative_vertical')
+
+    async def test_rejects_scroll_without_an_explicit_target(self):
+        with self.assertRaisesRegex(ValueError, 'explicit target'):
+            await self.worker.execute('scroll', 'sess_no_default')
+
     async def test_scroll_to_absolute(self):
         self.mock_page.evaluate.return_value = (
             '{"targetName": "Page Window", "scrollY": 1500, "maxY": 5000, "percentY": 30, '
@@ -54,18 +64,8 @@ class ScrollCommandTests(unittest.IsolatedAsyncioTestCase):
             '{"targetName": "Page Window", "scrollY": 600, "maxY": 5000, "percentY": 12, '
             '"atBottom": false, "atTop": false, "moved": true}'
         )
-        await self.worker.execute('scroll down 600', 'sess_guard')
-        await self.worker.execute('scroll down 600', 'sess_guard')
+        await self.worker.execute('scroll to 600', 'sess_guard')
+        await self.worker.execute('scroll to 1200', 'sess_guard')
         with self.assertRaises(ValueError) as ctx:
-            await self.worker.execute('scroll down 600', 'sess_guard')
-        self.assertIn('SCROLL_LOOP_GUARD', str(ctx.exception))
-
-    async def test_scroll_loop_guard_triggers_on_ping_pong(self):
-        self.mock_page.evaluate.return_value = (
-            '{"targetName": "Page Window", "scrollY": 600, "maxY": 5000, "percentY": 12, '
-            '"atBottom": false, "atTop": false, "moved": true}'
-        )
-        await self.worker.execute('scroll down 600', 'sess_pong')
-        with self.assertRaises(ValueError) as ctx:
-            await self.worker.execute('scroll up 600', 'sess_pong')
+            await self.worker.execute('scroll to 1800', 'sess_guard')
         self.assertIn('SCROLL_LOOP_GUARD', str(ctx.exception))

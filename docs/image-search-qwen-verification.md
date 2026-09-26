@@ -116,6 +116,48 @@ When interpreting reverse-image results:
 These are interpretation requirements, not a claim that the tested Qwen answer
 already followed them or that prompt wording guarantees compliance.
 
+## Parallel batch follow-up verification
+
+A subsequent source-extension Pi CLI test on 2026-09-23 used the same
+`local-llama/qwen3.6-35b-q4` model with two non-private 200×200 fixtures: a red
+circle and a blue triangle. Both images and exact local paths were supplied;
+the prompt asked 「這兩張圖一起搜圖，分別找一個相似圖片來源，並各自開啟確認」,
+without naming the batch tool. Both single-image and batch tools, the browser,
+Google search and read remained available.
+
+The final run used exactly **three tool calls**:
+
+1. `image_search_batch` with both paths (default concurrency 2).
+2. `image-search-select` with the red-circle search ID and its 13th result ref.
+3. `image-search-select` with the blue-triangle search ID and its 7th result ref.
+
+| Image | Relative job start | Relative job end | Candidates | Selection |
+| --- | --- | --- | --- | --- |
+| Red circle | 0.000 s | 2.525 s | 20 | Magnific red round sticker |
+| Blue triangle | 0.002 s | 2.589 s | 20 | Wikimedia Commons blue triangle |
+
+The job intervals overlap; both independent searches completed within about
+**2.6 seconds**. The complete Pi run, including model reasoning, two destination
+visits and the final answer, took **36.43 seconds**. There were no preliminary
+web searches, manual camera actions, upload retries or tool errors in this run.
+Returned search IDs and paths matched both destination selections. These are
+single-run observations, not a throughput or reliability guarantee.
+
+An earlier trial also found both images successfully but Qwen attempted another
+ref after navigating away from one search. The stale-ref guard rejected it.
+The final implementation explicitly marks a selected search complete and tells
+the agent that its other refs have expired; the final trial did not repeat that
+mistake. Wrong-image refs, foreign-owner IDs, expired/evicted tabs and cleanup
+are also covered by deterministic tests.
+
+The final answer distinguished visual similarity from confirmed provenance.
+This test verifies routing, overlapping searches and path/ref pairing; it does
+not independently certify every author, licensing or descriptive claim in the
+model's answer. The batch test used the **source extension explicitly loaded
+into Pi**, not an already-running PiWeb session. Existing sessions need reload
+to discover the new tool after installation. No source code publication is
+implied by this report.
+
 ## Safety and verification boundaries
 
 The local implementation stops on consent, CAPTCHA, access or login gates and
