@@ -1380,6 +1380,7 @@ def format_snapshot(elements: list[dict]) -> str:
             ('placeholder', 'placeholder'),
             ('selected', 'selected'),
             ('frame', 'frame'),
+            ('frameSrc', 'src'),
             ('href', 'href'),
             ('download', 'download'),
         ):
@@ -1396,6 +1397,7 @@ def format_snapshot(elements: list[dict]) -> str:
             ('disabled', 'disabled'),
             ('valueSet', 'value-set'),
             ('offscreen', 'offscreen'),
+            ('crossOrigin', 'cross-origin'),
         ):
             if item.get(state) is not None:
                 line += f' {label}="{str(bool(item[state])).lower()}"'
@@ -1407,6 +1409,11 @@ def format_snapshot(elements: list[dict]) -> str:
         lines.append(line)
     if not lines:
         return '(no interactive elements)'
+    if any(item.get('tag') == 'iframe' and item.get('crossOrigin') for item in elements):
+        lines.append(
+            'Cross-origin iframe content (e.g. a login overlay on another subdomain) exists but is not listed here. '
+            'Its inputs and buttons are real: use vision-mark omni, then vision-click <x> <y> / vision-fill <x> <y> "text".'
+        )
     if has_select:
         lines.append('Dropdown options are searchable without opening them: find-option "keywords", then use the returned select @ref --index=N command.')
     return '\n'.join(lines)

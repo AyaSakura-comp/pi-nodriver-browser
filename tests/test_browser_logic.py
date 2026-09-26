@@ -1307,3 +1307,16 @@ class ViewportLocateTests(unittest.TestCase):
         left, top, diff = locate_viewport_offset(screen.crop((0, 0, 1280, 720)), page)
         self.assertEqual((left, top), (0, 87))
         self.assertLess(diff, 1)
+
+
+class CrossOriginIframeSnapshotTests(unittest.TestCase):
+    def test_cross_origin_iframe_shows_origin_and_hint(self):
+        from browser_logic import format_snapshot
+        out = format_snapshot([{'ref': 'e90', 'tag': 'iframe', 'frameSrc': 'https://account.momoshop.com.tw', 'crossOrigin': True}])
+        self.assertIn('src="https://account.momoshop.com.tw" cross-origin="true"', out)
+        self.assertIn('vision-fill', out)
+
+    def test_same_origin_iframe_has_no_hint(self):
+        from browser_logic import format_snapshot
+        out = format_snapshot([{'ref': 'e1', 'tag': 'iframe', 'frameSrc': 'https://a.example', 'crossOrigin': False}])
+        self.assertNotIn('Cross-origin iframe content', out)

@@ -619,7 +619,15 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
         /^[-+]?\d+(?:\.\d+)?$/.test(String(option.textContent || '').trim())
       ) ? 'numeric' : (el.tagName === 'SELECT' ? 'text' : ''),
       offscreen: isOffscreen ? true : null,
-      frame
+      frame,
+      // Cross-origin iframes (e.g. login overlays on another subdomain) cannot be traversed from here:
+      // expose their origin so the agent knows the controls exist and must be reached visually.
+      frameSrc: el.tagName === 'IFRAME'
+        ? (() => { try { return new URL(el.src, el.ownerDocument.location.href).origin; } catch (_) { return ''; } })()
+        : '',
+      crossOrigin: el.tagName === 'IFRAME'
+        ? (() => { try { return !el.contentDocument; } catch (_) { return true; } })()
+        : null
     };
   });
 })(__PI_FULL_PAGE__))'''
@@ -1908,6 +1916,32 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
   return { found: true, ok: false, error: `unsupported ref action: ${request.action}` };
 })(__PI_REF_ACTION_REQUEST__))'''
 
+
+FOCUSED_FRAME_EDITABLE_JS = r'''JSON.stringify((() => {
+  const el = document.activeElement;
+  if (!document.hasFocus() || !el || el === document.body) return { ok: false };
+  const tag = (el.tagName || '').toLowerCase();
+  const editable = tag === 'input' || tag === 'textarea' || el.isContentEditable;
+  if (!editable) return { ok: false, tag };
+  const type = String(el.type || '').toLowerCase();
+  if (tag === 'input' && ['checkbox', 'radio', 'button', 'submit', 'file', 'hidden', 'image', 'reset'].includes(type)) {
+    return { ok: false, tag, type };
+  }
+  const view = el.ownerDocument.defaultView;
+  // clear the old value through the native setter so framework-controlled inputs see it
+  if (tag === 'input' || tag === 'textarea') {
+    const proto = tag === 'input' ? view.HTMLInputElement.prototype : view.HTMLTextAreaElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, ''); else el.value = '';
+    el.dispatchEvent(new view.Event('input', { bubbles: true }));
+  } else {
+    el.textContent = '';
+  }
+  return { ok: true, tag, type, sensitive: type === 'password', placeholder: el.placeholder || '' };
+})())'''
+
+FOCUSED_FRAME_VALUE_LEN_JS = r'''(() => { const el = document.activeElement; return el ? String(el.value ?? el.textContent ?? '').length : -1; })()'''
+
 VISION_FILL_JS = r'''JSON.stringify(((payload) => {
   const x = Number(payload.x);
   const y = Number(payload.y);
@@ -1932,6 +1966,12 @@ VISION_FILL_JS = r'''JSON.stringify(((payload) => {
   }
 
   if (!target) return { ok: false, error: 'no element found at point' };
+
+  // A (cross-origin) iframe: the preceding native click already focused the control inside it.
+  // Calling iframe.focus() here would move focus back to the frame's <body>, so bail out untouched.
+  if ((target.tagName || '').toLowerCase() === 'iframe') {
+    return { ok: false, error: `element <iframe> at (${x}, ${y}) is not an editable input`, iframe: true };
+  }
 
   if (typeof target.focus === 'function') {
     try { target.focus(); } catch (_) {}
@@ -5243,6 +5283,41 @@ class BrowserWorker:
         rect = await self.omni_content_rect(page, image_width or 100000, image_height or 100000)
         return float(rect[1]) if rect else 76.0
 
+    async def fill_focused_in_frames(self, page, text):
+        """Type into the element that has focus inside a child frame (incl. cross-origin iframes such as
+        login overlays, which top-document JS cannot reach). The preceding native click moved focus there;
+        CDP isolated worlds find it, and Input.insertText delivers trusted keyboard input to it."""
+        tree = await page.send(uc.cdp.page.get_frame_tree())
+
+        def walk(node, depth=0):
+            if depth:
+                yield node.frame
+            for child in node.child_frames or []:
+                yield from walk(child, depth + 1)
+
+        for frame in walk(tree):
+            try:
+                ctx = await page.send(uc.cdp.page.create_isolated_world(
+                    frame_id=frame.id_, world_name='pi-vision-fill'))
+                res, _ = await page.send(uc.cdp.runtime.evaluate(
+                    expression=FOCUSED_FRAME_EDITABLE_JS, context_id=ctx, return_by_value=True))
+                info = json.loads(res.value) if res and isinstance(res.value, str) else {}
+            except Exception:
+                continue
+            if not info.get('ok'):
+                continue
+            await page.send(uc.cdp.input_.insert_text(text=text))
+            try:
+                res, _ = await page.send(uc.cdp.runtime.evaluate(
+                    expression=FOCUSED_FRAME_VALUE_LEN_JS, context_id=ctx, return_by_value=True))
+                length = int(res.value)
+            except Exception:
+                length = -1
+            return {'ok': length == len(text) or length < 0, 'sensitive': bool(info.get('sensitive')),
+                    'frameUrl': frame.url, 'valueLength': length,
+                    'error': None if length in (-1, len(text)) else f'typed {length} of {len(text)} characters'}
+        return None
+
     async def call_omniparser(self, screenshot_path, image_size=None):
         endpoint = urllib.parse.urlparse(
             os.environ.get('PI_NODRIVER_OMNIPARSER_URL', 'http://127.0.0.1:8012/parse')
@@ -7975,6 +8050,10 @@ class BrowserWorker:
                 fill_res = json.loads(await page.evaluate(
                     VISION_FILL_JS.replace('__PI_VISION_FILL_PAYLOAD__', fill_payload)
                 ))
+                if not fill_res.get('ok') and 'is not an editable input' in str(fill_res.get('error')) and '<iframe>' in str(fill_res.get('error')):
+                    frame_res = await self.fill_focused_in_frames(page, text)
+                    if frame_res is not None:
+                        fill_res = frame_res
                 if not fill_res.get('ok'):
                     raise ValueError(fill_res.get('error') or f'Failed to fill input at ({x:g}, {y:g})')
 
@@ -8063,6 +8142,10 @@ class BrowserWorker:
             fill_res = json.loads(await page.evaluate(
                 VISION_FILL_JS.replace('__PI_VISION_FILL_PAYLOAD__', fill_payload)
             ))
+            if not fill_res.get('ok') and '<iframe>' in str(fill_res.get('error')):
+                frame_res = await self.fill_focused_in_frames(page, text)
+                if frame_res is not None:
+                    fill_res = frame_res
             if not fill_res.get('ok'):
                 raise ValueError(fill_res.get('error') or f'Failed to fill input at marker ({marker.x:g}, {marker.y:g})')
 
