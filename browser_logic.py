@@ -1410,3 +1410,106 @@ def format_snapshot(elements: list[dict]) -> str:
     if has_select:
         lines.append('Dropdown options are searchable without opening them: find-option "keywords", then use the returned select @ref --index=N command.')
     return '\n'.join(lines)
+
+
+def omni_rect_from_metrics(metrics: dict, image_width: int, image_height: int):
+    """Page-content rectangle (left, top, right, bottom) in Xvfb screenshot pixels.
+
+    `metrics` = window.screenX/screenY/outerWidth/outerHeight/innerWidth/innerHeight/devicePixelRatio.
+    Chrome draws its tab strip and toolbar above the viewport and (on Linux) no bottom frame, so the
+    viewport's top edge is screenY + outerHeight - innerHeight. Returns None when the numbers are
+    unusable, so callers can fall back to the full screenshot.
+    """
+    try:
+        dpr = float(metrics.get('dpr') or 1) or 1.0
+        sx, sy = float(metrics['sx']), float(metrics['sy'])
+        ow, oh = float(metrics['ow']), float(metrics['oh'])
+        iw, ih = float(metrics['iw']) * dpr, float(metrics['ih']) * dpr
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (sx, sy, ow, oh, iw, ih)) or iw <= 0 or ih <= 0:
+        return None
+    left = sx + max(0.0, (ow - iw) / 2)
+    top = sy + max(0.0, oh - ih)
+    right, bottom = left + iw, top + ih
+    left, top = max(0, int(round(left))), max(0, int(round(top)))
+    right, bottom = min(int(image_width), int(round(right))), min(int(image_height), int(round(bottom)))
+    if right - left < 64 or bottom - top < 64:
+        return None
+    return left, top, right, bottom
+
+
+def omni_dynamic_params(content_width: int, content_height: int, env=None) -> dict:
+    """OmniParser input size and candidate cap scaled to the page-content area.
+
+    image size keeps the detector's downscale near PI_NODRIVER_OMNI_SCALE (default 0.8, so small
+    icons stay detectable) within [800, 1280] rounded to 32; the candidate cap grows with area
+    (one per ~16k px², 30..80). Explicit PI_NODRIVER_OMNI_IMAGE_SIZE / PI_NODRIVER_OMNI_LIMIT win.
+    """
+    env = os.environ if env is None else env
+    long_side = max(int(content_width), int(content_height), 1)
+    try:
+        scale = float(env.get('PI_NODRIVER_OMNI_SCALE', '0.8'))
+    except ValueError:
+        scale = 0.8
+    size = int(math.ceil(long_side * scale / 32.0) * 32)
+    size = max(800, min(1280, size))
+    limit = max(30, min(80, int(round(content_width * content_height / 16000.0))))
+    try:
+        if env.get('PI_NODRIVER_OMNI_IMAGE_SIZE'):
+            size = int(env['PI_NODRIVER_OMNI_IMAGE_SIZE'])
+    except ValueError:
+        pass
+    try:
+        if env.get('PI_NODRIVER_OMNI_LIMIT'):
+            limit = int(env['PI_NODRIVER_OMNI_LIMIT'])
+    except ValueError:
+        pass
+    return {'imageSize': size, 'limit': limit}
+
+
+def trim_screen_margins(image, threshold: int = 8):
+    """(right, bottom) of the non-black area of an Xvfb root screenshot: the Chrome window can be
+    smaller than the X screen, leaving pure-black margins on the right/bottom."""
+    from PIL import Image as _Image  # local: browser_logic stays importable without Pillow
+    gray = image.convert('L')
+    mask = gray.point(lambda v: 255 if v > threshold else 0)
+    box = mask.getbbox()
+    if not box:
+        return image.width, image.height
+    return box[2], box[3]
+
+
+def locate_viewport_offset(screen_image, viewport_image, max_offset: int = 260, strip: int = 32, step: int = 1):
+    """Find where a CDP viewport screenshot sits inside an Xvfb screen screenshot.
+
+    Slides the viewport's top strip down the screen image and returns (left, top, mean_abs_diff).
+    Coarse search at 1/4 resolution, then 1px refinement. Robust to device-metrics emulation, which
+    makes JS window.innerHeight/outerHeight useless for computing Chrome's toolbar height.
+    """
+    from PIL import ImageChops, ImageStat
+    sw, sh = screen_image.size
+    vw, vh = viewport_image.size
+    width = min(sw, vw)
+    if width < 64 or vh < strip + 1 or sh < strip + 1:
+        return None
+    q = 4
+    screen = screen_image.convert('L')
+    view = viewport_image.convert('L')
+    small_screen = screen.crop((0, 0, width, min(sh, max_offset + strip))).resize((width // q, min(sh, max_offset + strip) // q))
+    small_ref = view.crop((0, 0, width, strip)).resize((width // q, strip // q))
+    rows = strip // q
+    coarse = None
+    for top in range(0, small_screen.height - rows + 1, step):
+        diff = ImageStat.Stat(ImageChops.difference(small_ref, small_screen.crop((0, top, width // q, top + rows)))).mean[0]
+        if coarse is None or diff < coarse[1]:
+            coarse = (top * q, diff)
+    if coarse is None:
+        return None
+    ref = view.crop((0, 0, width, strip))
+    best = None
+    for top in range(max(0, coarse[0] - q), min(sh - strip, coarse[0] + q) + 1):
+        diff = ImageStat.Stat(ImageChops.difference(ref, screen.crop((0, top, width, top + strip)))).mean[0]
+        if best is None or diff < best[2]:
+            best = (0, top, diff)
+    return best

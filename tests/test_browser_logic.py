@@ -1260,3 +1260,50 @@ class SnapshotFormattingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OmniDynamicRegionTests(unittest.TestCase):
+    def test_desktop_window_on_larger_xvfb_screen(self):
+        from browser_logic import omni_rect_from_metrics
+        rect = omni_rect_from_metrics({'sx': 0, 'sy': 0, 'ow': 1280, 'oh': 720, 'iw': 1280, 'ih': 633, 'dpr': 1}, 1366, 768)
+        self.assertEqual(rect, (0, 87, 1280, 720))
+
+    def test_mobile_frame_matches_legacy_toolbar(self):
+        from browser_logic import omni_rect_from_metrics
+        rect = omni_rect_from_metrics({'sx': 0, 'sy': 0, 'ow': 500, 'oh': 1000, 'iw': 500, 'ih': 924}, 500, 1000)
+        self.assertEqual(rect, (0, 76, 500, 1000))
+
+    def test_bad_metrics_fall_back(self):
+        from browser_logic import omni_rect_from_metrics
+        self.assertIsNone(omni_rect_from_metrics({'sx': 0}, 500, 1000))
+        self.assertIsNone(omni_rect_from_metrics({'sx': 0, 'sy': 0, 'ow': 10, 'oh': 10, 'iw': 10, 'ih': 10}, 500, 1000))
+
+    def test_params_scale_with_content(self):
+        from browser_logic import omni_dynamic_params
+        self.assertEqual(omni_dynamic_params(500, 924, {}), {'imageSize': 800, 'limit': 30})
+        self.assertEqual(omni_dynamic_params(1280, 633, {}), {'imageSize': 1024, 'limit': 51})
+        self.assertEqual(omni_dynamic_params(1920, 1000, {})['imageSize'], 1280)
+
+    def test_explicit_env_wins(self):
+        from browser_logic import omni_dynamic_params
+        env = {'PI_NODRIVER_OMNI_IMAGE_SIZE': '640', 'PI_NODRIVER_OMNI_LIMIT': '15'}
+        self.assertEqual(omni_dynamic_params(1280, 633, env), {'imageSize': 640, 'limit': 15})
+
+
+class ViewportLocateTests(unittest.TestCase):
+    def test_finds_toolbar_offset_and_black_margins(self):
+        from PIL import Image, ImageDraw
+        from browser_logic import locate_viewport_offset, trim_screen_margins
+        page = Image.new('RGB', (1280, 720), 'white')
+        d = ImageDraw.Draw(page)
+        for i in range(0, 1280, 40):
+            d.rectangle((i, 0, i + 20, 60), fill=(200, 30, 30))
+        d.text((100, 10), 'PChome', fill='black')
+        screen = Image.new('RGB', (1366, 768), 'black')
+        chrome = Image.new('RGB', (1280, 87), (240, 240, 240))
+        screen.paste(chrome, (0, 0))
+        screen.paste(page.crop((0, 0, 1280, 633)), (0, 87))
+        self.assertEqual(trim_screen_margins(screen), (1280, 720))
+        left, top, diff = locate_viewport_offset(screen.crop((0, 0, 1280, 720)), page)
+        self.assertEqual((left, top), (0, 87))
+        self.assertLess(diff, 1)

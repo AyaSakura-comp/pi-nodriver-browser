@@ -672,7 +672,11 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 | `PI_NODRIVER_FRAME_HEIGHT` | `720` | Content viewport height in pixels (default desktop: `720`, mobile override: `844`). |
 | `PI_NODRIVER_AUTO_IDENTITY` | `linux` | Default browser identity mode (`linux` for native desktop Chrome, `android` for mobile emulation). |
 | `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
-| `PI_NODRIVER_TOOLBAR_HEIGHT` | `76` | Chrome top toolbar height used only when converting viewport-origin coordinates to X11 screen coordinates. Xvfb-backed `vision-click` already has screenshot/screen coordinates and does not add it again. |
+| `PI_NODRIVER_TOOLBAR_HEIGHT` | measured (fallback `76`) | Chrome top toolbar height. By default it is measured live (Xvfb screenshot aligned against a CDP viewport screenshot, cached 120 s per window size), because device-metrics emulation makes JS window metrics unusable; set it only to force a value. Used when converting viewport-origin coordinates to X11 screen coordinates. Xvfb-backed `vision-click` already has screenshot/screen coordinates and does not add it again. |
+| `PI_NODRIVER_OMNI_SCALE` | `0.8` | Target detector downscale for `vision-mark omni`. OmniParser runs only on the measured page-content crop (no tab strip, address bar or empty X-screen margins); its input size is `ceil(long side × scale / 32) × 32`, clamped to 800–1280 (desktop 1280×633 → 1024, mobile → 800). |
+| `PI_NODRIVER_OMNI_IMAGE_SIZE` | dynamic | Force the OmniParser input size instead of the dynamic value. |
+| `PI_NODRIVER_OMNI_LIMIT` | dynamic | Force the candidate cap; by default one per ~16k px² of page content, 30–80 (desktop ≈ 51, mobile 30). |
+| `PI_NODRIVER_OMNI_THRESHOLD` | service default | Override the detector confidence threshold per request. |
 | `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
 | `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
 | `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM and vision mouse long presses. |

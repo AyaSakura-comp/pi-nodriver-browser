@@ -33,7 +33,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -5190,7 +5190,60 @@ class BrowserWorker:
             self.screenshot_capture_backends.pop(next(iter(self.screenshot_capture_backends)))
         return output
 
-    async def call_omniparser(self, screenshot_path):
+    async def omni_content_rect(self, page, image_width, image_height, screen_path=None):
+        """Page viewport rectangle (left, top, right, bottom) in Xvfb screenshot pixels.
+
+        JS window metrics are unusable under device-metrics emulation (innerHeight == outerHeight),
+        so the viewport is located visually: trim the black X-screen margins, then align a CDP
+        viewport screenshot against the Xvfb screenshot. Cached per window size for 120 s.
+        """
+        try:
+            if screen_path is None:
+                screen_path = await self.save_viewport_screenshot(page, 'pi-nodriver-rect-', format='png')
+                if self.screenshot_capture_backends.get(str(screen_path)) != 'xvfb':
+                    return None
+            with Image.open(screen_path) as screen_image:
+                screen_image.load()
+                right, bottom = trim_screen_margins(screen_image)
+                cache = getattr(self, '_viewport_offset_cache', {})
+                self._viewport_offset_cache = cache
+                key = (screen_image.size, right, bottom)
+                hit = cache.get(key)
+                if hit and time.monotonic() - hit[1] < 120:
+                    left, top = hit[0]
+                else:
+                    tmp_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-vp-'))
+                    vp_path = tmp_dir / 'viewport.png'
+                    try:
+                        await asyncio.wait_for(page.save_screenshot(vp_path, format='png', full_page=False), timeout=10)
+                        with Image.open(vp_path) as vp_image:
+                            found = locate_viewport_offset(screen_image.crop((0, 0, right, bottom)), vp_image)
+                    finally:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    if not found or found[2] > 12:
+                        return None
+                    left, top = found[0], found[1]
+                    cache[key] = ((left, top), time.monotonic())
+        except Exception:
+            return None
+        right, bottom = min(int(image_width), right), min(int(image_height), bottom)
+        if right - left < 64 or bottom - top < 64:
+            return None
+        return int(left), int(top), int(right), int(bottom)
+
+    async def xvfb_toolbar_height(self, page, image_width=None, image_height=None):
+        """Distance from the Xvfb screen top to the page viewport. An explicit
+        PI_NODRIVER_TOOLBAR_HEIGHT wins; otherwise it is measured, falling back to 76."""
+        explicit = os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT')
+        if explicit:
+            try:
+                return float(explicit)
+            except ValueError:
+                pass
+        rect = await self.omni_content_rect(page, image_width or 100000, image_height or 100000)
+        return float(rect[1]) if rect else 76.0
+
+    async def call_omniparser(self, screenshot_path, image_size=None):
         endpoint = urllib.parse.urlparse(
             os.environ.get('PI_NODRIVER_OMNIPARSER_URL', 'http://127.0.0.1:8012/parse')
         )
@@ -5205,6 +5258,8 @@ class BrowserWorker:
                 payload_data['threshold'] = float(omni_threshold)
             except ValueError:
                 pass
+        if image_size is not None:
+            payload_data['image_size'] = int(image_size)
         omni_image_size = os.environ.get('PI_NODRIVER_OMNI_IMAGE_SIZE')
         if omni_image_size is not None:
             try:
@@ -5753,7 +5808,7 @@ class BrowserWorker:
         await self.ensure_page_front(page)
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if xvfb_screen_points is None:
-                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                toolbar_height = int(round(await self.xvfb_toolbar_height(page)))
                 xvfb_screen_points = (
                     (start_x, start_y + toolbar_height),
                     (end_x, end_y + toolbar_height),
@@ -6040,7 +6095,7 @@ class BrowserWorker:
             await before_dispatch()
         if os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if xvfb_screen_point is None:
-                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                toolbar_height = int(round(await self.xvfb_toolbar_height(page)))
                 xvfb_screen_point = (x, y + toolbar_height)
             res = await self.xvfb_mouse_long_press(
                 page, *xvfb_screen_point, duration_ms,
@@ -6105,7 +6160,7 @@ class BrowserWorker:
     ):
         if prefer_xvfb and os.environ.get('PI_NODRIVER_XVFB_FORWARD_CLICK', '1') == '1':
             if xvfb_screen_point is None:
-                toolbar_height = int(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                toolbar_height = int(round(await self.xvfb_toolbar_height(page)))
                 xvfb_screen_point = (x, y + toolbar_height)
             if await self.xvfb_mouse_click(page, *xvfb_screen_point):
                 return True
@@ -7449,7 +7504,7 @@ class BrowserWorker:
                 click_x, click_y = map_screenshot_point_to_viewport(
                     page_state, image_width, image_height, x, y,
                     capture_backend=capture_backend,
-                    toolbar_height=float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76')),
+                    toolbar_height=await self.xvfb_toolbar_height(page, image_width, image_height),
                 )
                 output = self.annotate_vision_screenshot(clean, x, y)
                 token = secrets.token_hex(12)
@@ -7509,7 +7564,7 @@ class BrowserWorker:
                 with Image.open(clean) as screenshot_image:
                     image_width, image_height = screenshot_image.size
                 capture_backend = self.screenshot_capture_backends.get(str(clean), 'cdp')
-                toolbar_height = float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
+                toolbar_height = await self.xvfb_toolbar_height(page, image_width, image_height)
                 click_x1, click_y1 = map_screenshot_point_to_viewport(
                     page_state, image_width, image_height, x1, y1,
                     capture_backend=capture_backend, toolbar_height=toolbar_height,
@@ -8774,7 +8829,28 @@ class BrowserWorker:
                 with Image.open(clean) as screenshot_image:
                     image_width, image_height = screenshot_image.size
                 capture_backend = self.screenshot_capture_backends.get(str(clean), 'cdp')
-                parsed = await self.call_omniparser(clean)
+                # Detect only on the page content (no tab strip / address bar / empty Xvfb margins),
+                # with input size and candidate cap scaled to that area, then map back to screen pixels.
+                content_rect = (
+                    await self.omni_content_rect(page, image_width, image_height, screen_path=clean)
+                    if capture_backend == 'xvfb' else None
+                )
+                measured = content_rect is not None
+                if content_rect is None:
+                    content_rect = (0, 0, image_width, image_height)
+                left, top, right, bottom = content_rect
+                crop_w, crop_h = right - left, bottom - top
+                detect_path = clean
+                if (left, top, right, bottom) != (0, 0, image_width, image_height):
+                    detect_path = clean.with_name(clean.stem + '-content' + clean.suffix)
+                    with Image.open(clean) as full_image:
+                        full_image.crop((left, top, right, bottom)).save(detect_path)
+                omni_params = omni_dynamic_params(crop_w, crop_h)
+                try:
+                    parsed = await self.call_omniparser(detect_path, image_size=omni_params['imageSize'])
+                finally:
+                    if detect_path != clean:
+                        detect_path.unlink(missing_ok=True)
                 if await self.vision_page_state(page) != state:
                     raise ValueError(
                         'OMNI_CONFIRMATION_REQUIRED: page changed during detection; run vision-mark omni again'
@@ -8783,19 +8859,36 @@ class BrowserWorker:
                     latency = float(parsed['latency'])
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError('OmniParser returned an invalid latency') from error
-                toolbar_height = (
-                    float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
-                    if capture_backend == 'xvfb' else 0.0
-                )
-                omni_limit = int(os.environ.get('PI_NODRIVER_OMNI_LIMIT', '30'))
-                elements = self.filter_omni_page_candidates(
-                    parsed.get('elements', []),
-                    min_y=toolbar_height,
-                    limit=omni_limit,
-                    image_width=image_width,
-                    image_height=image_height,
-                    capture_backend=capture_backend,
-                )
+                if capture_backend != 'xvfb':
+                    toolbar_height = 0.0
+                elif measured:
+                    toolbar_height = float(top)
+                else:
+                    # measurement failed: keep the legacy fixed browser-chrome cutoff
+                    toolbar_height = float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT') or 76)
+                omni_limit = omni_params['limit']
+                if measured:
+                    # Detection ran on the cropped page content: filter in crop space (bounds and
+                    # area ratios relative to the page), then shift back to Xvfb screen pixels.
+                    elements = self.filter_omni_page_candidates(
+                        parsed.get('elements', []), min_y=0, limit=omni_limit,
+                        image_width=crop_w, image_height=crop_h, capture_backend='cdp',
+                    )
+                    for element in elements:
+                        x1, y1, x2, y2 = element['box']
+                        element['box'] = [x1 + left, y1 + top, x2 + left, y2 + top]
+                        cx, cy = element['center']
+                        element['center'] = [cx + left, cy + top]
+                else:
+                    elements = self.filter_omni_page_candidates(
+                        parsed.get('elements', []),
+                        min_y=toolbar_height,
+                        limit=omni_limit,
+                        image_width=image_width,
+                        image_height=image_height,
+                        capture_backend=capture_backend,
+                    )
+                omni_meta = {'contentRect': [left, top, right, bottom], **omni_params}
                 annotated_dir = Path(tempfile.mkdtemp(prefix='pi-nodriver-omniparse-'))
                 annotated = annotated_dir / 'annotated.png'
                 self.annotate_omni_candidates(clean, annotated, elements)
@@ -8826,15 +8919,12 @@ class BrowserWorker:
                     'screenshotPath': str(annotated),
                     'elements': elements,
                     'latency': latency,
+                    'omniDetection': omni_meta,
                 }
             finally:
                 clean.unlink(missing_ok=True)
             self.touch_tab(page)
             self.vision_guard.record_screenshot(session_id, state)
-            toolbar_height = (
-                float(os.environ.get('PI_NODRIVER_TOOLBAR_HEIGHT', '76'))
-                if capture_backend == 'xvfb' else 0.0
-            )
             self.omni_previews[session_id] = {
                 'state': state,
                 'imageWidth': image_width,
