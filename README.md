@@ -11,6 +11,174 @@ Designed specifically for autonomous agent pair-programming, dynamic SPA interac
 
 ---
 
+## Deploy from a fresh clone (Linux)
+
+**Choose a deployment tier:** the core `browser` tool needs Pi + Python + Chrome/Xvfb.
+OmniParser adds visual detection; Laya adds the separate `browser_intent` tool;
+Xvfb Streaming is optional viewing/recording. Submodules pin source code only:
+they do **not** install model weights, Python environments, or background services.
+
+### 1. Prerequisites and pinned source
+
+Install Pi separately and confirm `pi --version`. On Debian/Ubuntu, install the
+browser system dependencies (adapt package names for other distributions):
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip xvfb xauth \
+  xdotool poppler-utils
+# Install Google Chrome or Chromium separately; verify its executable exists.
+command -v google-chrome || command -v chromium || command -v chromium-browser
+```
+
+Model-service examples below use Python 3.12 and separate environments. Do not
+replace the Python/PyTorch environment of an already-running model service.
+
+```sh
+git clone https://github.com/AyaSakura-comp/pi-nodriver-browser.git
+cd pi-nodriver-browser
+export ROOT="$PWD"   # reuse this absolute path in the following terminals
+
+# Public dependencies only; enough for the core browser + detector + Laya model.
+git submodule update --init -- dependencies/omniparser dependencies/laya
+```
+
+For **all four** submodules, first authenticate with an account authorized for
+`laya-browser-intent` and `xvfb-streaming` (both private):
+
+```sh
+gh auth login
+gh auth setup-git
+git submodule update --init --recursive
+git submodule status --recursive
+```
+
+Do not use `--remote` during normal installation: it would advance the pins.
+No credentials belong in `.gitmodules`. See [dependency setup](docs/dependencies.md)
+for exact versions, selective initialization, upgrades, and private access errors.
+
+### 2. Install the core browser extension
+
+Finish any active browser task first. **`install.sh` is not a dry run**: it shuts
+down the current browser daemon, cleans browser state, copies the extension,
+creates its worker environment, and may disable a conflicting browser package.
+Do not run it from a dirty development tree if you intend to install the release.
+
+```sh
+cd "$ROOT"
+bash install.sh
+# In Pi: /reload, or start a new Pi session.
+```
+
+The target is `~/.pi/agent/extensions/nodriver-browser`; Chrome/the daemon start
+on the first browser tool call. No standalone `worker.py` service is needed.
+For a deliberate **core-only** deployment without OmniParser, launch Pi with:
+
+```sh
+PI_NODRIVER_VISION_FALLBACK=manual pi
+```
+
+This keeps semantic browser operations available and uses manual visual marking
+instead of contacting a missing detector. Ask Pi to search for a public page,
+open the exact returned URL, and run `snapshot -i` to smoke-test the core tool.
+
+### 3. Optional OmniParser visual detection (localhost:8012)
+
+Follow the pinned fork's [CPU INT8 installation guide](dependencies/omniparser/docs/CPU_INT8_INSTALL.md)
+to create a compatible environment, obtain the trusted YOLOv9-E checkpoint,
+and export or provision the calibrated XML/BIN pair. Model files are not in Git.
+After that preparation, run in a separate terminal with the chosen environment:
+
+```sh
+export OMNI_PYTHON=/absolute/path/to/omni-environment/bin/python
+"$OMNI_PYTHON" "$ROOT/dependencies/omniparser/detector_service.py" \
+  --backend openvino-int8 --device cpu --threads 16 \
+  --model "$ROOT/dependencies/omniparser/weights/icon_detect_v3/openvino-int8/int8-1024.xml" \
+  --threshold 0.05 --image-size 1024 --host 127.0.0.1 --port 8012
+```
+
+From another terminal, verify `curl -fsS http://127.0.0.1:8012/health` reports
+`backend: openvino-int8` and `device: cpu`. Launch/reload Pi with
+`PI_NODRIVER_VISION_FALLBACK=omni` and call `vision-mark omni` on an open public
+page. A non-default detector URL is configured with `PI_NODRIVER_OMNIPARSER_URL`.
+
+**INT8 is optional and lossy, not a speed/accuracy upgrade over GPU FP16.** In the
+20-site test, CPU INT8 took 114 ms vs GPU FP16 71 ms and failed raw-output cosine
+>=0.99 on all 20 images. Use the fork's PyTorch backend if this loss is unsuitable.
+Sizes 800–1280 are supported, with a compile cost for a new/evicted size.
+
+### 4. Optional Laya `browser_intent` stack
+
+This needs **both** `dependencies/laya` (model server) and the private
+`dependencies/laya-browser-intent` (router/API + Pi extension). First prepare a
+separate Python 3.12 environment; select an appropriate PyTorch build before
+installing model dependencies. Installing packages/checkpoints may download
+large files; the first Laya/e5 requests may also download model weights.
+
+```sh
+python3.12 -m venv "$HOME/.venvs/pi-laya"
+export LAYA_PYTHON="$HOME/.venvs/pi-laya/bin/python"
+"$LAYA_PYTHON" -m pip install -e "$ROOT/dependencies/laya[serve]"
+"$LAYA_PYTHON" -m pip install transformers
+
+# Terminal A: Laya model server (not the intent router).
+"$LAYA_PYTHON" "$ROOT/dependencies/laya/examples/server.py" \
+  --host 127.0.0.1 --port 8000 --device cpu --no-preload
+```
+
+In terminal B, after restoring `ROOT` and `LAYA_PYTHON`, start the intent router:
+
+```sh
+LAYA_URL=http://127.0.0.1:8000/v1/systemone \
+PI_NODRIVER_SOCKET="$HOME/.pi/agent/nodriver-browser.sock" \
+"$LAYA_PYTHON" "$ROOT/dependencies/laya-browser-intent/intent_service.py" --port 8011
+```
+
+Check `http://127.0.0.1:8000/health` and `http://127.0.0.1:8011/health` with curl.
+Laya health before lazy model load is **not** a successful model inference test.
+The core browser daemon must have been started by a browser tool call before
+intent actions can use its socket. Start Pi with the additional extension:
+
+```sh
+LAYA_INTENT_URL=http://127.0.0.1:8011 \
+pi -e "$ROOT/dependencies/laya-browser-intent/pi-extension/browser-intent.ts"
+```
+
+Do not also load an older copy of `browser-intent.ts`. The router uses the caller's
+model context where supported; standalone judge defaults point to a separately
+provisioned OpenAI-compatible model on localhost:8001. Configure `JUDGE_URL` and
+`JUDGE_MODEL` in the router's environment when those defaults do not apply. Laya
+is not that judge model; this guide does not install or restart Qwen for you.
+See the [intent README](dependencies/laya-browser-intent/README.md) for its model
+requirements. Smoke-test one harmless public-page task; do not test with real
+passwords, checkout, or destructive actions.
+
+### 5. Optional streaming, persistence, and updates
+
+Follow [Xvfb Streaming's deployment guide](dependencies/xvfb-streaming/README.md)
+for FFmpeg/X11, environment variables, Docker and optional Tailscale setup.
+Bind to the **actual browser** DISPLAY/XAUTHORITY, not an assumed `:99`; never
+commit `.env`, Tailscale keys, browser profiles, or recorded personal screens.
+Streaming is not required for either browser tool.
+
+The service commands above run in the foreground. For persistent deployment,
+create service-manager units with **absolute** interpreter/model paths and the
+same localhost bindings; keep each service/environment independent. On the
+maintained host, use the existing restart-service hub and the documented
+OmniParser rollback rather than replacing active units blindly. Adding submodules
+did not migrate existing `~/src/...` service working directories.
+
+Before upgrades, inspect both parent and child working trees, preserve local
+changes, pull the parent, then run `git submodule sync --recursive` and
+`git submodule update --init --recursive`. Reinstall the core only during a safe
+browser maintenance window; restart a dependency only if deliberately deploying
+its changed version. See [dependency upgrade rules](docs/dependencies.md).
+
+**Verification scope:** fresh recursive source checkout and pin checks were
+verified. The existing host's INT8 API and browser integration were smoke-tested.
+The complete multi-service installation above has not been tested from scratch
+on a clean machine; do not treat it as a one-command, fully automated installer.
+
 ## 📚 Design Documents
 
 - [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
