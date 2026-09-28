@@ -1,0 +1,16 @@
+[submodule "dependencies/omniparser"]
+	path = dependencies/omniparser
+	url = https://github.com/AyaSakura-comp/OmniParser.git
+	branch = master
+[submodule "dependencies/laya"]
+	path = dependencies/laya
+	url = https://github.com/AyaSakura-comp/laya.git
+	branch = laya
+[submodule "dependencies/laya-browser-intent"]
+	path = dependencies/laya-browser-intent
+	url = https://github.com/AyaSakura-comp/laya-browser-intent.git
+	branch = laya
+[submodule "dependencies/xvfb-streaming"]
+	path = dependencies/xvfb-streaming
+	url = https://github.com/AyaSakura-comp/xvfb-streaming.git
+	branch = master

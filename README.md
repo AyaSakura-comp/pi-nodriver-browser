@@ -111,13 +111,13 @@ RUN_BROWSER_INTEGRATION=0 .venv/bin/python -m unittest discover -s tests -q
 
 ## 🧩 Dependent Project: OmniParser
 
-[Microsoft OmniParser](https://github.com/microsoft/OmniParser) is an **external dependent project** used by the default visual fallback. It is not vendored, forked, or installed by `pi-nodriver-browser`; it keeps its own repository, model weights, Python environment, service lifecycle, and license.
+The default visual fallback uses the [OmniParser fork](https://github.com/AyaSakura-comp/OmniParser), pinned as `dependencies/omniparser`. Laya's model server, Laya Browser Intent, and optional Xvfb Streaming are also pinned submodules. See [dependent projects setup](docs/dependencies.md) for exact versions, initialization, private-repository access, and upgrades. Each project retains its own environment, model weights, service lifecycle, and license; fetching submodules does not install or start services.
 
 | Integration item | Contract |
 |---|---|
 | Upstream project | `microsoft/OmniParser` |
-| Tested revision | `3540212` |
-| Detector | OmniParser V3, `weights/icon_detect_v3/model.pt` |
+| Initial fork pin | `f4e53d5` (authoritative pin: submodule gitlink) |
+| Detector | YOLOv9-E; original PyTorch or opt-in lossy OpenVINO INT8 CPU service |
 | Runtime boundary | Local HTTP service; default endpoint `http://127.0.0.1:8012/parse` |
 | Configuration | `PI_NODRIVER_OMNIPARSER_URL` and `PI_NODRIVER_OMNIPARSER_TIMEOUT` |
 | Required for | Default `PI_NODRIVER_VISION_FALLBACK=omni` and `vision-mark omni` |
@@ -712,7 +712,7 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 * Poppler command-line tools `pdftotext` and `pdfimages` (usually the `poppler-utils` package)
 * Python's `sqlite3` module built with SQLite FTS5 support (the installer reports a clear warning when unavailable)
 * [Pi coding agent](https://github.com/badlogic/pi-mono)
-* For the default Omni visual fallback: a separately installed and running [Microsoft OmniParser](https://github.com/microsoft/OmniParser) service compatible with the local `/parse` contract. This is an external dependent project, not an installer-managed Python package. Use `PI_NODRIVER_VISION_FALLBACK=manual` when it is intentionally absent.
+* For the default Omni visual fallback: a separately provisioned and running OmniParser `/parse` service from the pinned `dependencies/omniparser` source. See [dependencies setup](docs/dependencies.md) and the submodule's `docs/CPU_INT8_INSTALL.md`. It is not an installer-managed Python package. Use `PI_NODRIVER_VISION_FALLBACK=manual` when intentionally absent.
 
 ### One-Step Automated Installation:
 ```bash
@@ -727,7 +727,7 @@ The installer will:
 3. Deploy extension files, worker daemon, and the **Stealth & Turnstile Subsystem** to `~/.pi/agent/extensions/nodriver-browser`.
 4. Automatically disable conflicting legacy browser packages.
 
-The installer does **not** clone OmniParser, download its model weights, or manage its service. Provision that dependent project separately before using the default `omni` fallback.
+Initialize the desired source submodules explicitly as described in [dependencies setup](docs/dependencies.md). The installer does **not** initialize them, download weights, or manage their services. Provision OmniParser separately before using the default `omni` fallback. Full recursive initialization also needs access to the private Laya Browser Intent and Xvfb Streaming repositories.
 
 Then reload Pi or launch a new session:
 ```text
