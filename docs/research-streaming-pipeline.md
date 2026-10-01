@@ -64,9 +64,11 @@ append-only, so every prefix already sent to the GPU stays valid.
 Prefill is owned by the Pi harness (`ctx.prefill`, pi-coding-agent `feat/prefill-api`,
 `prefill` setting). The extension only reports committed text
 (`begin` / `append` / `end`); Pi previews the exact next request, warms its slot
-and pins the final request. Limitation: `begin()` refuses when the assistant
-message contains more than one tool call (e.g. `gettime` + `research` in parallel),
-because the next request cannot be previewed; that run has no overlap.
+and pins the final request. Sibling tool calls in the same assistant message
+(e.g. `gettime` + `research` in parallel) are supported: the preview waits for
+the real results of calls placed before `research` and ignores calls after it.
+Verified live: with parallel `gettime` + `research` the final request prefills
+69 tokens instead of ~5,400.
 
 ## Settings
 
