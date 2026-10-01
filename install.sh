@@ -7,6 +7,30 @@ TARGET="$PI_AGENT_DIR/extensions/nodriver-browser"
 SETTINGS="$PI_AGENT_DIR/settings.json"
 PI_NODRIVER_SOCKET="${PI_NODRIVER_SOCKET:-$PI_AGENT_DIR/nodriver-browser.sock}"
 
+copy_runtime() {
+  local target="$1"
+  mkdir -p "$target/research" "$target/intent"
+  install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$target/"
+  install -m 0644 "$ROOT/intent/"*.py "$ROOT/intent/"*.ts "$target/intent/"
+  install -m 0755 "$ROOT/worker.py" "$target/worker.py"
+  install -m 0644 "$ROOT/browser_logic.py" "$ROOT/requirements.txt" "$target/"
+  install -m 0644 "$ROOT/research/"*.py "$target/research/"
+  install -m 0644 "$ROOT/research-model.ts" "$target/"
+  if [[ -d "$ROOT/stealth-extension" ]]; then
+    mkdir -p "$target/stealth-extension"
+    cp -rf "$ROOT/stealth-extension/"* "$target/stealth-extension/"
+  fi
+}
+
+# Staging copies only runtime files; it never probes/stops services, installs
+# dependencies, changes settings, or cleans sockets/display locks.
+if [[ "${1:-}" == "--stage" ]]; then
+  [[ $# == 2 && -n "$2" ]] || { echo 'usage: install.sh --stage DIRECTORY' >&2; exit 2; }
+  copy_runtime "$2"
+  exit 0
+fi
+[[ $# == 0 ]] || { echo 'unknown installer arguments' >&2; exit 2; }
+
 if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
   for command in python3 xvfb-run; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -68,14 +92,16 @@ fi
 rm -f "$PI_NODRIVER_SOCKET" "$PI_AGENT_DIR/nodriver-browser.env" "$PI_AGENT_DIR/nodriver-browser.sock.lock"
 find /tmp -maxdepth 1 -name ".X10*-lock" -mmin +5 -delete 2>/dev/null || true
 
-mkdir -p "$TARGET"
-install -m 0644 "$ROOT/index.ts" "$TARGET/index.ts"
-install -m 0755 "$ROOT/worker.py" "$TARGET/worker.py"
-install -m 0644 "$ROOT/browser_logic.py" "$TARGET/browser_logic.py"
-install -m 0644 "$ROOT/requirements.txt" "$TARGET/requirements.txt"
-if [[ -d "$ROOT/stealth-extension" ]]; then
-  mkdir -p "$TARGET/stealth-extension"
-  cp -rf "$ROOT/stealth-extension/"* "$TARGET/stealth-extension/"
+copy_runtime "$TARGET"
+
+# The integrated extension owns tool registration. Keep the old entry as a backup,
+# outside Pi's extensions directory so it cannot register a duplicate tool.
+if [[ -e "$PI_AGENT_DIR/extensions/browser-intent.ts" || -L "$PI_AGENT_DIR/extensions/browser-intent.ts" ]]; then
+  mkdir -p "$PI_AGENT_DIR/extension-backups"
+  mv --backup=numbered "$PI_AGENT_DIR/extensions/browser-intent.ts" "$PI_AGENT_DIR/extension-backups/browser-intent.ts"
+fi
+if [[ ! -f "$PI_AGENT_DIR/browser-config.json" ]]; then
+  printf '{"browserMode":"direct"}\n' > "$PI_AGENT_DIR/browser-config.json"
 fi
 
 if [[ "${SKIP_PIP_INSTALL:-0}" != "1" ]]; then

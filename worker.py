@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+from research.capture import research_capture_js
 import base64
 import fcntl
 import hashlib
@@ -110,6 +111,7 @@ PDF_STREAM_CHUNK_BYTES = 1024 * 1024
 PDF_WIKI_INLINE_MAX_CHARS = 12000
 PDF_WIKI_CHUNK_CHARS = 1800
 PDF_WIKI_CHUNK_OVERLAP = 200
+BACKGROUND_TAB_CLOSE_TIMEOUT = 2.0
 GOOGLE_RESULTS_JS = r'''JSON.stringify((() => {
   const rows = [];
   for (const anchor of document.querySelectorAll('a')) {
@@ -126,7 +128,8 @@ GOOGLE_RESULTS_JS = r'''JSON.stringify((() => {
       .map(line => line.trim())
       .filter(line => line && line !== title && !/^https?:\/\//i.test(line));
     const snippet = explicitSnippet || lines.slice(0, 4).join(' ');
-    rows.push({ title, url, snippet: snippet.slice(0, 600) });
+    rows.push({ title, url, snippet: snippet.slice(0, 600),
+      truncated: snippet.length > 600 || (!explicitSnippet && lines.length > 4) });
   }
   return rows.slice(0, 20);
 })())'''
@@ -2289,11 +2292,21 @@ class BrowserWorker:
         self.xvfb_active_target_id = None
         self.max_tabs = int(os.environ.get('PI_NODRIVER_MAX_TABS', '20'))
         self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
+        self.background_slots = asyncio.Semaphore(max(1, self.max_tabs - 1))
+        # Research crawl tabs live in their own pool: they never enter the
+        # interactive LRU registry, never count against max_tabs, and never
+        # evict a user's tab. Their own cap bounds Chrome load instead.
+        self.crawl_pool_max = max(1, int(os.environ.get('PI_NODRIVER_CRAWL_POOL_TABS', '48')))
+        self.crawl_pool_slots = asyncio.Semaphore(self.crawl_pool_max)
+        self.crawl_pool_targets = {}  # target id -> page, until the tab is really closed
+        self.crawl_pool_inflight = set()  # target ids a crawl is using right now
         self.tab_management_lock = asyncio.Lock()
         self.browser_lifecycle_lock = asyncio.Lock()
+        self.browser_verified_at = float('-inf')
         self.active_target_counts = {}
         self.session_action_targets = {}
         self.detached_preflight_tasks = set()
+        self.research_cleanup_tasks = set()
         self.quarantined_target_ids = set()
         self.scroll_history = {}
         configured_download_dir = os.environ.get('PI_NODRIVER_DOWNLOAD_DIR')
@@ -3703,10 +3716,14 @@ class BrowserWorker:
         for record in self.tab_registry.records():
             if record.target_id not in live_target_ids:
                 self.forget_closed_tab(record)
+        for target_id in list(self.crawl_pool_targets):
+            if target_id not in live_target_ids:
+                self.crawl_pool_targets.pop(target_id, None)
+                self.crawl_pool_inflight.discard(target_id)
         known = {record.target_id for record in self.tab_registry.records()}
         for page in self.browser.tabs:
             target_id = self.tab_registry.target_id(page)
-            if target_id in known:
+            if target_id in known or target_id in self.crawl_pool_targets:
                 continue
             owner = next(
                 (session_id for session_id, active_page in self.pages.items() if active_page is page),
@@ -3740,6 +3757,46 @@ class BrowserWorker:
                 protected_targets.add(self.tab_registry.target_id(page))
         async with self.tab_management_lock:
             return await self._ensure_tab_capacity(required, protected_targets)
+
+    async def create_pool_tab(self):
+        """A research crawl tab outside the interactive LRU registry.
+
+        Deliberately not under tab_management_lock: that lock serializes the
+        interactive registry (capacity, eviction), which pool tabs never touch,
+        and holding it made crawls wait ~0.27 s behind a Google search tab.
+        If a concurrent reconcile adopted the new tab before it was marked as
+        a pool tab, the registry record is dropped again here."""
+        page = await self.browser.get('about:blank', new_tab=True)
+        target_id = self.tab_registry.target_id(page)
+        self.crawl_pool_targets[target_id] = page
+        self.crawl_pool_inflight.add(target_id)
+        if any(record.target_id == target_id for record in self.tab_registry.records()):
+            self.tab_registry.remove(page)
+        return page
+
+    async def close_pool_tab(self, tab):
+        target_id = self.tab_registry.target_id(tab)
+        self.crawl_pool_inflight.discard(target_id)
+        try:
+            await asyncio.wait_for(tab.close(), timeout=BACKGROUND_TAB_CLOSE_TIMEOUT)
+        except Exception:
+            return  # still tracked as a leftover; sweep_crawl_pool retries it
+        self.crawl_pool_targets.pop(target_id, None)
+
+    async def sweep_crawl_pool(self):
+        """Close crawl-pool tabs no crawl is using (e.g. a close that failed
+        earlier). Tabs in use by another research job are left alone."""
+        closed = 0
+        for target_id, page in list(self.crawl_pool_targets.items()):
+            if target_id in self.crawl_pool_inflight:
+                continue
+            try:
+                await asyncio.wait_for(page.close(), timeout=BACKGROUND_TAB_CLOSE_TIMEOUT)
+            except Exception:
+                continue
+            self.crawl_pool_targets.pop(target_id, None)
+            closed += 1
+        return closed
 
     async def create_managed_tab(self, session_id, kind='page'):
         async with self.tab_management_lock:
@@ -3809,9 +3866,18 @@ class BrowserWorker:
         self.touch_tab(popup)
         return popup
 
-    async def ensure_browser(self):
+    async def ensure_browser(self, max_age=None):
+        # max_age lets hot paths (research crawls) reuse a recent liveness probe
+        # instead of queueing every call behind the lifecycle lock and a CDP roundtrip.
+        if max_age is not None and self._browser_fresh(max_age):
+            return self.browser
         async with self.browser_lifecycle_lock:
+            if max_age is not None and self._browser_fresh(max_age):
+                return self.browser
             return await self._ensure_browser_locked()
+
+    def _browser_fresh(self, max_age):
+        return self.browser is not None and time.monotonic() - self.browser_verified_at < max_age
 
     async def _ensure_browser_locked(self):
         if self.browser is not None:
@@ -3819,7 +3885,9 @@ class BrowserWorker:
                 await asyncio.wait_for(
                     self.browser.send(uc.cdp.browser.get_version()), timeout=1.0
                 )
+                self.browser_verified_at = time.monotonic()
             except Exception:
+                self.browser_verified_at = float('-inf')
                 stale_browser = self.browser
                 stale_launched_browser = self.launched_browser
                 stopped = set()
@@ -3841,6 +3909,8 @@ class BrowserWorker:
                 self.download_frame_targets.clear()
                 self.download_target_sessions.clear()
                 self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
+                self.crawl_pool_targets.clear()
+                self.crawl_pool_inflight.clear()
                 self.active_target_counts.clear()
                 self.session_action_targets.clear()
                 self.quarantined_target_ids.clear()
@@ -3929,6 +3999,7 @@ class BrowserWorker:
             await self.browser.send(uc.cdp.browser.set_download_behavior(
                 'allow', download_path=str(self.download_dir), events_enabled=True
             ))
+            self.browser_verified_at = time.monotonic()
         return self.browser
 
     @staticmethod
@@ -4914,6 +4985,8 @@ class BrowserWorker:
             self.download_frame_targets.clear()
             self.download_target_sessions.clear()
             self.tab_registry = TabActivityRegistry(max_tabs=self.max_tabs)
+            self.crawl_pool_targets.clear()
+            self.crawl_pool_inflight.clear()
             self.active_target_counts.clear()
             self.session_action_targets.clear()
             self.quarantined_target_ids.clear()
@@ -6980,6 +7053,356 @@ class BrowserWorker:
                 self.browser_modes.pop(session_id, None)
             else:
                 self.browser_modes[session_id] = previous_mode
+
+    async def cleanup_research_owner(self, owner):
+        for record in tuple(self.tab_registry.records()):
+            if record.session_id == owner:
+                await self._close_background_tab(record.page, owner=owner)
+        await self.cleanup_pdf_session(owner)
+
+    async def _close_background_tab(self, tab, *, owner=None):
+        # Keep cleanup in the operation's own task: a detached close coroutine
+        # could otherwise retain the global tab lock after its caller finishes.
+        task = asyncio.current_task()
+        expired = False
+        def expire():
+            nonlocal expired
+            expired = True
+            task.cancel()
+        timer = asyncio.get_running_loop().call_later(BACKGROUND_TAB_CLOSE_TIMEOUT, expire)
+        try:
+            async with self.tab_management_lock:
+                record = next((item for item in self.tab_registry.records() if item.page is tab), None)
+                if owner is not None:
+                    if record is None:
+                        return  # Another cleanup already closed this registered target.
+                    if record.session_id != owner:
+                        raise ValueError('background_tab_owner_changed')
+                if record is not None:
+                    await self.evict_tab(record)
+                else:
+                    await tab.close()
+        except asyncio.CancelledError:
+            if expired:
+                raise TimeoutError('background_tab_cleanup_timeout') from None
+            raise
+        finally:
+            timer.cancel()
+
+    async def search_one(self, search, idx, session_id, search_slots, *, research=False):
+        async with self.background_slots:
+            return await self._search_one(search, idx, session_id, search_slots, research=research)
+
+    async def _search_one(self, search, idx, session_id, search_slots, *, research=False):
+        tab = None
+        t0 = asyncio.get_running_loop().time()
+        await search_slots.acquire()
+        try:
+            async def fetch_results():
+                nonlocal tab
+                tab = await self.create_managed_tab(session_id, 'google-search')
+                self.begin_tab_activity(tab)
+                try:
+                    await tab.send(uc.cdp.emulation.set_device_metrics_override(
+                        width=1920,
+                        height=1080,
+                        device_scale_factor=1.0,
+                        mobile=False,
+                    ))
+                except Exception:
+                    pass
+                params = urllib.parse.urlencode({
+                    'q': search['query'],
+                    'hl': 'zh-TW',
+                    'gl': 'tw',
+                    'filter': '0',
+                })
+                await tab.get(f'https://www.google.com/search?{params}')
+                await self.wait_for_page_ready(tab, timeout_sec=2.5)
+                title = str(await tab.evaluate('document.title') or '')
+                body_text = str(await tab.evaluate('document.body.innerText') or '')
+                raw_results = await tab.evaluate(GOOGLE_RESULTS_JS)
+                if isinstance(raw_results, str):
+                    raw_results = json.loads(raw_results)
+                return title, body_text, raw_results if isinstance(raw_results, list) else []
+
+            title, body_text, raw_results = await asyncio.wait_for(fetch_results(), timeout=5.0)
+            lower_page = f'{title}\n{body_text}'.lower()
+            blocked = any(marker in lower_page for marker in (
+                'unusual traffic',
+                'before you continue to google',
+                'our systems have detected unusual traffic',
+                'verify you are human',
+            ))
+            if blocked:
+                raise ValueError('Google anti-bot or consent challenge detected')
+            clean_results = [
+                {
+                    'title': str(item.get('title') or '').strip(),
+                    'url': str(item.get('url') or '').strip(),
+                    'snippet': str(item.get('snippet') or '').strip(),
+                    **({'truncated': bool(item.get('truncated'))} if research else {}),
+                }
+                for item in raw_results
+                if isinstance(item, dict) and item.get('title') and item.get('url')
+            ]
+            return {
+                'index': idx + 1,
+                'direction': search['direction'],
+                'query': search['query'],
+                'results': clean_results,
+                'ok': bool(clean_results),
+                'error': None if clean_results else 'No Google result links extracted',
+                'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
+            }
+        except Exception as error:
+            return {
+                'index': idx + 1,
+                'direction': search['direction'],
+                'query': search['query'],
+                'results': [],
+                'ok': False,
+                'error': str(error),
+                'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
+            }
+        finally:
+            try:
+                if tab is not None:
+                    self.end_tab_activity(tab)
+                    await self._close_background_tab(tab)
+            finally:
+                search_slots.release()
+
+    async def crawl_one(self, target_url, idx, session_id, crawl_slots, *, max_text_units=None, fetch_timeout=3.0):
+        if max_text_units is not None and (type(max_text_units) is not int or not 1 <= max_text_units <= 1_000_000):
+            raise ValueError('invalid research DOM capture limit')
+        if type(fetch_timeout) not in (int, float) or not 1.0 <= fetch_timeout <= 30.0:
+            raise ValueError('invalid crawl fetch timeout')
+        if max_text_units is not None:
+            # Research capture: separate tab pool (see crawl_pool_max).
+            async with self.crawl_pool_slots:
+                return await self._crawl_one(target_url, idx, session_id, crawl_slots,
+                                             max_text_units=max_text_units, fetch_timeout=fetch_timeout,
+                                             pooled=True)
+        async with self.background_slots:
+            return await self._crawl_one(target_url, idx, session_id, crawl_slots,
+                                         max_text_units=max_text_units, fetch_timeout=fetch_timeout)
+
+    async def _crawl_one(self, target_url, idx, session_id, crawl_slots, *, max_text_units=None, fetch_timeout=3.0,
+                         pooled=False):
+        tab = None
+        capture = {}
+        is_pdf = False
+        t0 = asyncio.get_running_loop().time()
+        await crawl_slots.acquire()
+        try:
+            async def fetch_tab():
+                nonlocal tab, capture
+                if pooled:
+                    tab = await self.create_pool_tab()
+                else:
+                    tab = await self.create_managed_tab(session_id, 'crawl')
+                    self.begin_tab_activity(tab)
+                # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
+                try:
+                    await tab.send(uc.cdp.emulation.set_device_metrics_override(
+                        width=1920,
+                        height=1080,
+                        device_scale_factor=1.0,
+                        mobile=False
+                    ))
+                except Exception:
+                    pass
+                await tab.get(target_url)
+                await self.wait_for_page_ready(tab, timeout_sec=2.5)
+                title = await tab.evaluate("document.title") or "No Title"
+                if await self.page_is_pdf(tab):
+                    return str(title).strip(), '', True
+                if max_text_units is not None:
+                    # nodriver deep serialization returns object entries rather
+                    # than a Python dict; transport metadata as an explicit JSON string.
+                    capture = await tab.evaluate(f'JSON.stringify({research_capture_js(max_text_units)})')
+                    if isinstance(capture, str): capture = json.loads(capture)
+                    if not isinstance(capture, dict) or not isinstance(capture.get('text'), str):
+                        raise ValueError('invalid research DOM capture')
+                    capture = dict(capture)
+                    text = capture.pop('text')
+                    if len(text.encode('utf-8')) > 4_000_000:
+                        raise ValueError('research capture byte limit exceeded')
+                    return str(title).strip(), text, False
+                text = await tab.evaluate("document.body.innerText") or ""
+                return str(title).strip(), str(text).strip(), False
+
+            # Keep the interactive HTML fast path at 3 seconds (research may allow more),
+            # but allow PDF parsing its own budget.
+            title, clean_text, is_pdf = await asyncio.wait_for(fetch_tab(), timeout=fetch_timeout)
+            pdf_result = None
+            if is_pdf:
+                # PDF extraction enforces one bounded queue/phase deadline itself.
+                # Do not wrap it in a competing crawl timeout: once text succeeds,
+                # image timeout/failure must remain best-effort.
+                pdf_result = await self.extract_pdf_page(
+                    tab, session_id, source_url=target_url
+                )
+                clean_text = pdf_result['text'].strip()
+            elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+
+            if pdf_result is not None:
+                is_ok = bool(clean_text or pdf_result['imageCount'])
+                return {
+                    "index": idx + 1,
+                    "url": target_url,
+                    "title": title,
+                    "text": clean_text,
+                    "ok": is_ok,
+                    "error": None if is_ok else "No extractable PDF text or images found",
+                    "chars": len(clean_text),
+                    "elapsed": elapsed,
+                    'contentType': 'application/pdf',
+                    'pdfPath': pdf_result['pdfPath'],
+                    'pdfImagePaths': pdf_result['imagePaths'],
+                    'imageCandidates': [],
+                    'imageCount': pdf_result['imageCount'],
+                    'imageCandidateText': self.format_pdf_extraction(
+                        pdf_result, include_text=False
+                    ),
+                    'imageDiscoveryStatus': 'pdf-extracted',
+                    'imageDiscoveryError': pdf_result.get('imageExtractionError'),
+                    'imageExtractionError': pdf_result.get('imageExtractionError'),
+                    'contentMode': pdf_result['contentMode'],
+                    'sourceChars': pdf_result['sourceChars'],
+                    **{
+                        key: pdf_result[key]
+                        for key in ('wikiId', 'wikiPath', 'wikiChunks')
+                        if key in pdf_result
+                    },
+                }
+
+            # Detect Anti-Bot / Cloudflare Challenge Validation
+            lower_title = title.lower()
+            lower_text = clean_text.lower()
+            is_challenge = (
+                "challenge validation" in lower_title
+                or "just a moment..." in lower_title
+                or "cloudflare" in lower_title
+                or "attention required" in lower_title
+                or "verify you are human" in lower_text
+                or "enable javascript and cookies to continue" in lower_text
+            )
+
+            if is_challenge:
+                return {
+                    "index": idx + 1,
+                    "url": target_url,
+                    "title": title,
+                    "text": "",
+                    "ok": False,
+                    "error": "Anti-Bot / Cloudflare Challenge Validation detected (Access Blocked by WAF)",
+                    "chars": 0,
+                    "elapsed": elapsed,
+                    'imageCandidates': [],
+                    'imageCount': 0,
+                    'imageCandidateText': self.format_image_candidates([], status='not-run'),
+                    'imageDiscoveryStatus': 'not-run',
+                    'imageDiscoveryError': 'anti-bot challenge detected before image discovery',
+                }
+
+            image_discovery = await self.extract_image_candidate_result(tab)
+            image_candidates = image_discovery['candidates']
+            image_candidate_text = self.format_image_candidates(
+                image_candidates, status=image_discovery['status']
+            )
+            elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+            is_ok = bool(clean_text and len(clean_text) > 20)
+            return {
+                "index": idx + 1,
+                "url": target_url,
+                "title": title,
+                "text": clean_text,
+                "ok": is_ok,
+                "error": None if is_ok else "No readable text content extracted",
+                "chars": len(clean_text),
+                "elapsed": elapsed,
+                'imageCandidates': image_candidates,
+                'imageCount': len(image_candidates),
+                'imageCandidateText': image_candidate_text,
+                'imageDiscoveryStatus': image_discovery['status'],
+                'imageDiscoveryError': image_discovery['error'],
+                **capture,
+            }
+        except asyncio.TimeoutError:
+            elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+            if (tab is not None and not is_pdf and max_text_units is not None
+                    and os.environ.get('RESEARCH_PARTIAL_ON_TIMEOUT') == '1'):
+                # Research only: keep whatever the page has rendered so far
+                # instead of discarding it. The page may be incomplete.
+                try:
+                    async def grab():
+                        title = await tab.evaluate("document.title") or "No Title"
+                        raw = await tab.evaluate(f'JSON.stringify({research_capture_js(max_text_units)})')
+                        return str(title).strip(), json.loads(raw) if isinstance(raw, str) else raw
+                    title, partial = await asyncio.wait_for(grab(), timeout=0.8)
+                    if isinstance(partial, dict) and isinstance(partial.get('text'), str) and len(partial['text'].strip()) > 20:
+                        partial = dict(partial)
+                        text = partial.pop('text')
+                        return {
+                            "index": idx + 1, "url": target_url, "title": title, "text": text,
+                            "ok": True, "error": None, "chars": len(text),
+                            "elapsed": round(asyncio.get_running_loop().time() - t0, 2),
+                            'partialOnTimeout': True,
+                            'imageCandidates': [], 'imageCount': 0,
+                            'imageCandidateText': self.format_image_candidates([], status='not-run'),
+                            'imageDiscoveryStatus': 'not-run',
+                            'imageDiscoveryError': 'partial capture after crawl timeout',
+                            **partial,
+                        }
+                except Exception:
+                    pass
+            return {
+                "index": idx + 1,
+                "url": target_url,
+                "title": "Timeout",
+                "text": "",
+                "ok": False,
+                "error": (
+                    f"PDF extraction timed out after {elapsed}s"
+                    if is_pdf else
+                    f"3.0s Circuit Breaker Tripped (Page took >{elapsed}s to load or settle)"
+                ),
+                "chars": 0,
+                "elapsed": elapsed,
+                'imageCandidates': [],
+                'imageCount': 0,
+                'imageCandidateText': self.format_image_candidates([], status='not-run'),
+                'imageDiscoveryStatus': 'not-run',
+                'imageDiscoveryError': 'page crawl timed out before image discovery',
+            }
+        except Exception as err:
+            elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+            return {
+                "index": idx + 1,
+                "url": target_url,
+                "title": "Error",
+                "text": "",
+                "ok": False,
+                "error": str(err),
+                "chars": 0,
+                "elapsed": elapsed,
+                'imageCandidates': [],
+                'imageCount': 0,
+                'imageCandidateText': self.format_image_candidates([], status='not-run'),
+                'imageDiscoveryStatus': 'not-run',
+                'imageDiscoveryError': 'page crawl failed before image discovery',
+            }
+        finally:
+            try:
+                if tab is not None and pooled:
+                    await self.close_pool_tab(tab)
+                elif tab is not None:
+                    self.end_tab_activity(tab)
+                    await self._close_background_tab(tab)
+            finally:
+                crawl_slots.release()
 
     async def execute(self, command, session_id='default'):
         parts = parse_command(command)
@@ -9228,92 +9651,9 @@ class BrowserWorker:
             await self.ensure_browser()
             search_slots = asyncio.Semaphore(min(4, self.available_crawl_slots()))
 
-            async def search_single(search, idx):
-                tab = None
-                t0 = asyncio.get_running_loop().time()
-                await search_slots.acquire()
-                try:
-                    async def fetch_results():
-                        nonlocal tab
-                        tab = await self.create_managed_tab(session_id, 'google-search')
-                        self.begin_tab_activity(tab)
-                        try:
-                            await tab.send(uc.cdp.emulation.set_device_metrics_override(
-                                width=1920,
-                                height=1080,
-                                device_scale_factor=1.0,
-                                mobile=False,
-                            ))
-                        except Exception:
-                            pass
-                        params = urllib.parse.urlencode({
-                            'q': search['query'],
-                            'hl': 'zh-TW',
-                            'gl': 'tw',
-                            'filter': '0',
-                        })
-                        await tab.get(f'https://www.google.com/search?{params}')
-                        await self.wait_for_page_ready(tab, timeout_sec=2.5)
-                        title = str(await tab.evaluate('document.title') or '')
-                        body_text = str(await tab.evaluate('document.body.innerText') or '')
-                        raw_results = await tab.evaluate(GOOGLE_RESULTS_JS)
-                        if isinstance(raw_results, str):
-                            raw_results = json.loads(raw_results)
-                        return title, body_text, raw_results if isinstance(raw_results, list) else []
 
-                    title, body_text, raw_results = await asyncio.wait_for(fetch_results(), timeout=5.0)
-                    lower_page = f'{title}\n{body_text}'.lower()
-                    blocked = any(marker in lower_page for marker in (
-                        'unusual traffic',
-                        'before you continue to google',
-                        'our systems have detected unusual traffic',
-                        'verify you are human',
-                    ))
-                    if blocked:
-                        raise ValueError('Google anti-bot or consent challenge detected')
-                    clean_results = [
-                        {
-                            'title': str(item.get('title') or '').strip(),
-                            'url': str(item.get('url') or '').strip(),
-                            'snippet': str(item.get('snippet') or '').strip(),
-                        }
-                        for item in raw_results
-                        if isinstance(item, dict) and item.get('title') and item.get('url')
-                    ]
-                    return {
-                        'index': idx + 1,
-                        'direction': search['direction'],
-                        'query': search['query'],
-                        'results': clean_results,
-                        'ok': bool(clean_results),
-                        'error': None if clean_results else 'No Google result links extracted',
-                        'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
-                    }
-                except Exception as error:
-                    return {
-                        'index': idx + 1,
-                        'direction': search['direction'],
-                        'query': search['query'],
-                        'results': [],
-                        'ok': False,
-                        'error': str(error),
-                        'elapsed': round(asyncio.get_running_loop().time() - t0, 2),
-                    }
-                finally:
-                    if tab is not None:
-                        self.end_tab_activity(tab)
-                        async with self.tab_management_lock:
-                            record = next(
-                                (item for item in self.tab_registry.records() if item.page is tab),
-                                None,
-                            )
-                            if record is not None:
-                                await self.evict_tab(record)
-                            else:
-                                await tab.close()
-                    search_slots.release()
 
-            groups = await asyncio.gather(*(search_single(search, i) for i, search in enumerate(searches)))
+            groups = await asyncio.gather(*(self.search_one(search, i, session_id, search_slots) for i, search in enumerate(searches)))
             raw_count = sum(len(group['results']) for group in groups)
             unresolved_candidates = select_diverse_search_results(groups, limit=min(max(raw_count, 1), 20))
             redirect_slots = asyncio.Semaphore(8)
@@ -9391,182 +9731,9 @@ class BrowserWorker:
             await self.ensure_browser()
             crawl_slots = asyncio.Semaphore(self.available_crawl_slots())
 
-            async def crawl_single(target_url, idx):
-                tab = None
-                is_pdf = False
-                t0 = asyncio.get_running_loop().time()
-                await crawl_slots.acquire()
-                try:
-                    async def fetch_tab():
-                        nonlocal tab
-                        tab = await self.create_managed_tab(session_id, 'crawl')
-                        self.begin_tab_activity(tab)
-                        # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
-                        try:
-                            await tab.send(uc.cdp.emulation.set_device_metrics_override(
-                                width=1920,
-                                height=1080,
-                                device_scale_factor=1.0,
-                                mobile=False
-                            ))
-                        except Exception:
-                            pass
-                        await tab.get(target_url)
-                        await self.wait_for_page_ready(tab, timeout_sec=2.5)
-                        title = await tab.evaluate("document.title") or "No Title"
-                        if await self.page_is_pdf(tab):
-                            return str(title).strip(), '', True
-                        text = await tab.evaluate("document.body.innerText") or ""
-                        return str(title).strip(), str(text).strip(), False
 
-                    # Keep the HTML fast path at 3 seconds, but allow PDF parsing its own budget.
-                    title, clean_text, is_pdf = await asyncio.wait_for(fetch_tab(), timeout=3.0)
-                    pdf_result = None
-                    if is_pdf:
-                        # PDF extraction enforces one bounded queue/phase deadline itself.
-                        # Do not wrap it in a competing crawl timeout: once text succeeds,
-                        # image timeout/failure must remain best-effort.
-                        pdf_result = await self.extract_pdf_page(
-                            tab, session_id, source_url=target_url
-                        )
-                        clean_text = pdf_result['text'].strip()
-                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
 
-                    if pdf_result is not None:
-                        is_ok = bool(clean_text or pdf_result['imageCount'])
-                        return {
-                            "index": idx + 1,
-                            "url": target_url,
-                            "title": title,
-                            "text": clean_text,
-                            "ok": is_ok,
-                            "error": None if is_ok else "No extractable PDF text or images found",
-                            "chars": len(clean_text),
-                            "elapsed": elapsed,
-                            'contentType': 'application/pdf',
-                            'pdfPath': pdf_result['pdfPath'],
-                            'pdfImagePaths': pdf_result['imagePaths'],
-                            'imageCandidates': [],
-                            'imageCount': pdf_result['imageCount'],
-                            'imageCandidateText': self.format_pdf_extraction(
-                                pdf_result, include_text=False
-                            ),
-                            'imageDiscoveryStatus': 'pdf-extracted',
-                            'imageDiscoveryError': pdf_result.get('imageExtractionError'),
-                            'imageExtractionError': pdf_result.get('imageExtractionError'),
-                            'contentMode': pdf_result['contentMode'],
-                            'sourceChars': pdf_result['sourceChars'],
-                            **{
-                                key: pdf_result[key]
-                                for key in ('wikiId', 'wikiPath', 'wikiChunks')
-                                if key in pdf_result
-                            },
-                        }
-
-                    # Detect Anti-Bot / Cloudflare Challenge Validation
-                    lower_title = title.lower()
-                    lower_text = clean_text.lower()
-                    is_challenge = (
-                        "challenge validation" in lower_title
-                        or "just a moment..." in lower_title
-                        or "cloudflare" in lower_title
-                        or "attention required" in lower_title
-                        or "verify you are human" in lower_text
-                        or "enable javascript and cookies to continue" in lower_text
-                    )
-
-                    if is_challenge:
-                        return {
-                            "index": idx + 1,
-                            "url": target_url,
-                            "title": title,
-                            "text": "",
-                            "ok": False,
-                            "error": "Anti-Bot / Cloudflare Challenge Validation detected (Access Blocked by WAF)",
-                            "chars": 0,
-                            "elapsed": elapsed,
-                            'imageCandidates': [],
-                            'imageCount': 0,
-                            'imageCandidateText': self.format_image_candidates([], status='not-run'),
-                            'imageDiscoveryStatus': 'not-run',
-                            'imageDiscoveryError': 'anti-bot challenge detected before image discovery',
-                        }
-
-                    image_discovery = await self.extract_image_candidate_result(tab)
-                    image_candidates = image_discovery['candidates']
-                    image_candidate_text = self.format_image_candidates(
-                        image_candidates, status=image_discovery['status']
-                    )
-                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
-                    is_ok = bool(clean_text and len(clean_text) > 20)
-                    return {
-                        "index": idx + 1,
-                        "url": target_url,
-                        "title": title,
-                        "text": clean_text,
-                        "ok": is_ok,
-                        "error": None if is_ok else "No readable text content extracted",
-                        "chars": len(clean_text),
-                        "elapsed": elapsed,
-                        'imageCandidates': image_candidates,
-                        'imageCount': len(image_candidates),
-                        'imageCandidateText': image_candidate_text,
-                        'imageDiscoveryStatus': image_discovery['status'],
-                        'imageDiscoveryError': image_discovery['error'],
-                    }
-                except asyncio.TimeoutError:
-                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
-                    return {
-                        "index": idx + 1,
-                        "url": target_url,
-                        "title": "Timeout",
-                        "text": "",
-                        "ok": False,
-                        "error": (
-                            f"PDF extraction timed out after {elapsed}s"
-                            if is_pdf else
-                            f"3.0s Circuit Breaker Tripped (Page took >{elapsed}s to load or settle)"
-                        ),
-                        "chars": 0,
-                        "elapsed": elapsed,
-                        'imageCandidates': [],
-                        'imageCount': 0,
-                        'imageCandidateText': self.format_image_candidates([], status='not-run'),
-                        'imageDiscoveryStatus': 'not-run',
-                        'imageDiscoveryError': 'page crawl timed out before image discovery',
-                    }
-                except Exception as err:
-                    elapsed = round(asyncio.get_running_loop().time() - t0, 2)
-                    return {
-                        "index": idx + 1,
-                        "url": target_url,
-                        "title": "Error",
-                        "text": "",
-                        "ok": False,
-                        "error": str(err),
-                        "chars": 0,
-                        "elapsed": elapsed,
-                        'imageCandidates': [],
-                        'imageCount': 0,
-                        'imageCandidateText': self.format_image_candidates([], status='not-run'),
-                        'imageDiscoveryStatus': 'not-run',
-                        'imageDiscoveryError': 'page crawl failed before image discovery',
-                    }
-                finally:
-                    if tab is not None:
-                        self.end_tab_activity(tab)
-                        async with self.tab_management_lock:
-                            record = next(
-                                (item for item in self.tab_registry.records() if item.page is tab),
-                                None,
-                            )
-                            if record is not None:
-                                await self.evict_tab(record)
-                            else:
-                                await tab.close()
-                    crawl_slots.release()
-
-            results = await asyncio.gather(*(crawl_single(url, i) for i, url in enumerate(urls)))
+            results = await asyncio.gather(*(self.crawl_one(url, i, session_id, crawl_slots) for i, url in enumerate(urls)))
             successful = [r for r in results if r["ok"]]
             failed = [r for r in results if not r["ok"]]
             total_chars = sum(r["chars"] for r in results)
@@ -9706,9 +9873,12 @@ async def stdio_main():
 
 
 async def server_main(socket_path):
+    from research.jobs import ResearchConnection
     worker = BrowserWorker()
     session_locks = {}
     browser_structure_lock = asyncio.Lock()
+    research_slots = asyncio.Semaphore(2)
+    research_connections = set()
     client_writers = set()
     stop = asyncio.Event()
     path = Path(socket_path).expanduser()
@@ -9765,6 +9935,7 @@ async def server_main(socket_path):
     async def handle_client(reader, writer):
         client_writers.add(writer)
         active_tasks = {}
+        active_task_sessions = {}
         write_lock = asyncio.Lock()
 
         async def send_response(response):
@@ -9772,13 +9943,25 @@ async def server_main(socket_path):
                 writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
                 await writer.drain()
 
+        research = ResearchConnection(worker, send_response, path.parent / 'research-artifacts', admission=research_slots)
+        research_connections.add(research)
+
         async def process_request(request):
             request_id = request.get('id')
             session_id = str(request.get('sessionId') or 'default')
             command = str(request.get('command') or '').strip()
             action = command.split(maxsplit=1)[0].lower() if command else ''
             try:
-                if action == 'shutdown':
+                if action == 'research':
+                    result = await research.run(request_id, session_id, request.get('research'))
+                    response = {'id': request_id, 'sessionId': session_id, 'ok': True, 'type': 'result', **result}
+                elif action == 'research-add-query':
+                    research.add_query(session_id, request.get('research'))
+                    response = {'id': request_id, 'sessionId': session_id, 'ok': True, 'type': 'result'}
+                elif action == 'research-prefetch':
+                    await research.prefetch(session_id, request.get('research'))
+                    response = {'id': request_id, 'sessionId': session_id, 'ok': True, 'type': 'result'}
+                elif action == 'shutdown':
                     async with browser_structure_lock:
                         response = await execute_request(worker, request)
                 elif not action_requires_session_lock(action):
@@ -9798,8 +9981,13 @@ async def server_main(socket_path):
                     'ok': False,
                     'error': 'Browser command cancelled',
                 }
+            except Exception as error:
+                code = 'research_cleanup_incomplete' if str(error) in ('research_cleanup_incomplete','crawl_cleanup_incomplete') else 'research_failed'
+                response = {'id': request_id, 'sessionId': session_id, 'ok': False,
+                            'error': code if action == 'research' else 'command_failed'}
             finally:
                 active_tasks.pop(request_id, None)
+                active_task_sessions.pop(request_id, None)
             await send_response(response)
             if response.get('action') == 'shutdown':
                 stop.set()
@@ -9810,10 +9998,18 @@ async def server_main(socket_path):
             while line := await reader.readline():
                 request = json.loads(line)
                 request_id = request.get('id')
+                if request.get('type') == 'planner_reply':
+                    try:
+                        research.reply(request)
+                    except (ValueError, TypeError):
+                        await send_response({'id': None, 'ok': False, 'error': 'invalid_planner_reply'})
+                    continue
+                if request_id in active_tasks:
+                    raise ValueError('duplicate active request ID')
                 cancel_id = request.get('cancelId')
                 if cancel_id is not None:
                     task = active_tasks.get(cancel_id)
-                    if task is not None:
+                    if task is not None and active_task_sessions.get(cancel_id) == str(request.get('sessionId') or 'default'):
                         task.cancel()
                     await send_response({
                         'id': request_id,
@@ -9825,9 +10021,12 @@ async def server_main(socket_path):
                     continue
                 task = asyncio.create_task(process_request(request))
                 active_tasks[request_id] = task
+                active_task_sessions[request_id] = str(request.get('sessionId') or 'default')
         except Exception as error:
             await send_response({'id': None, 'ok': False, 'error': f'{type(error).__name__}: {error}'})
         finally:
+            await research.close()
+            research_connections.discard(research)
             if active_tasks:
                 await asyncio.gather(*tuple(active_tasks.values()), return_exceptions=True)
             client_writers.discard(writer)
@@ -9841,7 +10040,7 @@ async def server_main(socket_path):
         except NotImplementedError:
             pass
 
-    server = await asyncio.start_unix_server(handle_client, path=str(path))
+    server = await asyncio.start_unix_server(handle_client, path=str(path), limit=128*1024)
     path.chmod(0o600)
     try:
         async with server:
@@ -9849,6 +10048,7 @@ async def server_main(socket_path):
     finally:
         server.close()
         await server.wait_closed()
+        await asyncio.gather(*(connection.close() for connection in tuple(research_connections)), return_exceptions=True)
         await worker.close()
         path.unlink(missing_ok=True)
         env_info_path.unlink(missing_ok=True)

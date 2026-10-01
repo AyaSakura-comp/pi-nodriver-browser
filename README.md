@@ -44,7 +44,7 @@ git submodule update --init -- dependencies/omniparser dependencies/laya
 ```
 
 For **all four** submodules, first authenticate with an account authorized for
-`laya-browser-intent` and `xvfb-streaming` (both private):
+`xvfb-streaming` (private):
 
 ```sh
 gh auth login
@@ -109,8 +109,8 @@ Sizes 800–1280 are supported, with a compile cost for a new/evicted size.
 
 ### 4. Optional Laya `browser_intent` stack
 
-This needs **both** `dependencies/laya` (model server) and the private
-`dependencies/laya-browser-intent` (router/API + Pi extension). First prepare a
+This needs `dependencies/laya` (model server) and the integrated
+`intent/` router/API (no separate extension or intent submodule). First prepare a
 separate Python 3.12 environment; select an appropriate PyTorch build before
 installing model dependencies. Installing packages/checkpoints may download
 large files; the first Laya/e5 requests may also download model weights.
@@ -131,25 +131,25 @@ In terminal B, after restoring `ROOT` and `LAYA_PYTHON`, start the intent router
 ```sh
 LAYA_URL=http://127.0.0.1:8000/v1/systemone \
 PI_NODRIVER_SOCKET="$HOME/.pi/agent/nodriver-browser.sock" \
-"$LAYA_PYTHON" "$ROOT/dependencies/laya-browser-intent/intent_service.py" --port 8011
+"$LAYA_PYTHON" "$ROOT/intent/intent_service.py" --port 8011
 ```
 
 Check `http://127.0.0.1:8000/health` and `http://127.0.0.1:8011/health` with curl.
 Laya health before lazy model load is **not** a successful model inference test.
-The core browser daemon must have been started by a browser tool call before
-intent actions can use its socket. Start Pi with the additional extension:
+The integrated extension starts the core socket daemon as needed. Select intent mode
+in `~/.pi/agent/browser-config.json` and reload Pi:
 
-```sh
-LAYA_INTENT_URL=http://127.0.0.1:8011 \
-pi -e "$ROOT/dependencies/laya-browser-intent/pi-extension/browser-intent.ts"
+```json
+{"browserMode":"intent"}
 ```
 
-Do not also load an older copy of `browser-intent.ts`. The router uses the caller's
+Use `"direct"` for the low-level `browser` tool instead. Only one is registered.
+Do not load an older standalone `browser-intent.ts` entry. The router uses the caller's
 model context where supported; standalone judge defaults point to a separately
 provisioned OpenAI-compatible model on localhost:8001. Configure `JUDGE_URL` and
 `JUDGE_MODEL` in the router's environment when those defaults do not apply. Laya
 is not that judge model; this guide does not install or restart Qwen for you.
-See the [intent README](dependencies/laya-browser-intent/README.md) for its model
+See the [intent README](intent/README.md) for its model
 requirements. Smoke-test one harmless public-page task; do not test with real
 passwords, checkout, or destructive actions.
 
@@ -184,8 +184,38 @@ on a clean machine; do not treat it as a one-command, fully automated installer.
 - [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
+- [Research: streaming search → crawl → prefill pipeline](docs/research-streaming-pipeline.md) — default `research` tool: speculative start at q1, crawl pool, evidence/prefill overlap, guards, settings and measurements.
 - [Google Search Engine: Technical Design, Workflow, and Architecture](docs/google-search-workflow-and-architecture.md) — multi-directional parallel Google Search, DOM extraction engine, anti-bot interception, de-duplication, and benchmark verification.
 - [Bad UI Seven-Level Benchmark](benchmarks/bad-ui/README.md) — portable end-to-end Pi agent challenge for low-contrast, tiny, native, and non-semantic controls across forced Omni, hybrid CDP+Omni, and CDP+manual-vision modes.
+
+## Research (default web lookup)
+
+`research` is the agent's default web search. The agent writes only four keyword
+queries (`q1`–`q4`, concrete dates); the tool searches (3 fourget + 1 Google),
+crawls results in search order through a dedicated 32-tab pool, and returns
+append-only, source-labelled evidence (~6,000-token budget) ending with an
+explicit "answer now" footer.
+
+Every stage overlaps the next:
+
+- **Speculative start** — the job starts as soon as `q1` has streamed out of the
+  tool call; `q2`–`q4` join while they are still being written, and `execute()`
+  adopts the running job.
+- **Search → crawl pipeline** — each result is crawled the moment its search
+  returns (first crawl ≤10 ms after the first result).
+- **Crawl → prefill** — evidence is committed while pages arrive and Pi's
+  `ctx.prefill` warms the model with it, so the final request only processes the tail.
+
+Guards: `RESEARCH_DONE_GUARD` blocks follow-up `crawl`/`google_search`/`fetch_image(s)`/
+`research` in the same user message unless the user asks for more; URL provenance
+rules are unchanged. Tunables: `RESEARCH_CRAWL_CONCURRENCY` (32),
+`RESEARCH_CRAWL_TOP_PER_QUERY` (0 = off; 5 keeps answer quality and cuts ~20 % of
+evidence), `RESEARCH_EVIDENCE_BUDGET` (6000), `RESEARCH_CRAWL_TIMEOUT` (3 s).
+
+Design, settings and measurements: [research-streaming-pipeline.md](docs/research-streaming-pipeline.md).
+Earlier designs (planner / Laya ranking / extension-side prefill) are kept for
+history in [research-ranked-workflow.md](docs/research-ranked-workflow.md) and
+[research-progressive-prefill-validation.md](docs/research-progressive-prefill-validation.md).
 
 ## Google Lens local-image search
 
@@ -279,7 +309,7 @@ RUN_BROWSER_INTEGRATION=0 .venv/bin/python -m unittest discover -s tests -q
 
 ## 🧩 Dependent Project: OmniParser
 
-The default visual fallback uses the [OmniParser fork](https://github.com/AyaSakura-comp/OmniParser), pinned as `dependencies/omniparser`. Laya's model server, Laya Browser Intent, and optional Xvfb Streaming are also pinned submodules. See [dependent projects setup](docs/dependencies.md) for exact versions, initialization, private-repository access, and upgrades. Each project retains its own environment, model weights, service lifecycle, and license; fetching submodules does not install or start services.
+The default visual fallback uses the [OmniParser fork](https://github.com/AyaSakura-comp/OmniParser), pinned as `dependencies/omniparser`. Laya's model server and optional Xvfb Streaming are also pinned submodules. Browser Intent is integrated under `intent/`. See [dependent projects setup](docs/dependencies.md) for exact versions, initialization, private-repository access, and upgrades. Each project retains its own environment, model weights, service lifecycle, and license; fetching submodules does not install or start services.
 
 | Integration item | Contract |
 |---|---|
@@ -914,7 +944,7 @@ The test strategy is layered so fast state-machine checks run on every change, w
 |---|---|---|---|
 | Pure logic | `tests/test_browser_logic.py`, `tests/test_popup_logic.py` | Parsing, snapshots, repeated-command guards, open streaks, LRU ordering, protected targets, download isolation | Always runs |
 | Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, hung-preflight isolation, durable popup quarantine, target-bound close races, nested popup opener recovery, active-target cleanup, download-route preservation, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
-| Installer | `tests/test_install.py` | Extension deployment and conflicting-package cleanup | Always runs in a temporary directory |
+| Packaging | `tests/test_install.py` | Staging-only runtime copy/imports and static installer contracts; lifecycle commands stubbed | Always runs in a temporary directory; never installs or stops services |
 | Real browser | `tests/test_worker_integration.py`, `tests/test_daemon_integration.py` | Headful Chrome navigation, popups, downloads, multi-session isolation, cancellation, daemon persistence | Opt-in with `RUN_BROWSER_INTEGRATION=1` |
 | Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival, eight-part CoolPC selection, same-origin iframe report generation | Run before deployment of lifecycle or semantic-action changes |
 

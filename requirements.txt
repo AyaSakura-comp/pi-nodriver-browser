@@ -1,3 +1,5 @@
 nodriver==0.50.3
 Pillow==12.3.0
 idna==3.10
+# Bounded async HTTP for research providers (no Chrome needed for 4get).
+aiohttp>=3.9,<4

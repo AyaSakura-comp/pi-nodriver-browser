@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { readBrowserConfig } from "./browser-config.ts";
+import registerIntent from "./intent/tool.ts";
+import { randomUUID } from "node:crypto";
+import { ResearchPlanner, hostClock } from "./research-model.ts";
 import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
@@ -6,6 +10,15 @@ import { createConnection, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+/** Subset of Pi's ctx.prefill (pi-coding-agent PrefillApi); absent on older Pi builds. */
+interface PrefillHandle {
+  append(text: string): boolean;
+  end(): void;
+  cancel(reason?: string): void;
+  stats(): Record<string, unknown>;
+}
+interface PrefillApi { begin(toolCallId: string): PrefillHandle | undefined; }
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -34,7 +47,7 @@ function parseGettimeValue(value: string): number | undefined {
 const SEARCH_FIRST_URL_RULE = `MANDATORY URL PROVENANCE RULE:
 - Only exact URLs supplied verbatim by the user or returned by successful google_search or web_search results may be opened. This is enforced by URL_PROVENANCE_GUARD.
 - If the user supplied an exact HTTP(S) URL in their message, you may open that exact URL directly. Do not guess, modify, repair, or synthesize variations of it.
-- If no exact URL was provided by the user, you MUST search first (via google_search, web_search, or browser google-search). Never guess, infer, synthesize, or construct a URL from memory.
+- If no exact URL was provided by the user, you MUST search first (via research, google_search, or browser google-search). Never guess, infer, synthesize, or construct a URL from memory.
 - Copy one exact URL from search results without changing its domain, path, query, casing, or percent-encoding. If a requested deep link is not indexed and was not provided by the user, open the closest official parent URL returned by search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl. If search returns no usable parent URL, stop; never try a URL variant.
 - Browser's google-search command is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
 - image_search / image_search_batch (browser image-search / image-search-batch) uses an internally verified fixed provider entry, not an agent-supplied URL. Call it directly for authorized reverse-image searches; no preliminary URL search or manual navigation is needed.`;
@@ -48,7 +61,7 @@ Guidelines:
 - Visual Context: Successful open, activation, selection, submission, scroll, dismissal and popup-switch actions automatically attach a current-viewport image alongside the existing text/refs when capture succeeds. Use the image for understanding and refs for precise actions; do not request a redundant screenshot. Observations and fill/type do not auto-attach. Auto images do not arm vision-click: use vision-mark omni for guarded coordinates.
 - Browser Identity Mode: \`browser-mode-switch auto|android|linux\` is session-scoped. \`auto\` starts each new origin on Android; a strong CAPTCHA/access/login gate pins only that origin to fresh-target Linux while different origins remain Android. Unexpected same-tab post-click login gates reopen the pre-click URL without replaying the click; explicit login clicks do not trigger fallback. New popup targets keep their first-request native Linux identity so POST/OAuth/payment/one-time URLs are never replayed. Android uses the 390x844 mobile viewport with touch; Linux/fallback disables mobile and touch, renders a 1280px desktop layout, and scales it into the 390x844 frame.
 - REF SYNTAX IS LITERAL: snapshot outputs refs like @e16. Use 'activate @e16', 'fill @e6 "text"', or 'fill-submit @e2 "query"' exactly; never wrap refs in '<' or '>'. Angle brackets in generic documentation denote placeholders, not characters to type.
-- URL Provenance: Only URLs returned by successful google_search or web_search results may be opened. User-supplied, remembered, page-derived, or guessed URLs are not valid open provenance. Search first, then copy the exact returned URL. For an unindexed deep link, start at the closest official parent URL from search and navigate through visible links instead of opening the deep URL. URL_PROVENANCE_GUARD blocks every other HTTP(S) open.
+- URL Provenance: Only exact URLs supplied verbatim by the user or returned by successful google_search or web_search results may be opened. Open user-supplied URLs directly; otherwise search first. Assistant-generated, remembered, modified, or guessed URLs are not authorized. For a deep link neither supplied by the user nor indexed, start at the closest official parent URL from search and navigate through visible links. URL_PROVENANCE_GUARD blocks every other HTTP(S) open.
 - Fast 2-Step Pattern: 'open <url> [timeout_seconds]' automatically returns interactive page elements with @refs (no need to call snapshot -i). Then use a literal ref, for example 'fill-submit @e1 "query"', to fill and submit forms in 1 atomic step.
 - Goal-Driven: Stop once the required info (price, stock, specs) is found, but for a concrete subject do not finalize until 1–3 genuinely useful image candidates already returned by get text/crawl have been delivered with fetch_images. This delivery step is completion, not over-exploration.
 - Incidental Image Completion: Do not finalize a concrete-subject answer as text-only when get text/crawl returned relevant representative or content candidates. Call fetch_images with 1–3 non-duplicate direct URLs even when the user did not mention images; skip only irrelevant, logo/icon/ad/tracking, or low-confidence assets.
@@ -134,6 +147,7 @@ type WorkerResponse = {
 };
 
 class NodriverWorker {
+  async ensureStarted() { await this.connection(); }
   private socket?: Socket;
   private connecting?: Promise<Socket>;
   private nextId = 1;
@@ -143,6 +157,7 @@ class NodriverWorker {
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
     removeAbortListener: () => void;
+    onFrame?: (frame: WorkerResponse) => void;
   }>();
 
   private openSocket(): Promise<Socket> {
@@ -177,6 +192,10 @@ class NodriverWorker {
       }
       const request = this.pending.get(response.id);
       if (!request) return;
+      if (response.type === "planner_request" || response.type === "progress") {
+        if (request.onFrame) request.onFrame(response);
+        return;
+      }
       clearTimeout(request.timer);
       request.removeAbortListener();
       this.pending.delete(response.id);
@@ -252,7 +271,8 @@ class NodriverWorker {
     return this.connecting;
   }
 
-  private async sendRequest(command: string, sessionId: string, signal?: AbortSignal): Promise<WorkerResponse> {
+  private async sendRequest(command: string, sessionId: string, signal?: AbortSignal,
+    research?: Record<string, unknown>, onFrame?: (frame: WorkerResponse) => void): Promise<WorkerResponse> {
     const socket = await this.connection();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -273,17 +293,17 @@ class NodriverWorker {
       const abort = () => finishWithError(new Error("Browser command cancelled"), true);
       const timer = setTimeout(
         () => finishWithError(new Error(`Browser command timed out: ${command}`), true),
-        90_000,
+        research ? 300_000 : 90_000,
       );
       const removeAbortListener = () => signal?.removeEventListener("abort", abort);
-      this.pending.set(id, { resolve, reject, timer, removeAbortListener });
+      this.pending.set(id, { resolve, reject, timer, removeAbortListener, onFrame });
       signal?.addEventListener("abort", abort, { once: true });
 
       if (signal?.aborted) {
         abort();
         return;
       }
-      socket.write(`${JSON.stringify({ id, command, sessionId })}\n`, (error) => {
+      socket.write(`${JSON.stringify({ id, command, sessionId, ...(research ? { research } : {}) })}\n`, (error) => {
         if (error) finishWithError(error, false);
       });
     });
@@ -313,6 +333,50 @@ class NodriverWorker {
     }
   }
 
+  async addQuery(sessionId: string, payload: Record<string, unknown>) {
+    await this.sendRequest("research-add-query", sessionId, undefined, payload);
+  }
+
+  async prefetch(query: string, index: number, sessionId: string) {
+    this.usedSessionIds.add(sessionId);
+    await this.sendRequest("research-prefetch", sessionId, undefined, { query, index });
+  }
+
+  async research(params: Record<string, unknown>, sessionId: string, planner: ResearchPlanner, signal?: AbortSignal,
+    onEvidence?: (prefix: string) => void) {
+    this.usedSessionIds.add(sessionId);
+    const lifetime = new AbortController();
+    const abort = () => lifetime.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      // No replay: a lost response may already have consumed query budget.
+      return await this.sendRequest("research", sessionId, lifetime.signal, params, (frame) => {
+        if (frame.type === "progress" && frame.jobId === params.jobId &&
+            frame.phase === "evidence" && typeof frame.prefix === "string") {
+          onEvidence?.(frame.prefix);
+          return;
+        }
+        if (frame.type !== "planner_request" || frame.jobId !== params.jobId ||
+            typeof frame.requestId !== "string" || !Array.isArray(frame.providers)) return;
+        const socket = this.socket;
+        void (async () => {
+          let reply: Record<string, unknown>;
+          try {
+            const proposal = await planner.plan(frame.view as Parameters<ResearchPlanner["plan"]>[0],
+              frame.providers as string[], lifetime.signal);
+            reply = { proposal };
+          } catch { reply = { error: "planner_failed" }; }
+          if (!lifetime.signal.aborted && socket && !socket.destroyed) {
+            socket.write(`${JSON.stringify({type:"planner_reply",id:frame.id,jobId:frame.jobId,requestId:frame.requestId,...reply})}\n`);
+          }
+        })();
+      });
+    } finally {
+      lifetime.abort(); signal?.removeEventListener("abort", abort);
+    }
+  }
+
   async cleanupSession(sessionId: string) {
     if (!this.usedSessionIds.has(sessionId)) return;
     await this.sendRequest("session-cleanup", sessionId);
@@ -322,6 +386,12 @@ class NodriverWorker {
   disconnect() {
     const socket = this.socket;
     this.socket = undefined;
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.removeAbortListener();
+      request.reject(new Error("Browser daemon connection closed"));
+    }
+    this.pending.clear();
     socket?.destroy();
   }
 }
@@ -367,7 +437,9 @@ function isSearchResultEvent(event: { toolName?: string; input?: unknown }): boo
 }
 
 export default function (pi: ExtensionAPI) {
+  const { browserMode } = readBrowserConfig();
   const worker = new NodriverWorker();
+  if (browserMode === "intent") registerIntent(pi, () => worker.ensureStarted());
   let queue = Promise.resolve<unknown>(undefined);
   const searchedUrls = new Map<string, Set<string>>();
   const sessionId = (ctx: { sessionManager: { getSessionId(): string } }) => ctx.sessionManager.getSessionId();
@@ -376,13 +448,24 @@ export default function (pi: ExtensionAPI) {
     searchedUrls.set(sessionId(ctx), new Set());
   });
 
+  // research returns the complete evidence for one user message. Agents still
+  // wandered off to crawl / fetch more afterwards (minimal thinking ignores the
+  // prompt rule), so follow-up lookups are blocked until the next user message
+  // unless that message asks for them (a URL, Google, crawling, images, more search).
+  const researchDone = new Map<string, boolean>();
+  const lastInput = new Map<string, string>();
+  const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research"]);
+  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多/i;
   pi.on("input", (event, ctx) => {
+    researchDone.set(sessionId(ctx), false);
+    lastInput.set(sessionId(ctx), typeof event.text === "string" ? event.text : "");
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.text)) allowed.add(url);
     searchedUrls.set(sessionId(ctx), allowed);
   });
 
   pi.on("tool_result", (event, ctx) => {
+    if (event.toolName === "research" && !event.isError) researchDone.set(sessionId(ctx), true);
     if (event.isError || !isSearchResultEvent(event)) return;
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.content, event.details)) allowed.add(url);
@@ -390,9 +473,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", (event, ctx) => {
-    if (event.toolName !== "browser") return;
-    const target = browserOpenHttpUrl((event.input as { command?: unknown } | undefined)?.command);
-    if (!target) return;
+    if (FOLLOW_UP_LOOKUPS.has(event.toolName) && researchDone.get(sessionId(ctx))
+        && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")) {
+      return {
+        block: true,
+        reason: "RESEARCH_DONE_GUARD: research already returned the complete evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover. crawl, google_search, fetch_image(s) and another research call are only allowed when the user explicitly asks for them.",
+      };
+    }
+    if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
+    const input = event.input as {command?: unknown; url?: string; action?: string; goal?: string; steps?: {url?: string}[]};
+    const targets = event.toolName === "browser"
+      ? [browserOpenHttpUrl(input?.command)].filter(Boolean) as string[]
+      : [input?.url, ...(input?.steps || []).map(s => s.url),
+          ...(!input?.url && input?.action === "task" ? extractSearchResultUrls(input.goal) : [])]
+          .filter((url): url is string => typeof url === "string" && /^https?:\/\//i.test(url));
+    if (!targets.length) return;
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     if ((ctx as any)?.sessionManager?.getEntries) {
       try {
@@ -406,22 +501,236 @@ export default function (pi: ExtensionAPI) {
         searchedUrls.set(sessionId(ctx), allowed);
       } catch {}
     }
-    const isAllowed = (url: string) =>
-      allowed.has(url) ||
-      allowed.has(url.replace(/\/+$/, "")) ||
-      allowed.has(url.replace(/\/+$/, "") + "/");
-    if (isAllowed(target)) return;
+    const target = targets.find(url => !allowed.has(url));
+    if (!target) return;
     return {
       block: true,
       reason: `URL_PROVENANCE_GUARD: ${target} was not supplied verbatim by the user nor returned by a successful google_search or web_search result. If the user provided a link, open that link directly. If searching, copy the exact search result URL. If the exact deep link is not indexed and was not provided by the user, open the closest official parent URL from search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl.`,
     };
   });
 
+  // The invoking agent writes the search queries itself (no planner model
+  // call). Every extra token here is decoded on the critical path, so the
+  // rule asks for keyword queries, not sentences.
+  const RESEARCH_QUERY_RULE = "research takes only q1, q2, q3, q4: four distinct keyword queries, each 2-6 keywords (no sentences, no filler words), different angles (official source, exact figure, date, English), relative dates replaced by concrete YYYY-MM-DD dates.";
+  // Research queries are written by the invoking agent, which must resolve
+  // 今天/明天/這週 to concrete dates (the planner used to get this line).
+  const localDateLine = () => {
+    const now = new Date();
+    const day = new Intl.DateTimeFormat("en-CA", {year:"numeric",month:"2-digit",day:"2-digit"}).format(now);
+    const weekday = "日一二三四五六"[now.getDay()];
+    return `Today: ${day} (週${weekday}), timezone ${Intl.DateTimeFormat().resolvedOptions().timeZone}. Resolve relative dates (今天/明天/這週…) against this.`;
+  };
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\n${SEARCH_FIRST_URL_RULE}`,
+    systemPrompt: `${event.systemPrompt}\n\n${SEARCH_FIRST_URL_RULE}\n\n${localDateLine()}\n\n${RESEARCH_QUERY_RULE}`,
   }));
 
+  const activeResearch = new Set<string>();
+  const crawlConcurrency = Math.min(64, Math.max(1, Number(process.env.RESEARCH_CRAWL_CONCURRENCY) || 32));
+  const crawlWordBudget = Math.min(100000, Math.max(1000, Number(process.env.RESEARCH_CRAWL_WORD_BUDGET) || 20000));
+  const lastUserText = (ctx: {sessionManager?: {getBranch?: () => unknown[]}}): string | undefined => {
+    const entries = ctx.sessionManager?.getBranch?.() ?? [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i] as {type?: string; message?: {role?: string; content?: unknown}};
+      if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+      const content = entry.message.content;
+      const text = typeof content === "string" ? content
+        : Array.isArray(content) ? content.filter((c: {type?: string}) => c?.type === "text").map((c: {text?: string}) => c.text ?? "").join("\n") : "";
+      if (text.trim()) return text.trim().slice(0, 4000);
+    }
+    return undefined;
+  };
+  // Speculative prefill is owned by the Pi harness (ctx.prefill, opt-in via the
+  // `prefill` setting): it previews the exact next request, leases a slot per
+  // session, warms it with the evidence committed so far, and pins the final
+  // request. This extension only reports what text is committed. Older Pi
+  // builds have no ctx.prefill; research then runs without prefill.
+  // Speculative research: the job starts as soon as q1 of a research call is
+  // written (search, crawl and evidence assembly need only the queries and
+  // the user's question). q2..q4 join the running job as they are written.
+  // execute() adopts the job; only prefill and the tool result need the
+  // finished call. A call that never executes is cancelled.
+  type Speculative = {jobId: string; sid: string; clock: ReturnType<typeof hostClock>; planner: ResearchPlanner;
+    promise: Promise<Record<string, any>>; lastPrefix: string; listener?: (prefix: string) => void;
+    abort: AbortController; adopted: boolean; timer: ReturnType<typeof setTimeout>};
+  const speculative = new Map<string, Speculative>();
+  const streamedArgs = new Map<string, {raw: string; sent: Set<number>}>();
+  const dropSpeculative = (id: string, reason: string) => {
+    const spec = speculative.get(id);
+    if (!spec || spec.adopted) return;
+    speculative.delete(id);
+    clearTimeout(spec.timer);
+    spec.abort.abort(new Error(reason));
+    activeResearch.delete(spec.sid);
+  };
+  pi.on("message_update", (event: {assistantMessageEvent?: {type?: string; contentIndex?: number; delta?: string;
+      partial?: {content?: Array<{type?: string; id?: string; name?: string}>}}}, ctx) => {
+    const ev = event.assistantMessageEvent;
+    if (!ev || (ev.type !== "toolcall_delta" && ev.type !== "toolcall_start" && ev.type !== "toolcall_end")) return;
+    const block = ev.partial?.content?.[ev.contentIndex ?? -1];
+    if (!block || block.type !== "toolCall" || block.name !== "research" || !block.id) return;
+    const id = block.id;
+    const sid = sessionId(ctx);
+    const state = streamedArgs.get(id) ?? {raw: "", sent: new Set<number>()};
+    streamedArgs.set(id, state);
+    if (streamedArgs.size > 32) streamedArgs.delete(streamedArgs.keys().next().value as string);
+    if (ev.type === "toolcall_delta" && typeof ev.delta === "string") state.raw += ev.delta;
+    // Only complete string values (closing quote present) are used.
+    for (const m of state.raw.matchAll(/"q([1-4])"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+      const index = Number(m[1]) - 1;
+      if (state.sent.has(index)) continue;
+      let query: string;
+      try { query = JSON.parse(`"${m[2]}"`); } catch { continue; }
+      if (!query.trim() || query.length > 80) continue;
+      state.sent.add(index);
+      const spec = speculative.get(id);
+      if (!spec) {
+        if (activeResearch.has(sid)) continue;  // another research owns this session
+        const jobId = randomUUID();
+        const clock = hostClock();
+        const abort = new AbortController();
+        const created: Speculative = {jobId, sid, clock, planner: new ResearchPlanner(ctx, jobId, clock),
+          promise: Promise.resolve({}), lastPrefix: "", abort, adopted: false,
+          timer: setTimeout(() => dropSpeculative(id, "speculative_research_not_adopted"), 60_000)};
+        created.promise = worker.research({jobId, question: lastUserText(ctx) ?? query, provider: "auto",
+          searchBudget: 8, searchConcurrency: 4, layaConcurrency: 2, crawlWordBudget, rankBatchSize: 4,
+          ranker: "none", crawlConcurrency, searchRounds: 1, queries: [query], streaming: true,
+          evidence: "progressive", clock}, sid, created.planner, abort.signal,
+          (prefix) => { created.lastPrefix = prefix; created.listener?.(prefix); });
+        created.promise.catch(() => {});
+        speculative.set(id, created);
+        activeResearch.add(sid);
+        // A query written before q1 (unusual order) joins right away.
+        for (const [other, q] of pendingEarly(state.raw, index)) {
+          if (state.sent.has(other)) continue;
+          state.sent.add(other);
+          worker.addQuery(sid, {jobId, query: q, index: other}).catch(() => {});
+        }
+      } else {
+        worker.addQuery(sid, {jobId: spec.jobId, query, index}).catch(() => {});
+      }
+    }
+    const spec = speculative.get(id);
+    if (ev.type === "toolcall_end" && spec) worker.addQuery(sid, {jobId: spec.jobId, done: true}).catch(() => {});
+  });
+  // Queries already complete when the job is created, other than the one that created it.
+  const pendingEarly = (raw: string, creator: number): Array<[number, string]> => {
+    const out: Array<[number, string]> = [];
+    for (const m of raw.matchAll(/"q([1-4])"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+      const index = Number(m[1]) - 1;
+      if (index === creator) continue;
+      try { out.push([index, JSON.parse(`"${m[2]}"`)]); } catch { /* skip */ }
+    }
+    return out;
+  };
+  // The call was not executed (other tool, no tool, error or abort): cancel.
+  pi.on("message_end", (event: {message?: {role?: string; stopReason?: string; content?: Array<{type?: string; id?: string; name?: string}>}}) => {
+    if (event.message?.role !== "assistant") return;
+    const calls = new Set((event.message.content ?? []).filter((c) => c.type === "toolCall" && c.name === "research").map((c) => c.id));
+    for (const id of [...speculative.keys()])
+      if (!calls.has(id) || event.message.stopReason !== "toolUse") dropSpeculative(id, "speculative_research_not_called");
+  });
+
   pi.registerTool({
+    name: "research",
+    label: "Budgeted research",
+    description: "Web research: runs your keyword queries (3 fourget + 1 Google), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
+    promptSnippet: "Default web search: four keyword queries in, crawled source-labelled evidence out (searches, crawls and dates handled by the tool)",
+    promptGuidelines: [
+      "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
+      "Do not call gettime before research: the system prompt's Today line is the current local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates in the queries.",
+      "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
+    ],
+    // Four separate parameters, not one array: llama.cpp streams a tool call
+    // one finished parameter at a time, so q1 reaches the extension (and its
+    // search starts) while q2..q4 are still being written.
+    parameters: Type.Object({
+      q1: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 1 (2-6 keywords, concrete dates)" }),
+      q2: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 2, a different angle" }),
+      q3: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 3, a different angle" }),
+      q4: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 4, a different angle" }),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const sid = sessionId(ctx);
+      const spec = speculative.get(_toolCallId);
+      if (spec) { spec.adopted = true; clearTimeout(spec.timer); }
+      else if (activeResearch.has(sid)) throw new Error("research_session_busy");
+      const jobId = spec?.jobId ?? randomUUID();
+      const clock = spec?.clock ?? hostClock();
+      const planner = spec?.planner ?? new ResearchPlanner(ctx, jobId, clock);
+      // Committed evidence is appended once, in order; the final packet must
+      // start with it or Pi drops the prefill (never affects correctness).
+      const prefill = (ctx as {prefill?: PrefillApi}).prefill?.begin(_toolCallId);
+      // Evidence is ranked against what the user actually asked, taken from
+      // the session instead of making the model copy it into the tool call.
+      const queries = [params.q1, params.q2, params.q3, params.q4].filter((q): q is string => typeof q === "string" && q.trim().length > 0);
+      const question = lastUserText(ctx) ?? queries.join(" ; ");
+      let committed = "";
+      let delivered = false;
+      const onPrefix = prefill ? (prefix: string) => {
+        if (!prefix.startsWith(committed)) { prefill.cancel("prefix_rewritten"); return; }
+        if (prefix.length > committed.length && prefill.append(prefix.slice(committed.length))) committed = prefix;
+      } : undefined;
+      activeResearch.add(sid);
+      try {
+        onUpdate?.({content:[{type:"text",text:"Research running; evidence will be returned once at completion."}],details:{jobId,status:"running"}});
+        // The model only chooses queries; the tool owns every other knob.
+        let response: Record<string, any>;
+        if (spec) {
+          // Adopt the job that started while the call was being written:
+          // replay the evidence committed so far, then follow it live.
+          if (onPrefix) { spec.listener = onPrefix; if (spec.lastPrefix) onPrefix(spec.lastPrefix); }
+          signal?.addEventListener("abort", () => spec.abort.abort(), { once: true });
+          response = await spec.promise;
+        } else {
+          response = await worker.research({jobId,question,provider:"auto",
+            searchBudget:8,searchConcurrency:4,layaConcurrency:2,crawlWordBudget:crawlWordBudget,
+            rankBatchSize:4,ranker:"none",crawlConcurrency,searchRounds:1,queries,
+            evidence:prefill ? "progressive" : "passages",clock},sid,planner,signal,
+            onPrefix);
+        }
+        prefill?.end();
+        if (response.action !== "research" || response.jobId !== jobId) throw new Error("research_invalid_terminal_frame");
+        const allowed = searchedUrls.get(sid) || new Set<string>();
+        // Only typed provider-success records from this owned job grant authority.
+        // Never scan packet text, page text, planner prose, or failure messages.
+        if (Array.isArray(response.authorizations)) for (const source of response.authorizations) {
+          if (!source || typeof source.url !== "string" ||
+              !Array.isArray(source.discoveries) || !source.discoveries.length ||
+              !source.discoveries.every((d: {provider?: unknown; taskId?: unknown}) =>
+                (d.provider === "google" || d.provider === "4get") && typeof d.taskId === "string")) continue;
+          try {
+            const parsed = new URL(source.url);
+            if ((parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password) allowed.add(source.url);
+          } catch { /* malformed provider URL cannot grant authority */ }
+        }
+        searchedUrls.set(sid,allowed);
+        let text = response.text || "Research incomplete: no terminal evidence packet.";
+        const usage = ctx.getContextUsage();
+        // Coarse byte-based estimate, NOT tokenizer/model inference or a guarantee.
+        // Keep half the remaining context plus 16k for sibling tools/prompt/output.
+        const packetBytes = Buffer.byteLength(text);
+        const estimatedInputTokens = Math.ceil(packetBytes / 2);
+        const reserve = usage?.tokens == null || !Number.isFinite(usage.tokens) || !Number.isFinite(usage.contextWindow)
+          ? 0 : Math.max(0,(usage.contextWindow-usage.tokens-16384)/2);
+        if (response.fullEvidenceDelivered && (packetBytes>2*1024*1024 ||
+            text.split("\n").length>20000 || estimatedInputTokens>reserve)) {
+          response.status="incomplete"; response.reason="packet_too_large"; response.fullEvidenceDelivered=false;
+          text="Research incomplete: packet_too_large (tool/context reserve). Full evidence was NOT delivered; immutable artifact preserved for recovery.";
+        }
+        const {text: _packet,...details}=response;
+        delivered = true;
+        return {content:[{type:"text" as const,text}],details:{...details,estimatedInputTokens,
+          plannerDiagnostics:planner.diagnostics,...(prefill ? {prefill:prefill.stats()} : {})},usage:planner.usage};
+      } finally {
+        activeResearch.delete(sid);
+        speculative.delete(_toolCallId);
+        if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
+      }
+    },
+  });
+
+  if (browserMode === "direct") pi.registerTool({
     name: "browser",
     label: "Browser (Nodriver + Xvfb)",
     description: DESCRIPTION,
@@ -695,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
     description: "Search Google directly through Nodriver with one to four distinct query directions in parallel. Returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
     promptSnippet: "Run 1–4 directional Google searches in parallel and return a de-duplicated Top 10",
     promptGuidelines: [
-      "Use google_search when broad research benefits from multiple non-overlapping Google query directions; use web_search for a single fast discovery query.",
+      "research is the default web lookup tool. Use google_search only when the user explicitly asks for a Google search; otherwise call research instead.",
       "For google_search, choose two to four task-appropriate directions. Good defaults are official or primary sources; current news or date-specific updates; independent reviews or community experience; and alternatives, risks, or counter-evidence.",
       "Do not mechanically use all four defaults when they do not fit. For shopping, prefer official specifications, retailer availability, independent reviews, and competing products; for technical research, prefer official docs, recent changes, implementation experience, and known limitations.",
       "For every google_search involving a date, time, relative time, recency, schedule, release, current price/stock, or other time-sensitive fact, first call gettime with action now, then copy its complete output into google_search.currentTime. The tool rejects missing or stale timestamps. Use the confirmed current year when a year improves retrieval; never default to 2025 from model memory.",

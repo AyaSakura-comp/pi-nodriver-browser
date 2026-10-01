@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1150" viewBox="0 0 1200 1150"><title>混合搜尋、網頁排名與粗略兩萬字預算</title><defs><marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1 1 L8 4.5 L1 8" fill="none" stroke="#7f9298"/></marker></defs><style>text{font-family:"Noto Sans CJK TC","Noto Sans TC",sans-serif;fill:#364950}.title{font-size:23px;font-weight:600}.sub{font-size:16px;fill:#6c7e84}</style><rect width="1200" height="1150" fill="#fcfcfa"/>
+<text x="60" y="48" class="sub">RANKED RESEARCH / 2026.09.28</text>
+<text x="60" y="90" class="title">3 × 4get ＋ 1 × Google → Laya 排名 → 約 20k 文字 → Pi</text>
+<path d="M600 220 V250 M180 250 H1020 M180 354 V393 H1020 V354 M460 354 V393 M740 354 V393" fill="none" stroke="#7f9298" stroke-width="1.5"/>
+<path d="M180 250 V278" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M460 250 V278" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M740 250 V278" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M1020 250 V278" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600 393 V425" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600 520 V570" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600 665 V710" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600 800 V850" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600 935 V980" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M865 890 H1110 V620 H865" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M335 890 H30 V185 H335" fill="none" stroke="#7f9298" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="335" y="135" width="530" height="85" rx="8" fill="#eef4ef" stroke="#cddbd5"/>
+<text x="353" y="169" class="title">Planner：只產生搜尋詞</text>
+<text x="353" y="197" class="sub">原題＋歷史＋引擎槽位；不收文章</text>
+<rect x="60" y="278" width="240" height="76" rx="8" fill="#edf3f6" stroke="#cddbd5"/>
+<text x="78" y="312" class="title">4get A</text>
+<text x="78" y="340" class="sub">每組最多前 10 筆</text>
+<rect x="340" y="278" width="240" height="76" rx="8" fill="#edf3f6" stroke="#cddbd5"/>
+<text x="358" y="312" class="title">4get B</text>
+<text x="358" y="340" class="sub">每組最多前 10 筆</text>
+<rect x="620" y="278" width="240" height="76" rx="8" fill="#edf3f6" stroke="#cddbd5"/>
+<text x="638" y="312" class="title">4get C</text>
+<text x="638" y="340" class="sub">每組最多前 10 筆</text>
+<rect x="900" y="278" width="240" height="76" rx="8" fill="#edf3f6" stroke="#cddbd5"/>
+<text x="918" y="312" class="title">Google D</text>
+<text x="918" y="340" class="sub">每組最多前 10 筆</text>
+<rect x="335" y="425" width="530" height="95" rx="8" fill="#fff" stroke="#cddbd5"/>
+<text x="353" y="459" class="title">先合併、URL 去重</text>
+<text x="353" y="487" class="sub">排除已排隊／爬過／失敗連結，再送 Laya</text>
+<rect x="335" y="570" width="530" height="95" rx="8" fill="#f6f0e6" stroke="#cddbd5"/>
+<text x="353" y="604" class="title">Laya：只比較候選網頁</text>
+<text x="353" y="632" class="sub">每次最多 3 選 1；快取淘汰賽，取前 N 個</text>
+<text x="355" y="690" class="sub">不混排不同組的機率；不再混入 none／動作選項</text>
+<rect x="335" y="710" width="530" height="90" rx="8" fill="#edf3f6" stroke="#cddbd5"/>
+<text x="353" y="744" class="title">依排名分批平行 crawl</text>
+<text x="353" y="772" class="sub">預設每批 4 頁、同時 2 頁；沒有總共 6 頁限制</text>
+<rect x="335" y="850" width="530" height="85" rx="8" fill="#f3eff7" stroke="#cddbd5"/>
+<text x="353" y="884" class="title">累積約 20,000 粗略文字單位</text>
+<text x="353" y="912" class="sub">不算精準 token；不裁斷已爬原文</text>
+<text x="888" y="800" class="sub">未達預算</text>
+<text x="888" y="827" class="sub">還有候選 → 下一批</text>
+<text x="52" y="799" class="sub">候選用完</text>
+<text x="52" y="826" class="sub">仍有 query 額度</text>
+<text x="52" y="853" class="sub">→ 規劃下一輪</text>
+<rect x="335" y="980" width="530" height="90" rx="8" fill="#eef4ef" stroke="#cddbd5"/>
+<text x="353" y="1014" class="title">完整證據交給 Pi 產生答案</text>
+<text x="353" y="1042" class="sub">達預算後不開新爬文；在途頁面可能超額</text>
+<text x="60" y="1120" class="sub">20k 是粗略門檻，不是精準 input-token 上限；排序不是正確性保證。原始碼已驗證，尚未部署。</text>
+</svg>

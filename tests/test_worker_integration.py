@@ -910,6 +910,29 @@ class PdfExtractionUnitTests(unittest.IsolatedAsyncioTestCase):
         stale.stop.assert_called_once()
         start.assert_awaited_once()
 
+    async def test_ensure_browser_max_age_reuses_recent_probe_without_lock(self):
+        from worker import BrowserWorker
+
+        worker = BrowserWorker()
+        browser = SimpleNamespace(send=AsyncMock(), stop=Mock())
+        worker.browser = browser
+
+        self.assertIs(await worker.ensure_browser(max_age=5.0), browser)
+        self.assertEqual(browser.send.await_count, 1)
+        async with worker.browser_lifecycle_lock:
+            # A held lifecycle lock (e.g. Google opening a tab) must not block crawls.
+            results = await asyncio.wait_for(asyncio.gather(
+                *(worker.ensure_browser(max_age=5.0) for _ in range(8))
+            ), timeout=0.5)
+        self.assertTrue(all(result is browser for result in results))
+        self.assertEqual(browser.send.await_count, 1)
+
+        await worker.ensure_browser()
+        self.assertEqual(browser.send.await_count, 2)
+        worker.browser_verified_at -= 10
+        await worker.ensure_browser(max_age=5.0)
+        self.assertEqual(browser.send.await_count, 3)
+
     async def test_concurrent_dead_browser_recovery_launches_once(self):
         from worker import BrowserWorker
 
@@ -2690,6 +2713,89 @@ class WorkerTabCapacityUnitTests(unittest.IsolatedAsyncioTestCase):
             {record.target_id for record in worker.tab_registry.records()},
             {'tab-alive'},
         )
+
+    async def test_research_crawl_pool_tabs_never_enter_or_evict_the_interactive_lru(self):
+        from worker import BrowserWorker
+
+        class PoolBrowser(FakeBrowser):
+            def __init__(self):
+                super().__init__()
+                self.opened = 0
+            async def get(self, url, new_tab=False):
+                self.opened += 1
+                page = FakePage(self, f'pool-{self.opened}')
+                self.tabs.append(page)
+                return page
+
+        worker = BrowserWorker()
+        worker.browser = PoolBrowser()
+        user_tabs = [FakePage(worker.browser, f'user-{i}') for i in range(worker.max_tabs)]
+        worker.browser.tabs.extend(user_tabs)
+        for i, page in enumerate(user_tabs):
+            worker.register_tab(page, f'user-session-{i}')
+        # Far more crawl tabs than the interactive limit.
+        pool = [await worker.create_pool_tab() for _ in range(worker.max_tabs + 10)]
+        await worker.reconcile_tabs()
+        self.assertEqual({r.target_id for r in worker.tab_registry.records()},
+                         {f'user-{i}' for i in range(worker.max_tabs)},
+                         'crawl tabs are not adopted as unowned LRU tabs')
+        self.assertTrue(all(not page.closed for page in user_tabs), 'no user tab was evicted')
+        for page in pool:
+            await worker.close_pool_tab(page)
+        self.assertEqual(worker.crawl_pool_targets, {})
+        self.assertTrue(all(page.closed for page in pool))
+
+    async def test_pool_tab_creation_does_not_wait_for_the_interactive_tab_lock(self):
+        from worker import BrowserWorker
+
+        class PoolBrowser(FakeBrowser):
+            async def get(self, url, new_tab=False):
+                page = FakePage(self, 'pool-x')
+                self.tabs.append(page)
+                return page
+
+        worker = BrowserWorker()
+        worker.browser = PoolBrowser()
+        async with worker.tab_management_lock:  # e.g. a Google search tab being created
+            page = await asyncio.wait_for(worker.create_pool_tab(), 1)
+        self.assertIn('pool-x', worker.crawl_pool_targets)
+        # A reconcile that raced the creation does not keep the tab in the LRU registry.
+        worker.register_tab(page, '__unowned__', 'unowned')
+        await worker.close_pool_tab(page)
+        page2 = await worker.create_pool_tab()
+        self.assertNotIn('pool-x', {r.target_id for r in worker.tab_registry.records()})
+        await worker.close_pool_tab(page2)
+
+    async def test_sweep_closes_only_leftover_crawl_pool_tabs(self):
+        from worker import BrowserWorker
+
+        class PoolBrowser(FakeBrowser):
+            def __init__(self):
+                super().__init__()
+                self.opened = 0
+            async def get(self, url, new_tab=False):
+                self.opened += 1
+                page = FakePage(self, f'pool-{self.opened}')
+                self.tabs.append(page)
+                return page
+
+        class StuckPage(FakePage):
+            async def close(self):
+                raise TimeoutError('close hung')
+
+        worker = BrowserWorker()
+        worker.browser = PoolBrowser()
+        in_use = await worker.create_pool_tab()          # another job is crawling with it
+        leftover = await worker.create_pool_tab()
+        stuck = StuckPage(worker.browser, 'pool-stuck')
+        worker.browser.tabs.append(stuck)
+        worker.crawl_pool_targets['pool-stuck'] = stuck
+        leftover_id = worker.tab_registry.target_id(leftover)
+        worker.crawl_pool_inflight.discard(leftover_id)  # its crawl finished but close failed
+        self.assertEqual(await worker.sweep_crawl_pool(), 1)
+        self.assertTrue(leftover.closed)
+        self.assertFalse(in_use.closed, 'a tab another research job is using is not closed')
+        self.assertIn('pool-stuck', worker.crawl_pool_targets, 'a close that fails again stays tracked')
 
     async def test_reconcile_restores_live_opener_when_current_popup_was_closed_externally(self):
         from worker import BrowserWorker

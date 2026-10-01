@@ -15,6 +15,7 @@ class UrlProvenanceJavaScriptTests(unittest.TestCase):
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"direct"});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -72,6 +73,7 @@ if (blocked?.block) throw new Error('non-open browser command was blocked');
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"direct"});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -97,6 +99,7 @@ if (decision?.block) throw new Error('browser google-search result URL was block
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"direct"});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -133,7 +136,7 @@ if (allowedHistory?.block) throw new Error('user history URL was blocked: ' + al
 let allowedSlash = await handlers.get('tool_call')({
   toolName: 'browser', toolCallId: '3', input: { command: 'open https://user.example/from-input/' }
 }, ctx);
-if (allowedSlash?.block) throw new Error('user input URL with trailing slash was blocked');
+if (!allowedSlash?.block) throw new Error('modified user URL with added trailing slash was authorized');
 
 // 4. Guessed / hallucinated URL is blocked
 let blocked = await handlers.get('tool_call')({
@@ -148,3 +151,48 @@ if (!blocked?.block || !blocked.reason.includes('URL_PROVENANCE_GUARD')) {
 if __name__ == '__main__':
     unittest.main()
 
+
+
+class ResearchDoneGuardJavaScriptTests(unittest.TestCase):
+    run_node = LensJavaScriptTests.run_node
+
+    def test_follow_up_lookups_after_research_are_blocked_unless_the_user_asks(self):
+        text = (ROOT / 'index.ts').read_text()
+        start = text.index('function extractSearchResultUrls')
+        source = text[start:].replace('export default function', 'function register', 1)
+        self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"direct"});
+const Type = new Proxy({}, { get: () => (...args) => args[0] });
+const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
+const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
+const truncateHead = text => ({content:text, truncated:false});
+class NodriverWorker { async request() { return {text:'ok'}; } async cleanupSession() {} disconnect() {} }
+''' + source + r'''
+const handlers = new Map();
+register({ on(name, handler) { handlers.set(name, handler); }, registerTool() {} });
+const ctx = {sessionManager:{getSessionId:()=> 'session-r'}};
+await handlers.get('session_start')({}, ctx);
+const call = name => handlers.get('tool_call')({toolName:name, toolCallId:name, input:{urls:['https://a.example/']}}, ctx);
+const research = isError => handlers.get('tool_result')({toolName:'research', toolCallId:'r', input:{}, isError,
+  content:[{type:'text', text:'evidence'}], details:{}}, ctx);
+
+await handlers.get('input')({text:'這禮拜南部有什麼活動'}, ctx);
+if ((await call('crawl'))?.block) throw new Error('crawl blocked before research');
+await research(false);
+for (const name of ['crawl','google_search','fetch_images','fetch_image','research']) {
+  const r = await call(name);
+  if (!r?.block || !r.reason.includes('RESEARCH_DONE_GUARD')) throw new Error(name + ' not blocked after research');
+}
+if ((await call('gettime'))?.block) throw new Error('unrelated tool blocked');
+
+await handlers.get('input')({text:'謝謝，那高雄呢'}, ctx);
+if ((await call('research'))?.block) throw new Error('next user message did not reset the guard');
+
+await handlers.get('input')({text:'幫我爬一下第一個網址'}, ctx);
+await research(false);
+if ((await call('crawl'))?.block) throw new Error('explicit crawl request was blocked');
+
+await handlers.get('input')({text:'台南天氣'}, ctx);
+await research(true);
+if ((await call('google_search'))?.block) throw new Error('failed research must not block a fallback');
+''', suffix='.mts')

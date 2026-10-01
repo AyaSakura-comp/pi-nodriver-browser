@@ -177,6 +177,7 @@ class BatchTransportTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / 'index.ts').read_text()
         factory = source[source.index('export default function'):].replace('export default function', 'function register', 1)
         self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"direct"});
 const Type = new Proxy({}, {get: () => (...args) => args[0]});
 const DESCRIPTION='', VISION_FALLBACK_GUIDANCE='', SEARCH_FIRST_URL_RULE='';
 const DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES=50000;

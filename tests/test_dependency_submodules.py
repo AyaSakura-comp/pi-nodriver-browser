@@ -8,7 +8,6 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
     'omniparser': ('OmniParser', 'master'),
     'laya': ('laya', 'laya'),
-    'laya-browser-intent': ('laya-browser-intent', 'laya'),
     'xvfb-streaming': ('xvfb-streaming', 'master'),
 }
 

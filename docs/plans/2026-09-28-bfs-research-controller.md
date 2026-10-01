@@ -1,8 +1,46 @@
 # BFS Research Controller Implementation Plan
 
-**Status:** TODO / design only. This commit does not implement or deploy the feature.
+**Status:** IN PROGRESS — source integration and isolated live evaluation exist; production deployment and a passing end-to-end quality gate remain pending. The live 20-case evaluation exposed planner-contract failures and premature sufficiency. Host-owned metadata and bounded format repair have since been implemented; evidence-quality defects are not claimed fixed. See [research-controller.md](../research-controller.md) for supported controls and limitations.
 
-**Execution:** Implement task-by-task with test-first verification. This document does not authorize subagent delegation; request operator approval before delegating.
+### Host-owned planner contract fix checkpoint
+
+- [x] Model drafts only semantic searches, assessments and finish; no revision/job/parent IDs requested.
+- [x] Host clones the original request/provider list, binds its original revision and chooses deterministic existing BFS parents. Backend stale-plan validation remains active.
+- [x] One syntax/shape repair maximum, same model and shared 20-second deadline/input cap; no silent defaults, clipping or third attempt.
+- [x] Invented references/providers and disallowed navigation fields fail closed before repairable shape checks, including mixed malformed-shape cases.
+- [x] Both attempts' valid reported usage is counted, including length-terminated repair responses; expose modelCalls/formatRepairs/formatFailures in tool details.
+- [x] RED/GREEN regressions and focused independent re-review completed. Node 25 tests and strict TS pass; Python 624 total/90 skipped/no failures.
+- [x] Six recorded request snapshots replayed through live Qwen: six contract-valid proposals, one call each. This is not a new factual-quality score.
+- [ ] Repeat whole-pipeline quality evaluation when Laya is available. The latest five-question smoke encountered inactive Laya; it is not counted as end-to-end success.
+
+### Integrated-review fix checkpoint
+
+The three accepted integrated-review findings now have offline RED→GREEN fixes:
+owned cancelled/expired Google callbacks remain tracked/joined through cleanup;
+shared Google/crawl closes and late owner cleanup are bounded and release locks/
+admission on failure; descriptor-level model fallback is rejected and returned
+provider/model/API identities must match exactly; typed terminal authority exports
+every exact successful-provider URL separately from one deduplicated crawl identity.
+Operator URL edits remain unchanged. Validation: 623 Python tests (90 skipped),
+89 focused research tests, 7 Node planner tests, strict TS/compile/syntax/diff
+checks passed. Independent re-review and live release verification remain pending;
+no commit, deployment, service restart, external search/model call or benchmark.
+
+### Integration checkpoint
+
+Implemented and fixture-tested: controller BFS/coverage/drain; active-model registry binding and host-clock snapshot; streamed planner replies outside interactive locks; shared real Google/crawl operations and global admission; private capability-socket crawl consumer; typed exact-URL authority; full captured text and PDF/HTML-cap metadata; explicit terminal packet overflow; cancellation-safe writer/consumer/job cleanup. Core review findings for sentinel admission and oversized Laya probabilities were reproduced RED and fixed GREEN.
+
+The installer test now uses only a staging branch with lifecycle stubs; previous full-suite runs must not be inferred to have been side-effect-safe. Integration verification uses repository `.venv`, Node's existing strip-types runner, installed Pi declarations and bounded offline fixtures. The installed `pi` bundle exposes `ModelRegistry.complete`; no model request was made to verify live authentication/provider behavior.
+
+Remaining: independent review, live/browser/model release verification, richer requirement decomposition/contradiction resolution, larger one-turn evidence delivery, measured telemetry/benchmarks. A cleanup-incomplete failure is not a successful result; eventual owned cleanup remains tracked. The documented 1,500-TPS figure remains an assumption.
+
+### Implementation checkpoint — core primitives
+
+Implemented in `research/`: validated tasks/results/limits, atomic query budget, provider-scoped query dedup, BFS level barriers, URL/source lifecycle registry, bounded parallel search with async 4get HTTP, bounded async Laya protocol client, and single-consumer full-text evidence journaling/freezing/rendering. See [`../research-core.md`](../research-core.md) for current API boundaries and verification.
+
+Verification checkpoint: baseline `.venv/bin/python -m unittest discover -s tests -v` had 534 tests with 90 skipped and no failures. New core/provider/Laya/pipeline tests are offline and use loopback fixtures, not live websites or model services. No production service has been restarted, no extension installed, and no model benchmark run.
+
+**Execution:** Implement task-by-task with test-first verification. Delegation requires operator authorization (explicitly supplied for this implementation); this document itself does not authorize it.
 
 **Goal:** Integrate budgeted, parallel Google/4get research into `pi-nodriver-browser`, decide whether to search further, crawl, or retain descriptions inside the tool, and return the complete collected textual evidence to the main Pi agent in one final handoff.
 
@@ -100,7 +138,7 @@ Register one tool, tentatively `research`, rather than requiring the agent to ca
 }
 ```
 
-`provider` supports `4get`, `google`, `auto`. For `auto`, start with 4get and use a bounded Google fallback only when failed/empty/non-covering results justify it. A page found with insufficient detail should usually be crawled, not automatically searched again with another engine. Read authoritative time in the controller; do not accept a model-provided timestamp as authority.
+`provider` supports `4get`, `google`, `auto`. For `auto`, start with 4get and use a bounded Google fallback only when failed/empty/non-covering results justify it. A page found with insufficient detail should usually be crawled, not automatically searched again with another engine. Capture authoritative time on the trusted extension host with Date/Intl and pass its ISO/timezone snapshot to the controller/planner; do not accept a model-provided timestamp as authority. This host-clock bridge was explicitly approved during integration.
 
 ### Internal search task and normalized result
 
@@ -210,14 +248,14 @@ Shared clients from sibling projects must have an explicit packaging strategy. P
 
 ## 7. Detailed TODO implementation sequence
 
-Each numbered unit is a small commit boundary; each checkbox is a separate action. For every behavior change: write its focused failing test, observe the expected failure, implement minimally, rerun, then inspect the diff and commit only its files. Do not run live searches in unit tests.
+Each numbered unit is a small review boundary; each checkbox is a separate action. For every behavior change: write its focused failing test, observe the expected failure, implement minimally, rerun, then inspect the diff. This implementation authorization prohibits committing or deploying. Historical checkboxes below are not a replacement for the current checkpoint and executable tests. Do not run live searches in unit tests.
 
 ### 01 — Capture baseline and reuse boundaries
 
 **Files:** `index.ts`, `worker.py`, `browser_logic.py`, sibling reference files above (read-only initially).
 
-- [ ] Record existing dirty files and preserve operator changes; never reset/stash them implicitly.
-- [ ] Run `python3 -m unittest discover -s tests -v`; record pre-existing failures.
+- [x] Record existing dirty files and preserve operator changes; never reset/stash them implicitly.
+- [x] Run baseline tests using the repository `.venv/bin/python`; system Python lacks nodriver. Baseline: 534 tests, 90 skipped, no failures.
 - [ ] Trace both TypeScript queueing and daemon command locks; document which operations mutate an interactive tab versus use independent managed tabs.
 - [ ] Trace streamed progress, cancellation and process ownership so nested crawl IPC cannot deadlock.
 - [ ] Confirm current Pi model/auth APIs and supported provider transports from complete relevant Pi docs/examples.
@@ -235,9 +273,9 @@ Each numbered unit is a small commit boundary; each checkbox is a separate actio
 
 **Files:** create `research/budget.py`, `tests/test_research_budget.py`.
 
-- [ ] Test three concurrent reservations with budget two: exactly two succeed.
-- [ ] Test retry/fallback charging, no refund after dispatched failure, and no debit for pre-dispatch cancellation or dedup rejection.
-- [ ] Implement an owner-mediated counter and attempt ledger; budget cannot go negative.
+- [x] Test concurrent reservations with budget two: exactly two succeed.
+- [x] Test explicit retry charging, no refund after dispatched failure, and no debit for dedup/unsupported-provider rejection; iterator close prevents further dispatch. End-to-end fallback remains pending.
+- [x] Implement an owner-mediated counter and attempt ledger; budget cannot go negative.
 - [ ] Verify dispatched-attempt count equals budget used in every terminal outcome.
 
 Executable test sketch (adapt names to the final contracts):
@@ -259,7 +297,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
 
 **Files:** create `research/frontier.py`, `tests/test_research_frontier.py`.
 
-- [ ] Add depth barrier, empty-frontier-with-pending-crawl, repeated-topic and late-discovery tests.
+- [x] Add depth barrier, query dedup and late-discovery tests. Pending-crawl awareness remains a controller integration task.
 - [ ] Implement same-depth FIFO dispatch and next-level child insertion without recursive free-form topic drift.
 - [ ] Distinguish duplicate query suppression from cross-provider fallback eligibility.
 - [ ] Verify a batch of three depth-1 tasks starts before any depth-2 task.
@@ -286,9 +324,9 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
 
 **Files:** `research/providers.py`, `tests/test_research_fourget.py`.
 
-- [ ] Fixture-test successful/empty/malformed/oversized responses, HTTP failures, timeout and cancellation.
+- [x] Fixture-test successful/empty/malformed/oversized responses, HTTP failures, timeout and cancellation.
 - [ ] Match existing ddg/global settings and sanitation; compare repository and installed extension behavior explicitly.
-- [ ] Use a shared asynchronous HTTP client or a bounded executor; never block the controller event loop with synchronous URL requests.
+- [x] Use a shared asynchronous HTTP client (aiohttp); never block the event loop with synchronous URL requests.
 - [ ] Normalize to the same source schema as Google while retaining provider, query and rank.
 
 ### 08 — Parallel provider scheduling
@@ -319,7 +357,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
 
 - [ ] Build candidates from registered sources and planner-generated query options, including none/uncertain.
 - [ ] Test snippet adequacy, crawl-needed, wrong-date results, contradictions and unsupported negative conclusions.
-- [ ] Call the existing Laya service directly with a concurrency semaphore (initially 2), not browser-intent `/act`.
+- [x] Add the direct Laya protocol client with a concurrency semaphore (initially 2), not browser-intent `/act`; verified with local fixtures, not a live model test.
 - [ ] Validate probabilities structurally; do not reuse UI thresholds as calibrated research thresholds.
 - [ ] Test that independent source judgments overlap but decisions only become actions through the controller.
 - [ ] Test timeout/uncertainty escalates to bounded planner work or incomplete status, not unconditional finish.
@@ -330,7 +368,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
 
 - [ ] Test snippets and page extracts entering the same journal, unicode/newlines, crash-torn final lines and duplicate event delivery.
 - [ ] Implement a single queue consumer writer with per-job restricted artifact paths and explicit flush/freeze lifecycle.
-- [ ] Preserve complete captured text, source wrappers and upstream truncation flags. Do not replace a snippet with a model summary.
+- [x] Preserve complete captured text, source wrappers and upstream truncation flags. Do not replace a snippet with a model summary.
 - [ ] Test final rendering has every captured evidence record exactly once, labels source type, and is deterministic under a defined stable ordering.
 - [ ] Do not include runtime headers, cookies, API keys, raw private browser profiles or unrelated page state.
 
@@ -436,4 +474,4 @@ python3 benchmarks/research_profile.py --mode end-to-end --provider 4get --searc
 
 ## 9. Scope of this planning commit
 
-Only this plan is added. Existing worktree changes to `index.ts`, `tests/test_url_provenance.py`, and untracked `tests/test_url_guard_regression.py` are outside this documentation commit and must remain untouched. No service restart, package installation, model call, browser session modification or deployment is required to commit this plan.
+The original planning commit added only this plan. Pre-existing worktree changes to `index.ts`, `tests/test_url_provenance.py`, and untracked `tests/test_url_guard_regression.py` remain outside the research implementation and must remain untouched. Implementation checkpoints may update this plan, but do not imply service restart or deployment. The first implementation slice added aiohttp to repository requirements and installed it only into the repository `.venv` for offline fixture tests.

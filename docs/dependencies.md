@@ -9,12 +9,11 @@ ordinary checkout follows the pinned commit, never the latest branch tip.
 |---|---|---|---|---|
 | `dependencies/omniparser` | `AyaSakura-comp/OmniParser` | `master` | `f4e53d5` | Public; YOLO detector `/parse`, normally localhost:8012 |
 | `dependencies/laya` | `AyaSakura-comp/laya` | `laya` | `e676305` | Public; Laya model server `/v1/systemone`, normally localhost:8000 |
-| `dependencies/laya-browser-intent` | `AyaSakura-comp/laya-browser-intent` | `laya` | `28a9b73` | **Private**; natural-language intent API, normally localhost:8011, plus separate Pi extension |
 | `dependencies/xvfb-streaming` | `AyaSakura-comp/xvfb-streaming` | `master` | `e97f706` | **Private**; optional Chrome/Xvfb screen streaming |
 
-Laya's model-server repository and Laya Browser Intent are different dependencies.
-The `laya` branch is intentional; their default branches are not the deployed
-integration branches. OmniParser points to the user's fork containing the INT8
+Laya's model-server repository remains a dependency. Browser Intent is now
+integrated under `intent/`, imported from `laya-browser-intent` at `28a9b73`.
+The model server's `laya` branch is intentional. OmniParser points to the user's fork containing the INT8
 CPU deployment code, not the unchanged Microsoft upstream tree.
 
 ## Clone and initialize
@@ -27,7 +26,7 @@ cd pi-nodriver-browser
 git submodule update --init -- dependencies/omniparser dependencies/laya
 ```
 
-Authenticated full setup, for an account with access to both private repos:
+Authenticated full setup, for an account with access to the private streaming repo:
 
 ```sh
 gh auth login
@@ -39,7 +38,7 @@ git submodule status --recursive
 Alternatively use `git clone --recurse-submodules` **after** configuring access.
 All `.gitmodules` URLs are credential-free HTTPS. Never embed a token in a URL,
 commit auth headers, or make a private repository public to fix an auth error.
-A public clone without private access cannot initialize all four dependencies;
+A public clone without private access cannot initialize all three dependencies;
 this does not prevent the core semantic browser from being used.
 
 For an existing checkout after pulling:
@@ -83,17 +82,17 @@ boundary. It does not bundle submodule contents into the installed extension.
 - Laya model server: consult its README and `examples/server.py --help`; provision
   its weights separately. Use localhost binding. Laya is a model dependency,
   not bundled weights and not TypeSafe's hosted Jev model.
-- Laya Browser Intent: consult its README. Its separately loaded
-  `pi-extension/browser-intent.ts` provides `browser_intent`; do not load duplicate
-  extension copies. Configure its Laya URL and browser socket for your host.
+- Browser Intent: consult [the integrated runtime guide](../intent/README.md).
+  Set `browserMode` to `intent` in the browser config; no separate extension.
+  Configure its Laya URL and browser socket for your host.
 - Xvfb Streaming: consult its README/compose setup. Supply your own ignored
   environment and access configuration; the private repo contains committed
   source only, not this host's `.env` or `.env.bak-before-autosize`.
 
-Existing running services on the original host continue to use their separate
-working copies. No running service paths, sockets, environments or settings were
-migrated by adding submodules. Migration to these source locations is a separate
-explicit deployment step via the host's restart-service procedures.
+Adding submodules alone does not migrate services. The Browser Intent integration
+explicitly migrated this host's router WorkingDirectory to the installed `intent/`
+directory; other dependent services retain their existing paths. Service migration
+uses the host's restart-service procedures.
 
 Other dependencies remain in their proper package/runtime layer: Python/nodriver
 and supporting libraries in `requirements.txt`, Chrome/Xvfb system packages,

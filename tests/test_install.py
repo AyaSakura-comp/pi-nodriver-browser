@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallerTests(unittest.TestCase):
-    def test_installs_extension_and_disables_conflicting_package(self):
+    def test_stages_runtime_without_install_or_lifecycle_actions(self):
         with tempfile.TemporaryDirectory() as temp:
             agent_dir = Path(temp) / 'agent'
             agent_dir.mkdir()
@@ -17,16 +17,29 @@ class InstallerTests(unittest.TestCase):
             settings.write_text(json.dumps({
                 'packages': ['npm:pi-agent-browser', 'npm:pi-until-done'],
             }))
-            env = {
-                **os.environ,
-                'PI_AGENT_DIR': str(agent_dir),
-                'SKIP_SYSTEM_CHECKS': '1',
-                'SKIP_PIP_INSTALL': '1',
-            }
-
-            subprocess.run([str(ROOT / 'install.sh')], cwd=ROOT, env=env, check=True)
-
             installer_source = (ROOT / 'install.sh').read_text()
+            # Fail before executing an installer that lacks the staging-only guard.
+            self.assertIn('if [[ "${1:-}" == "--stage" ]]', installer_source)
+            self.assertLess(installer_source.index('if [[ "${1:-}" == "--stage" ]]'),
+                            installer_source.index('if [[ "${SKIP_SYSTEM_CHECKS'))
+            extension = agent_dir / 'extensions/nodriver-browser'
+            stubs = Path(temp) / 'bin'
+            stubs.mkdir()
+            lifecycle_log = Path(temp) / 'lifecycle.log'
+            for command in ('pgrep','find','python3','sleep'):
+                stub = stubs / command
+                stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "{command}" >> "{lifecycle_log}"\nexit 42\n')
+                stub.chmod(0o755)
+            subprocess.run([str(ROOT / 'install.sh'), '--stage', str(extension)],
+                           cwd=ROOT, env={**os.environ, 'PI_AGENT_DIR': str(agent_dir),
+                             'HOME':temp, 'PI_NODRIVER_SOCKET':str(Path(temp)/'absent.sock'),
+                             'PATH':f'{stubs}:/usr/bin:/bin'}, check=True)
+            self.assertFalse(lifecycle_log.exists(), 'staging invoked a lifecycle command')
+            subprocess.run([str(ROOT / '.venv/bin/python'), '-B', '-c',
+                            'import research.jobs, research.crawl_jobs, worker'], cwd=extension, check=True)
+            self.assertTrue((extension / 'research/controller.py').is_file())
+            self.assertTrue((extension / 'research-model.ts').is_file())
+            self.assertFalse((extension / 'research/__pycache__').exists())
             self.assertIn('PI_NODRIVER_SOCKET', installer_source)
             self.assertIn("'command': 'shutdown'", installer_source)
             extension = agent_dir / 'extensions/nodriver-browser'
@@ -75,8 +88,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('new_tab_timeout_seconds = 2.0', native_click)
             self.assertNotIn('page.sleep(1)', native_click)
             updated = json.loads(settings.read_text())
-            self.assertEqual(updated['packages'], ['npm:pi-until-done'])
-            self.assertTrue((agent_dir / 'settings.json.pi-nodriver-browser.bak').is_file())
+            self.assertEqual(updated['packages'], ['npm:pi-agent-browser', 'npm:pi-until-done'])
+            self.assertFalse((agent_dir / 'settings.json.pi-nodriver-browser.bak').exists())
+            self.assertIn("item != 'npm:pi-agent-browser'", installer_source)
 
     def test_browser_mode_switch_is_exposed_and_documented(self):
         extension_source = (ROOT / 'index.ts').read_text()
@@ -296,8 +310,10 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("if action == 'google-search':", worker_source)
         self.assertIn('select_diverse_search_results', worker_source)
         google_worker = worker_source.split("if action == 'google-search':", 1)[1].split("if action == 'crawl':", 1)[0]
-        self.assertIn('width=1920', google_worker)
-        self.assertIn('mobile=False', google_worker)
+        self.assertIn('self.search_one(search, i, session_id, search_slots)', google_worker)
+        google_operation = worker_source.split('async def _search_one(', 1)[1].split('async def crawl_one(', 1)[0]
+        self.assertIn('width=1920', google_operation)
+        self.assertIn('mobile=False', google_operation)
 
     def test_google_search_extracts_the_description_sibling_outside_the_heading_block(self):
         worker_source = (ROOT / 'worker.py').read_text()
