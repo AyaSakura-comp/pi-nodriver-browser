@@ -70,6 +70,7 @@ class Act(BaseModel):
 
 
 TEXT_CACHE: dict[str, dict] = {}        # session -> last successful `get text` (worker LOOP_GUARD blocks repeats)
+PAGE_LINKS: dict[str, list[dict]] = {}        # session -> candidate links on the active page
 
 
 def _cmd(session: str, command: str) -> dict:
@@ -95,13 +96,27 @@ def _page_state(session: str, snap_text: str | None = None) -> dict:
         snap_text = _cmd(session, "snapshot -i").get("text", "")
     els = L.parse_snapshot(snap_text)
     heads = [e.name()[:60] for e in els if e.tag in ("h1", "h2", "h3") and e.name()][:4]
+    # Extract visible/interactive links with valid absolute URLs
+    from urllib.parse import urljoin
+    cand_links = []
+    seen_urls = set()
+    for e in els:
+        if e.tag == "a" and e.attrs.get("href"):
+            raw_href = e.attrs["href"].strip()
+            if raw_href and not raw_href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                full_url = urljoin(url, raw_href)
+                if (full_url.startswith("http://") or full_url.startswith("https://")) and full_url not in seen_urls:
+                    seen_urls.add(full_url)
+                    name = e.name().strip() or e.text.strip() or full_url
+                    cand_links.append({"title": name[:80], "url": full_url})
+    PAGE_LINKS[session] = cand_links
     # Visible text is part of the fingerprint: two states can expose identical controls (e.g. "− ＋").
     gt = _cmd(session, "get text")
     text = (gt.get("pageText") or gt.get("text") or "")[:20000]
     fp = L.fingerprint(snap_text + "\n@e-text " + hashlib.sha1(text.encode()).hexdigest())
     excerpt = re.sub(r"\s+", " ", text).strip()[:300]
     return {"url": url, "title": title, "headings": heads, "page_excerpt": excerpt, "fingerprint": fp,
-            "elements": len(els), "_snap": snap_text}
+            "elements": len(els), "links": cand_links[:12], "_snap": snap_text}
 
 
 def _remember(session: str, url: str) -> None:
@@ -180,8 +195,17 @@ def _options(g) -> list[str]:
 
 def do_open(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     p = progress or (lambda s, m, **e: None)
-    p("opening", f"🌐 正在導航至：{req.url}...")
-    r = _cmd(req.session, f"open {req.url}")
+    target_url = req.url
+    if not target_url and req.pick is not None:
+        cand_links = PAGE_LINKS.get(req.session, [])
+        if 1 <= req.pick <= len(cand_links):
+            target_url = cand_links[req.pick - 1]["url"]
+        else:
+            return {"status": "ERROR", "message": f"pick={req.pick} 超出候選連結範圍 (當前頁面有 {len(cand_links)} 個候選連結)"}
+    if not target_url:
+        return {"status": "ERROR", "message": "open 需要指定 url 或是從當前頁面候選連結指定 pick 編號"}
+    p("opening", f"🌐 正在導航至：{target_url}...")
+    r = _cmd(req.session, f"open {target_url}")
     st = _page_state(req.session)
     _remember(req.session, st["url"])
     p("opened", f"✓ 頁面載入完成 (標題: 「{st.get('title')}」)")
@@ -691,6 +715,7 @@ def _dispatch(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         PENDING.pop(req.session, None)
         HISTORY.pop(req.session, None)
         TEXT_CACHE.pop(req.session, None)
+        PAGE_LINKS.pop(req.session, None)
         # session-cleanup only drops temp artifacts; `close` is what releases the tab (20-tab cap).
         try:
             nd.request("close", req.session)

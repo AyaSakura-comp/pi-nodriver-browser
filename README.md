@@ -555,8 +555,14 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 * **Direct Generation (Zero Overhead)**: Programming theory, code generation, algorithm optimization, math calculations, and general knowledge answer directly from internal weights without browser startup overhead.
 * *Evaluated across a 20-scenario benchmark with 100.0% routing accuracy (20/20).*
 
-### 7. Search-Only URL Provenance Guard & Open Loop Guard
-Every HTTP(S) `open` must use an exact URL returned earlier in the same session by a successful `google_search` or `web_search` result. User-supplied, remembered, page-derived, modified, and guessed URLs are not valid provenance. The extension records search-result URLs and blocks every other HTTP(S) open with `URL_PROVENANCE_GUARD`; local non-HTTP fixture URLs remain available for development. Browser-native search uses `google-search {"searches":[{"direction":"official","query":"search terms"}]}`.
+### 7. Search & Candidate Link URL Provenance Guard & Open Loop Guard
+Every HTTP(S) `open` must use an authorized URL with verified provenance:
+- **Search Engine Query Allowlist**: Standard search engine queries (e.g. `https://www.google.com/search?q=...`, Bing, DuckDuckGo, Yahoo) are pre-authorized directly, allowing the agent to initiate or refine web searches without provenance deadlocks.
+- **Search Results & Research**: URLs returned earlier in the same session by `google_search`, `web_search`, `research`, or browser `google-search`.
+- **Page Candidate Links**: In `browser_intent`, candidate links extracted from the active page DOM are listed (`[1]..[N]`) and authorized for subsequent `open` actions via exact URL or `action: "open", pick: <number>`.
+- **User-Supplied URLs**: Exact URLs provided verbatim in user messages.
+
+User-guessed, inferred, or invented deep URLs outside these authorized sources are blocked with `URL_PROVENANCE_GUARD`; local non-HTTP fixture URLs remain available for development. Browser-native search uses `google-search {"searches":[{"direction":"official","query":"search terms"}]}` or direct search query `open`.
 
 To prevent a runaway agent from repeatedly opening the same site, each session may attempt at most **2 consecutive `open` actions to the same origin**. The 3rd same-origin `open` returns `OPEN_LOOP_GUARD` without launching a tab. A valid non-`open` browser action or a different-origin `open` resets the streak, while unsupported commands do not; for multiple same-site URLs, prefer one batched `crawl` call.
 

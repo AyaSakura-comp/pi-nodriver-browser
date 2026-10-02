@@ -50,6 +50,7 @@ const SEARCH_FIRST_URL_RULE = `MANDATORY URL PROVENANCE RULE:
 - If no exact URL was provided by the user, you MUST search first (via research, google_search, or browser google-search). Never guess, infer, synthesize, or construct a URL from memory.
 - Copy one exact URL from search results without changing its domain, path, query, casing, or percent-encoding. If a requested deep link is not indexed and was not provided by the user, open the closest official parent URL returned by search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl. If search returns no usable parent URL, stop; never try a URL variant.
 - Browser's google-search command is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
+- In browser_intent, candidate links on the active page are listed as [1]..[N]. You may navigate to them using action: "open" with pick: <number> or by copying the exact candidate URL. Opening standard search engine queries (e.g. https://www.google.com/search?q=...) is also authorized.
 - image_search / image_search_batch (browser image-search / image-search-batch) uses an internally verified fixed provider entry, not an agent-supplied URL. Call it directly for authorized reverse-image searches; no preliminary URL search or manual navigation is needed.`;
 
 const DESCRIPTION = `Autonomous live browser automation (Android Chrome mobile viewport 390x844 by default; native Linux identity uses mobile-disabled desktop-fit scaling inside the same 390x844 frame). Strong CAPTCHA, challenge, access-denied, 429, or unexpected login-gate signals pin only the affected origin to fresh-target Linux while other origins remain Android.
@@ -430,10 +431,25 @@ function browserOpenHttpUrl(command: unknown): string | undefined {
 }
 
 function isSearchResultEvent(event: { toolName?: string; input?: unknown }): boolean {
-  if (event.toolName === "google_search" || event.toolName === "web_search") return true;
+  if (event.toolName === "google_search" || event.toolName === "web_search" || event.toolName === "research" || event.toolName === "browser_intent") return true;
   if (event.toolName !== "browser") return false;
   const command = (event.input as { command?: unknown } | undefined)?.command;
-  return typeof command === "string" && /^\s*google-search(?:\s|$)/iu.test(command);
+  return typeof command === "string" && /^\s*(?:google-search|open|get text|snapshot)(?:\s|$)/iu.test(command);
+}
+
+function isSearchEngineUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.toLowerCase();
+    if (/(?:^|\.)google\.[a-z.]+/i.test(host) && (pathname === "/" || pathname === "/search")) return true;
+    if (/(?:^|\.)bing\.com$/i.test(host) && (pathname === "/" || pathname === "/search")) return true;
+    if (/(?:^|\.)duckduckgo\.com$/i.test(host)) return true;
+    if (/(?:^|\.)search\.yahoo\.com$/i.test(host)) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -490,7 +506,7 @@ export default function (pi: ExtensionAPI) {
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
-    const input = event.input as {command?: unknown; url?: string; action?: string; goal?: string; steps?: {url?: string}[]};
+    const input = event.input as {command?: unknown; url?: string; action?: string; goal?: string; steps?: {url?: string}[]; pick?: number};
     const targets = event.toolName === "browser"
       ? [browserOpenHttpUrl(input?.command)].filter(Boolean) as string[]
       : [input?.url, ...(input?.steps || []).map(s => s.url),
@@ -505,16 +521,23 @@ export default function (pi: ExtensionAPI) {
             for (const url of extractSearchResultUrls((entry as any).message.content)) {
               allowed.add(url);
             }
+          } else if (entry?.type === "tool_result" || (entry?.type === "message" && ((entry as any)?.message?.role === "toolResult" || (entry as any)?.message?.role === "tool"))) {
+            for (const url of extractSearchResultUrls(
+              (entry as any)?.message?.content ?? (entry as any)?.content,
+              (entry as any)?.message?.details ?? (entry as any)?.details
+            )) {
+              allowed.add(url);
+            }
           }
         }
         searchedUrls.set(sessionId(ctx), allowed);
       } catch {}
     }
-    const target = targets.find(url => !allowed.has(url));
+    const target = targets.find(url => !isSearchEngineUrl(url) && !allowed.has(url));
     if (!target) return;
     return {
       block: true,
-      reason: `URL_PROVENANCE_GUARD: ${target} was not supplied verbatim by the user nor returned by a successful google_search or web_search result. If the user provided a link, open that link directly. If searching, copy the exact search result URL. If the exact deep link is not indexed and was not provided by the user, open the closest official parent URL from search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl.`,
+      reason: `URL_PROVENANCE_GUARD: ${target} was not supplied verbatim by the user, found on the current page, nor returned by a search result. If navigating the current page, use action: "open" with pick: <number> (or copy an exact link from the page candidates list). If searching, open a Google search query (e.g. open https://www.google.com/search?q=...) or use research. Never guess deep URLs.`,
     };
   });
 

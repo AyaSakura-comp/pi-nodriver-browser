@@ -147,6 +147,50 @@ if (!blocked?.block || !blocked.reason.includes('URL_PROVENANCE_GUARD')) {
 }
 ''', suffix='.mts')
 
+    def test_search_engine_and_candidate_link_authorization(self):
+        text = (ROOT / 'index.ts').read_text()
+        start = text.index('function extractSearchResultUrls')
+        source = text[start:].replace('export default function', 'function register', 1)
+        self.run_node(r'''
+const readBrowserConfig = () => ({browserMode:"intent"});
+const Type = new Proxy({}, { get: () => (...args) => args[0] });
+const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
+const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
+const truncateHead = text => ({content:text, truncated:false});
+class NodriverWorker { async request() { return {text:'ok'}; } async cleanupSession() {} disconnect() {} }
+const registerIntent = () => {};
+''' + source + r'''
+const handlers = new Map();
+register({on(name, handler){handlers.set(name, handler);}, registerTool(){}});
+const ctx = {sessionManager:{getSessionId:()=> 'session-intent'}};
+await handlers.get('session_start')({}, ctx);
+
+// 1. Search engine URL is authorized directly
+let searchEngineDecision = await handlers.get('tool_call')({
+  toolName: 'browser_intent', toolCallId: '1', input: { action: 'open', url: 'https://www.google.com/search?q=%E9%BC%8E%E6%B3%B0%E8%B1%94+101' }
+}, ctx);
+if (searchEngineDecision?.block) throw new Error('google search URL was blocked: ' + searchEngineDecision.reason);
+
+// 2. Open with pick only (no url) is not blocked
+let pickDecision = await handlers.get('tool_call')({
+  toolName: 'browser_intent', toolCallId: '2', input: { action: 'open', pick: 1 }
+}, ctx);
+if (pickDecision?.block) throw new Error('open with pick was blocked');
+
+// 3. Candidate links from browser_intent tool_result authorize subsequent open
+await handlers.get('tool_result')({
+  toolName: 'browser_intent', toolCallId: '2', input: { action: 'open', pick: 1 }, isError: false,
+  content: [{ type: 'text', text: 'Opened page' }],
+  details: { url: 'https://dintaifung.example/home', links: [{ title: 'Queue', url: 'https://dintaifung.example/queue' }] }
+}, ctx);
+
+let linkDecision = await handlers.get('tool_call')({
+  toolName: 'browser_intent', toolCallId: '3', input: { action: 'open', url: 'https://dintaifung.example/queue' }
+}, ctx);
+if (linkDecision?.block) throw new Error('candidate link from page was blocked');
+''', suffix='.mts')
+
+
 
 if __name__ == '__main__':
     unittest.main()

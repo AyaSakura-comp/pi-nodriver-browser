@@ -43,6 +43,13 @@ For the existing user systemd unit, set WorkingDirectory to the installed
 interpreter and model environment. Restart only laya-intent through the service
 restart procedure. No Chrome/Qwen/streaming restart is required for this migration.
 
+## Candidate link picking & search engine navigation
+
+In `browser_intent`, when a page is opened or read, snapshot extraction collects visible `<a>` candidate links and presents them numbered (`[1]..[N]`) under `🔗 [頁面候選跳轉連結]`:
+- **Navigation via `pick`**: Models can navigate directly using `action: "open", pick: <number>` without having to copy or reconstruct URLs.
+- **Dynamic Provenance Authorization**: Candidate links returned in tool output details are automatically registered into the session history and authorized for subsequent exact URL `open` actions.
+- **Search Queries**: Direct search engine queries (e.g. `https://www.google.com/search?q=...`) are pre-authorized by `URL_PROVENANCE_GUARD`, allowing autonomous search workflows.
+
 ## Verification
 
 Both modes were exercised with Pi + local Qwen: open exact user-provided
@@ -51,5 +58,6 @@ Direct mode used only browser; intent used only browser_intent. Direct mode's
 first obsolete `click @e1` was rejected and Qwen recovered with `activate @e1`.
 Logs: `/tmp/merged-browser-{direct,intent}-e2e.jsonl` (local, not versioned).
 Unit tests cover exact user/search URLs, rejected assistant URLs, slash changes,
-failed searches, config validation and staging. This is a runtime integration,
+failed searches, config validation, staging, search engine query allowlist, and
+candidate link `pick` navigation. This is a runtime integration,
 not a merge of unrelated Research Controller work or a Git-history rewrite.

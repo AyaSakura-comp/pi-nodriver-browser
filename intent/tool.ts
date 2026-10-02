@@ -56,6 +56,8 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
       "If the result is TASK_STOPPED/TASK_FAILED/TASK_UNVERIFIED, restate the goal more precisely in one more task call or report what was found; do not loop.",
     ] : [
       "Prefer ONE task call {url, goal} using an exact user-supplied URL or exact search-result URL. If an exact deep link is absent and not provided by the user, use the closest official parent URL returned by search and navigate through visible links; never reuse or construct the deep URL.",
+      "When a page is opened or read, examine the '頁面候選跳轉連結' list in the output. To follow a link from the current page, use action: 'open' with pick: <number> (e.g. pick: 1) or copy the exact candidate URL. Never guess, infer, or construct deep URLs yourself.",
+      "To search within the browser, open a Google search URL directly: action: 'open', url: 'https://www.google.com/search?q=<query>'.",
       "When the user asks for a screenshot or to see the current webpage (例如要求傳截圖、截圖給我看、看畫面、看網頁截圖或 send screenshot), use action: 'screenshot'. It captures the current browser view immediately without re-opening or navigation.",
       "Use browser_intent for interactive web tasks. Describe targets by visible wording and constraints; never invent refs, selectors or coordinates.",
       "After CLICKED, trust the returned url/title/screenshot as the new page state and decide the next intent from it.",
@@ -71,13 +73,13 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         value: Type.Optional(Type.String()),
         submit: Type.Optional(Type.Boolean()),
       }), { maxItems: 8, description: "plan: ordered steps" })),
-      url: Type.Optional(Type.String({ description: "open: exact URL" })),
+      url: Type.Optional(Type.String({ description: "open: exact URL (from user, search, page candidates, or a search engine query)" })),
       target: Type.Optional(Type.String({ description: "click/fill/scroll: description of one element; read: what to look for" })),
       value: Type.Optional(Type.String({ description: "fill: text to enter; scroll: direction or offset (e.g. top, bottom, down 600)" })),
       submit: Type.Optional(Type.Boolean({ description: "fill: press Enter after typing" })),
       goal: Type.Optional(Type.String({ description: "task: the full goal with all constraints; otherwise overall task for disambiguation" })),
       max_steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 12, description: "task: step limit (default 8)" })),
-      pick: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, description: "Option number after AMBIGUOUS" })),
+      pick: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Option number after AMBIGUOUS, or candidate link index to navigate to with action: 'open'" })),
       confirm: Type.Optional(Type.Boolean({ description: "Only for user-requested irreversible actions" })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -350,6 +352,15 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         humanSummary = `⚠️ **[目標有多個可能選項]** "${params.target}"\n${opts}\n- 請指定 pick=<編號> 或更具體的特徵描述。`;
       } else if (data.status === "READ") {
         humanSummary = `📖 **[已讀取頁面內容]**\n${data.text || ""}`;
+      }
+
+      if (Array.isArray(data.links) && data.links.length > 0) {
+        const linkLines = data.links.slice(0, 10).map((l: any, idx: number) => {
+          const t = l.title ? `「${l.title}」 ` : "";
+          return `  [${idx + 1}] ${t}${l.url}`;
+        });
+        const linksBlock = `\n\n🔗 **[頁面候選跳轉連結 (可直接 open 搭配 pick:編號 或複製 exact url)]**:\n${linkLines.join("\n")}`;
+        humanSummary += linksBlock;
       }
 
       const text = humanSummary ? `${humanSummary}\n\n\`\`\`json\n${JSON.stringify(rest, null, 2)}\n\`\`\`` : JSON.stringify(rest, null, 1);
