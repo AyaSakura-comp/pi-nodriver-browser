@@ -21,7 +21,8 @@ GPU prefill (Pi core API)       warm … warm … warm … → final request reu
   agent resolves 今天/明天/這禮拜 itself; no `gettime` call is needed before research.
 - `research` is the default web lookup (`promptSnippet`/`promptGuidelines`);
   `google_search` is for explicit Google requests only.
-- The evidence ends with `End of evidence …` telling the agent to answer now.
+- The evidence ends with `End of evidence …`: the evidence is enough, answer now,
+  and finish by asking the user whether to search for more (naming what is missing).
   Status, stop reason, unread sources and the artifact path stay in the tool
   `details`; printing them in the text sent agents off to crawl again.
 - `RESEARCH_DONE_GUARD` (`tool_call` hook): after a successful research in the
@@ -59,6 +60,18 @@ snippet only locates its passage in the crawled page. Committed text is
 append-only, so every prefix already sent to the GPU stays valid.
 `RESEARCH_EVIDENCE_BUDGET` (default 6000) caps the committed evidence.
 
+## Images
+
+`research/images.py` `ResearchImages`: each crawled page offers its image
+candidates (already extracted by the crawler). Up to 2 per page (main/content
+images; no logos, icons, SVGs, thumbnails or images under 200 px), ranked by role
+and alt/caption overlap with the question, are downloaded in the background with
+the same validation and limits as `fetch_image`, at most `2 × RESEARCH_IMAGES` per
+job. After crawling, in-flight downloads get `RESEARCH_IMAGE_WAIT` seconds; up to
+`RESEARCH_IMAGES` finished ones (pages with delivered passages first) are appended
+as `## Images` with `[[image: …]]` markers, which piweb/piscord render. The agent is
+told to embed them in the paragraphs they illustrate and never fetch images itself.
+
 ## Prefill
 
 Prefill is owned by the Pi harness (`ctx.prefill`, pi-coding-agent `feat/prefill-api`,
@@ -77,8 +90,10 @@ Verified live: with parallel `gettime` + `research` the final request prefills
 | `RESEARCH_CRAWL_CONCURRENCY` | 32 | parallel crawl tabs per job |
 | `RESEARCH_CRAWL_WORD_BUDGET` | 20000 | stop dispatching crawls after this many words |
 | `RESEARCH_CRAWL_TIMEOUT` | 3 | per-page load timeout (s) |
-| `RESEARCH_CRAWL_TOP_PER_QUERY` | 0 (off) | crawl only each query's top-N results |
+| `RESEARCH_CRAWL_TOP_PER_QUERY` | 5 | crawl only each query's top-N results (0 = off) |
 | `RESEARCH_EVIDENCE_BUDGET` | 6000 | committed evidence budget |
+| `RESEARCH_IMAGES` | 3 | background-fetched images listed for the answer (0 = off) |
+| `RESEARCH_IMAGE_WAIT` | 1.0 | seconds to wait for in-flight image downloads |
 | `RESEARCH_SNIPPET_MODE` | `anchor` | `anchor` or `commit` for top-12 snippets |
 | `RESEARCH_SEARCH_CRAWL_PIPELINE` | 1 | crawl as each search returns |
 | `RESEARCH_PARTIAL_ON_TIMEOUT` | unset | capture partially loaded pages on timeout (hurt quality) |
@@ -114,6 +129,27 @@ is cached, but every evidence token is prefilled at that depth, so prefill falls
 from ~1,700 to ~1,050 tok/s and ~3 s of prefill remain after the tool ends
 (first answer token 7.70 → 10.83 s median). A smaller system prompt or less
 evidence shortens this directly.
+
+Background images (resident Pi, full config, thinking minimal 64, cap 5 per query;
+"southern events", "new Mac mini", "Taipei 101 fireworks"):
+
+| | events | Mac mini | 101 fireworks |
+|---|---|---|---|
+| images fetched (ok) | 6 (6) | 6 (6) | 6 (4) |
+| slowest download | 1.21 s | 0.80 s | 1.35 s |
+| crawl window | 3.53 s | 4.04 s | 3.85 s |
+| final prefill | 389 tok | 86 tok | 532 tok |
+| first answer character | 12.2 s | 14.7 s | 11.5 s |
+| images embedded in answer | 2 | 1 | 1 |
+
+Every download finished inside the crawl window, so `RESEARCH_IMAGE_WAIT` was never
+used and the tool ended with the crawl. The cost is the image list itself: it is
+appended after crawling (which images exist is only known then), adding ~300–450
+tokens (~0.3 s) to the final prefill; long download paths are most of it. Embedding
+went from 1/3 answers (first version, duplicate image) to 3/3 after content-hash
+de-duplication and an explicit closing instruction. Agents that retry blocked
+lookups (seen with minimal thinking at both 256 and 64) are told to stop calling
+tools from the second block on.
 
 ## Fixed along the way
 

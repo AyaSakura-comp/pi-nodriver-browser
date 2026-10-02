@@ -453,11 +453,13 @@ export default function (pi: ExtensionAPI) {
   // prompt rule), so follow-up lookups are blocked until the next user message
   // unless that message asks for them (a URL, Google, crawling, images, more search).
   const researchDone = new Map<string, boolean>();
+  const researchBlocks = new Map<string, number>();
   const lastInput = new Map<string, string>();
-  const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research"]);
-  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多/i;
+  const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
+  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|browser|瀏覽|打開|開啟|網站|網頁|點/i;
   pi.on("input", (event, ctx) => {
     researchDone.set(sessionId(ctx), false);
+    researchBlocks.set(sessionId(ctx), 0);
     lastInput.set(sessionId(ctx), typeof event.text === "string" ? event.text : "");
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.text)) allowed.add(url);
@@ -475,9 +477,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event, ctx) => {
     if (FOLLOW_UP_LOOKUPS.has(event.toolName) && researchDone.get(sessionId(ctx))
         && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")) {
+      const blocks = (researchBlocks.get(sessionId(ctx)) ?? 0) + 1;
+      researchBlocks.set(sessionId(ctx), blocks);
+      // Agents that keep retrying blocked lookups lose ~3.5 s per round; escalate.
+      if (blocks > 1) return {
+        block: true,
+        reason: `RESEARCH_DONE_GUARD (blocked ${blocks} times): STOP calling tools. Your next message must be the final answer, written only from the research evidence you already have, ending with a question asking the user whether to search for more.`,
+      };
       return {
         block: true,
-        reason: "RESEARCH_DONE_GUARD: research already returned the complete evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover. crawl, google_search, fetch_image(s) and another research call are only allowed when the user explicitly asks for them.",
+        reason: "RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want you to search for more. crawl, google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.",
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
@@ -640,6 +649,8 @@ export default function (pi: ExtensionAPI) {
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
       "Do not call gettime before research: the system prompt's Today line is the current local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates in the queries.",
       "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
+      "Always end an answer based on research with one short question asking the user whether to search for more, naming what is still missing if anything.",
+      "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the paragraphs they illustrate; never fetch images yourself.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its

@@ -26,6 +26,7 @@ from .workflow import LayaWorkflow
 from .ranking import PageRanker
 from . import focus
 from .delivery import deliver
+from .images import ResearchImages
 from .providers import FourgetProvider
 
 SEARCH_CLEANUP_TIMEOUT = 2.0
@@ -109,8 +110,13 @@ RESEARCH_FETCH_TIMEOUT = min(30.0, max(1.0, float(os.environ.get('RESEARCH_CRAWL
 # serialized the first crawls behind it. A job probes once in the background at
 # start; a dead browser still surfaces as a failed page.
 BROWSER_PROBE_MAX_AGE = 30.0
-# Crawl only each query's top-N search results (0 = no per-query cap).
-RESEARCH_CRAWL_TOP_PER_QUERY = max(0, int(os.environ.get('RESEARCH_CRAWL_TOP_PER_QUERY', '0') or 0))
+# Crawl only each query's top-N search results (0 = no per-query cap). Default 5:
+# pages beyond a query's top 5 were mostly ones that missed the crawl timeout.
+RESEARCH_CRAWL_TOP_PER_QUERY = max(0, int(os.environ.get('RESEARCH_CRAWL_TOP_PER_QUERY', '5') or 0))
+# Images fetched in the background while pages are crawled and listed for the
+# answer (0 = off), and how long finished crawling waits for in-flight downloads.
+RESEARCH_IMAGES = max(0, int(os.environ.get('RESEARCH_IMAGES', '3') or 0))
+RESEARCH_IMAGE_WAIT = max(0.0, float(os.environ.get('RESEARCH_IMAGE_WAIT', '1.0') or 0))
 
 
 def local_date_line(clock):
@@ -298,6 +304,13 @@ class ResearchConnection:
         from .passages import ProgressivePassages
         from .delivery import deliver_progressive
         progressive = ProgressivePassages(params['question'],budget=RESEARCH_EVIDENCE_BUDGET,snippets=RESEARCH_SNIPPET_MODE) if evidence_mode == 'progressive' else None
+        images=None
+        if progressive is not None and RESEARCH_IMAGES and hasattr(self.engine,'run_fetch_image'):
+            async def fetch_image(url):
+                async with self.engine.image_fetch_semaphore:
+                    path,mime,width,height,_=await self.engine.run_fetch_image(url,session_id or owner)
+                return dict(path=str(path),mime=mime,width=width,height=height)
+            images=ResearchImages(params['question'],fetch_image,max_deliver=RESEARCH_IMAGES,max_fetch=2*RESEARCH_IMAGES)
         progress_queue = asyncio.Queue(maxsize=1) if progressive is not None else None
         progress_task = None
         def on_page(source, text):
@@ -388,6 +401,8 @@ class ResearchConnection:
             if mode not in ('full','temp-wiki'): mode='full'
             truncated=mode=='temp-wiki' or result.get('truncated',False)
             text=result.get('text','')
+            if images is not None and result.get('ok'):
+                images.offer(request.source_id,request.title,result.get('imageCandidates') or [])
             return CrawlResult(text,truncated=truncated,
                 success=bool(result.get('ok')) and not truncated,content_mode=mode,source_chars=result.get('sourceChars'),
                 captured_chars=result.get('capturedChars',len(text)),capture_limit=result.get('captureLimit'),
@@ -447,13 +462,23 @@ class ResearchConnection:
                 # short status lines follow the prefix. Search snippets for
                 # unread sources are already in its "Search results" section.
                 packet=local_date_line(clock)+'\n'+progressive.finalize()
+                image_section=''
+                if images is not None:
+                    await images.settle(RESEARCH_IMAGE_WAIT)
+                    image_section=images.section(progressive.delivered_sources)
+                    packet+=image_section
                 # A list of unread sources, the stop reason or the capture path reads
                 # as "evidence incomplete" and sent agents off to crawl/fetch more;
                 # those stay in the tool details. The text closes the lookup instead.
-                packet+=('\nEnd of evidence. This is the complete research result: answer now from the '
-                         'passages and search results above, cite their URLs, and say plainly what they do '
-                         'not cover. Do not call crawl, google_search, fetch_image(s) or research again '
-                         'unless the user asks for it.\n')
+                packet+=('\nEnd of evidence. This is enough to answer: answer now from the passages and '
+                         'search results above, cite their URLs, and say plainly what they do not cover. Do '
+                         'not search, crawl, browse or fetch images on your own. Finish your answer by asking '
+                         'the user, in their language, whether they want you to search for more (name what '
+                         'is missing, if anything).\n')
+                if image_section:
+                    packet+=('This evidence includes downloaded images: put the one or two most relevant '
+                             '[[image: …]] markers from the Images list, copied exactly, on their own lines '
+                             'inside the paragraphs they illustrate.\n')
                 response=deliver_progressive(result.snapshot,packet,max_bytes=2*1024*1024,max_lines=20000)
             elif self.ranked and evidence_mode=='passages':
                 response=deliver(result.snapshot,max_bytes=2*1024*1024,max_lines=20000,
@@ -475,6 +500,7 @@ class ResearchConnection:
                         crawlConcurrency=crawl_concurrency,searchRounds=search_rounds,evidence=evidence_mode,action='research')
         finally:
             accepting[0]=False
+            if images is not None: images.cancel()
             if progress_task is not None:
                 progress_task.cancel()
                 await asyncio.gather(progress_task,return_exceptions=True)

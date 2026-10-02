@@ -161,6 +161,38 @@ class ResearchJobTests(unittest.IsolatedAsyncioTestCase):
                                            'https://example.com/b/0','https://example.com/b/1'])
         self.assertTrue(result['fullEvidenceDelivered'])
 
+    async def test_progressive_research_lists_images_fetched_while_crawling(self):
+        from research.jobs import ResearchConnection
+        class Provider:
+            async def search(self, task):
+                return [SearchResult('1', 'https://example.com/1', '黑琵季 台南')]
+            async def close(self): pass
+        async def extract(url, *args, **kwargs):
+            return dict(ok=True, text='台南 黑琵季 10/3 起在新光三越舉行', contentMode='full',
+                        imageCandidates=[dict(url='https://cdn.example/poster.jpg', role='representative',
+                                              width=900, height=1200, alt='黑琵季海報', caption='', score=90),
+                                         dict(url='https://cdn.example/logo.png', role='content',
+                                              width=900, height=900, alt='', caption='', score=10)])
+        fetched = []
+        poster = Path(tempfile.mkdtemp()) / 'poster.jpg'
+        poster.write_bytes(b'jpeg')
+        async def run_fetch_image(url, session_id):
+            fetched.append((url, session_id))
+            return (poster, 'image/jpeg', 900, 1200, url)
+        engine = SimpleNamespace(ensure_browser=AsyncMock(), crawl_one=extract, run_fetch_image=run_fetch_image,
+                                 image_fetch_semaphore=asyncio.Semaphore(2),
+                                 cleanup_research_owner=AsyncMock(), research_cleanup_tasks=set())
+        with tempfile.TemporaryDirectory() as root:
+            conn = ResearchConnection(engine, AsyncMock(), Path(root), fourget_factory=Provider)
+            result = await asyncio.wait_for(conn.run(7, 'pi-session', dict(jobId='job', question='台南 黑琵季',
+                provider='4get', searchBudget=1, searchConcurrency=1, layaConcurrency=1, queries=['黑琵季 台南'],
+                evidence='progressive', clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'})), 4)
+        self.assertEqual(fetched, [('https://cdn.example/poster.jpg', 'pi-session')], 'stored under the Pi session')
+        self.assertIn('## Images (already downloaded; do not fetch)', result['text'])
+        self.assertIn(f'[[image: {poster}]]', result['text'])
+        self.assertIn('This evidence includes downloaded images', result['text'])
+        self.assertLess(result['text'].index('## Images'), result['text'].index('End of evidence'))
+
     async def test_agent_written_queries_skip_the_planner_call(self):
         from research.jobs import ResearchConnection
         searched = []

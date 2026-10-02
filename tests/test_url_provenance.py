@@ -179,11 +179,13 @@ const research = isError => handlers.get('tool_result')({toolName:'research', to
 await handlers.get('input')({text:'這禮拜南部有什麼活動'}, ctx);
 if ((await call('crawl'))?.block) throw new Error('crawl blocked before research');
 await research(false);
-for (const name of ['crawl','google_search','fetch_images','fetch_image','research']) {
+for (const name of ['crawl','google_search','fetch_images','fetch_image','research','browser','browser_intent']) {
   const r = await call(name);
   if (!r?.block || !r.reason.includes('RESEARCH_DONE_GUARD')) throw new Error(name + ' not blocked after research');
 }
 if ((await call('gettime'))?.block) throw new Error('unrelated tool blocked');
+const again = await call('crawl');
+if (!again?.block || !again.reason.includes('STOP calling tools')) throw new Error('repeated blocks must escalate');
 
 await handlers.get('input')({text:'謝謝，那高雄呢'}, ctx);
 if ((await call('research'))?.block) throw new Error('next user message did not reset the guard');

@@ -205,12 +205,19 @@ Every stage overlaps the next:
   returns (first crawl ≤10 ms after the first result).
 - **Crawl → prefill** — evidence is committed while pages arrive and Pi's
   `ctx.prefill` warms the model with it, so the final request only processes the tail.
+- **Images** — while pages are crawled, their main images are downloaded in the
+  background (they finish inside the crawl window); up to 3 are listed as
+  `[[image: …]]` markers and the answer embeds them in the paragraphs they illustrate.
 
-Guards: `RESEARCH_DONE_GUARD` blocks follow-up `crawl`/`google_search`/`fetch_image(s)`/
-`research` in the same user message unless the user asks for more; URL provenance
-rules are unchanged. Tunables: `RESEARCH_CRAWL_CONCURRENCY` (32),
-`RESEARCH_CRAWL_TOP_PER_QUERY` (0 = off; 5 keeps answer quality and cuts ~20 % of
-evidence), `RESEARCH_EVIDENCE_BUDGET` (6000), `RESEARCH_CRAWL_TIMEOUT` (3 s).
+The evidence closes by telling the agent it is enough, and the answer ends by
+asking the user whether to search for more. Guards: `RESEARCH_DONE_GUARD` blocks
+follow-up `crawl`/`google_search`/`fetch_image(s)`/`browser`/`browser_intent`/
+`research` in the same user message unless the user asks for more, and tells a
+retrying agent to stop calling tools; URL provenance rules are unchanged.
+
+Tunables (all in the [Configuration Reference](#-configuration-reference)): `RESEARCH_CRAWL_CONCURRENCY` (32),
+`RESEARCH_CRAWL_TOP_PER_QUERY` (5; 0 = off — each query's top 5 keep answer quality
+and cut ~30 % of evidence), `RESEARCH_EVIDENCE_BUDGET` (6000), `RESEARCH_CRAWL_TIMEOUT` (3 s), `RESEARCH_IMAGES` (3; 0 = off).
 
 Design, settings and measurements: [research-streaming-pipeline.md](docs/research-streaming-pipeline.md).
 Earlier designs (planner / Laya ranking / extension-side prefill) are kept for
@@ -863,43 +870,140 @@ Remaining fail-closed hardening work is tracked in [`docs/plans/2026-09-11-visio
 
 ### Environment Variables & Display Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `PI_NODRIVER_VISION_FALLBACK` | `omni` (default) | Visual fallback after CDP/DOM semantic actions. Use `omni` for `vision-mark omni` (recommended) or `manual` for screenshot/cursor-marker fallback. |
-| `PI_NODRIVER_VISION_ONLY` | `0` | Set `1` only for forced vision benchmarks; normal deployment keeps CDP/DOM available. |
-| `PI_NODRIVER_BENCHMARK_ACTION_POLICY` | (unset) | Optional fail-closed benchmark policy: `forced-omni`, `hybrid`, or `semantic-manual`. The bad-UI runner sets this only on its isolated per-trial daemon. |
-| `PI_NODRIVER_SCREEN` | `1366x768x24` | Xvfb virtual display resolution (fits Chrome UI + 1280x720 desktop viewport without clipping). |
-| `PI_NODRIVER_WINDOW_SIZE` | `1280,720` | Chrome startup `--window-size` in Xvfb (`--window-position=0,0`). |
-| `PI_NODRIVER_FRAME_WIDTH` | `1280` | Content viewport width in pixels (default desktop: `1280`, mobile override: `390`). |
-| `PI_NODRIVER_FRAME_HEIGHT` | `720` | Content viewport height in pixels (default desktop: `720`, mobile override: `844`). |
-| `PI_NODRIVER_AUTO_IDENTITY` | `linux` | Default browser identity mode (`linux` for native desktop Chrome, `android` for mobile emulation). |
-| `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Enabled by default (`1`). Uses X11 native hardware mouse click forwarding (via `xdotool` on Xvfb, `isTrusted: true`) and Xvfb full-screen capture for `screenshot` and `vision-mark` (1:1 coordinate alignment). Set `0` to force CDP fallback. |
-| `PI_NODRIVER_TOOLBAR_HEIGHT` | measured (fallback `76`) | Chrome top toolbar height. By default it is measured live (Xvfb screenshot aligned against a CDP viewport screenshot, cached 120 s per window size), because device-metrics emulation makes JS window metrics unusable; set it only to force a value. Used when converting viewport-origin coordinates to X11 screen coordinates. Xvfb-backed `vision-click` already has screenshot/screen coordinates and does not add it again. |
-| `PI_NODRIVER_OMNI_SCALE` | `0.8` | Target detector downscale for `vision-mark omni`. OmniParser runs only on the measured page-content crop (no tab strip, address bar or empty X-screen margins); its input size is `ceil(long side × scale / 32) × 32`, clamped to 800–1280 (desktop 1280×633 → 1024, mobile → 800). |
-| `PI_NODRIVER_OMNI_IMAGE_SIZE` | dynamic | Force the OmniParser input size instead of the dynamic value. |
-| `PI_NODRIVER_OMNI_LIMIT` | dynamic | Force the candidate cap; by default one per ~16k px² of page content, 30–80 (desktop ≈ 51, mobile 30). |
-| `PI_NODRIVER_OMNI_THRESHOLD` | service default | Override the detector confidence threshold per request. |
-| `PI_NODRIVER_OMNI_LABELS` | `1` | Attach the DOM element under each Omni box centre (tag, text, placeholder, aria-label; CDP hit test) so text models can choose boxes. Set `0` to skip. |
-| `PI_NODRIVER_CROSS_ORIGIN_FRAMES` | `1` | `snapshot -i` also lists controls inside visible cross-origin iframes (e.g. login overlays on another subdomain) via CDP isolated worlds; their refs carry `frame="host"` and `activate`/`fill`/`type`/`select`/`check` run inside that frame (click coordinates offset by the iframe position). Set `0` to disable. Out-of-process (cross-site) iframes are not covered yet. |
-| `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` | `1000` | Default duration for `long-press` and `vision-long-press` if omitted (e.g. `2s`, `1500ms`, `2.5`). |
-| `PI_NODRIVER_FORCE_LONG_PRESS_MS` | (unset) | Globally force ALL `long-press` actions to a specific duration (e.g. `2s`, `3000ms`, `1.5`), overriding any command-line parameters. |
-| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Enabled by default (`1`). Adds subtle $\pm 2$px mouse micro-drift to DOM and vision mouse long presses. |
-| `PI_NODRIVER_LONG_PRESS_JITTER_PX` | `2.0` | Maximum radius (in pixels) for human micro-jitter drift during long-press holding. |
-| `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | Set `1` to allow fetching private/local IP images in test fixtures. |
-| `PI_NODRIVER_CHROME` | (auto-detect) | Custom path to Chrome/Chromium executable. |
-| `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix domain socket path for daemon IPC. |
-| `PI_NODRIVER_PDF_MAX_BYTES` | `104857600` | Maximum authenticated source-PDF bytes. |
-| `PI_NODRIVER_PDF_TEXT_MAX_BYTES` | `33554432` | Maximum extracted plaintext bytes per PDF. |
-| `PI_NODRIVER_PDF_IMAGES_MAX_BYTES` | `134217728` | Maximum aggregate extracted-image bytes per PDF. |
-| `PI_NODRIVER_PDF_IMAGES_MAX_COUNT` | `100` | Maximum extracted image count per PDF. |
-| `PI_NODRIVER_PDF_MAX_CONCURRENCY` | `2` | Maximum concurrent Poppler extraction pipelines. |
-| `PI_NODRIVER_PDF_EXTRACTION_TIMEOUT` | `60` | Total extraction deadline, including semaphore queue time and both Poppler phases. |
-| `PI_NODRIVER_PDF_QUEUE_TIMEOUT` | `5` | Maximum wait for a Poppler extraction slot. |
-| `PI_NODRIVER_PDF_TEXT_TIMEOUT` | `40` | `pdftotext` phase timeout in seconds, clamped to the total extraction deadline. |
-| `PI_NODRIVER_PDF_IMAGES_TIMEOUT` | `15` | Best-effort `pdfimages` and image-validation phase timeout, clamped to the remaining total deadline. |
-| `PI_NODRIVER_PDF_INLINE_MAX_CHARS` | `12000` | Text above this size is indexed in a temporary wiki instead of returned inline. |
+All settings, with defaults, are listed in the [Configuration Reference](#-configuration-reference).
 
 ---
+
+## ⚙️ Configuration Reference
+
+Every setting this extension reads, what it does, and its default. Environment
+variables are read by the Pi process (TypeScript side) or by the browser worker
+it spawns (Python side, inherits the Pi environment), so set them where Pi is
+started: the shell, a systemd unit, or a gateway's `config.env`. "This host"
+lists the value used on the reference deployment when it differs from the default.
+
+### Configuration files
+
+| File | Key | Default | What it does |
+|---|---|---|---|
+| `~/.pi/agent/browser-config.json` (override path: `PI_BROWSER_CONFIG`, or `$PI_AGENT_DIR/browser-config.json`) | `browserMode` | `direct` | `direct` registers the low-level `browser` tool; `intent` registers `browser_intent` (natural-language actions through the integrated Laya intent router). This host: `intent`. |
+| `~/.pi/agent/settings.json` (Pi) | `prefill.enabled` / `providers` / `slots` | off | Enables Pi's speculative prefill (`ctx.prefill`): research evidence is prefilled into a llama.cpp slot while pages are still being crawled. Needs a Pi build with the prefill API. This host: `{ "enabled": true, "providers": ["local-llama"], "slots": [0] }`. |
+| `~/.pi/agent/settings.json` (Pi) | `thinkingBudgets` | Pi defaults | Thinking-token budget per level; `minimal` is the level used by the piweb Life channel. This host: minimal 256, low 1024, medium 2048, high 4096, xhigh 12000. |
+| `~/.pi/agent/AGENTS.md` (Pi) | section 1 | — | Makes `research` the default web lookup and reserves `google_search`/`crawl` for explicit requests. |
+
+### Research (`research` tool)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `RESEARCH_CRAWL_CONCURRENCY` | `32` | Pages crawled in parallel per research job (1–64). The 8/16/24/32 sweep found 32 fastest at the same success rate. |
+| `RESEARCH_CRAWL_TOP_PER_QUERY` | `5` | Crawl only the first N results of each search query, in search-engine order; `0` = no cap. Results beyond the top 5 were mostly pages that missed the crawl timeout, and capping cuts ~30 % of evidence tokens. |
+| `RESEARCH_IMAGES` | `3` | While pages are crawled, their main/content images (no logos, icons, thumbnails or images under 200 px) are downloaded in the background, at most 2 per page and 6 per job; up to this many finished downloads are listed in the evidence as `[[image: …]]` markers for the answer to embed in the paragraphs they illustrate. `0` = off. Files go to the Pi session's download directory (`PI_NODRIVER_DOWNLOAD_DIR`). |
+| `RESEARCH_IMAGE_WAIT` | `1.0` | Seconds the finished crawl waits for in-flight image downloads before delivering the evidence. |
+| `RESEARCH_CRAWL_WORD_BUDGET` | `20000` | Stop dispatching new crawls once this many words have been captured (1,000–100,000). |
+| `RESEARCH_CRAWL_TIMEOUT` | `3` | Per-page load deadline in seconds (1–30). |
+| `RESEARCH_EVIDENCE_BUDGET` | `6000` | Size budget of the evidence returned to the model (search snippets plus page passages). |
+| `RESEARCH_SNIPPET_MODE` | `anchor` | How the top-12 search snippets are used: `anchor` uses a snippet to locate its passage in the crawled page; `commit` adds the snippet text itself. |
+| `RESEARCH_SEARCH_CRAWL_PIPELINE` | `1` | `1` crawls a result as soon as its search returns; `0` waits for the whole search wave. |
+| `RESEARCH_PARTIAL_ON_TIMEOUT` | unset | `1` keeps whatever text a page had rendered when it timed out. Off: it lowered answer quality in tests. |
+| `RESEARCH_FOCUS_URL` | unset | Optional comma-separated endpoints of a sentence-filter service applied to crawled pages before evidence assembly. |
+| `RESEARCH_FOCUS_MAX_WINDOWS` | `1` | With the focus filter: how many ~6,000-character windows of a page it reads (`0` = whole page). |
+| `PI_NODRIVER_CRAWL_POOL_TABS` | `48` | Size of the dedicated crawl tab pool. Pool tabs are not part of the interactive tab LRU and are swept when a job starts. |
+
+Fixed endpoints (not configurable by environment): 4get at `http://127.0.0.1:8088/api/v1/web`,
+Laya decisions at `http://127.0.0.1:8000/v1/systemone`.
+
+### Browser worker and Chrome
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix socket between Pi and the browser worker (the intent router uses the same one). |
+| `PI_NODRIVER_PROFILE` | built-in profile dir | Chrome user-data directory (cookies and logins persist here). |
+| `PI_NODRIVER_CHROME` | auto-detect | Path to the Chrome/Chromium executable. |
+| `PI_NODRIVER_NO_SANDBOX` | unset | `1` starts Chrome with `--no-sandbox` (containers/root only). |
+| `PI_NODRIVER_DOWNLOAD_DIR` | worker default | Where downloads are saved. |
+| `PI_NODRIVER_MAX_TABS` | `20` | Interactive tab limit; least-recently-used tabs are closed beyond it. |
+| `PI_NODRIVER_COMMAND_TIMEOUT` | `75` | Per-command deadline in seconds. |
+| `PI_NODRIVER_OPEN_TIMEOUT` | `10` | Page-open deadline in seconds for interactive `open`. |
+| `PI_NODRIVER_PREFLIGHT_TIMEOUT` | `2` | Deadline for the pre-navigation reachability check. |
+| `PI_NODRIVER_AUTO_IDENTITY` | `linux` | Browser identity: `linux` desktop Chrome or `android` mobile emulation. |
+| `PI_NODRIVER_AUTO_SCREENSHOT` | `1` | Attach a screenshot to interactive action results. |
+
+### Display (Xvfb) and viewport
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_SCREEN` | `1366x768x24` (`500x1000x24` when frame width is 390) | Xvfb virtual screen. |
+| `PI_NODRIVER_WINDOW_SIZE` | `1280,720` | Chrome `--window-size`. |
+| `PI_NODRIVER_START_MAXIMIZED` | `1` for `500,1000`, else `0` | Start Chrome maximized. |
+| `PI_NODRIVER_FRAME_WIDTH` / `PI_NODRIVER_FRAME_HEIGHT` | `1280` / `720` | Content viewport (mobile: `390` / `844`). |
+| `PI_NODRIVER_DESKTOP_WIDTH` | built-in | Layout width used to fit desktop pages. |
+| `PI_NODRIVER_TOOLBAR_HEIGHT` | measured (fallback `76`) | Chrome toolbar height for viewport→screen coordinates; set only to force a value. |
+| `PI_NODRIVER_XVFB_FORWARD_CLICK` | `1` | Real X11 clicks and Xvfb screenshots (`isTrusted` events, 1:1 coordinates); `0` = CDP only. |
+| `PI_NODRIVER_SCREENSHOT_TIMEOUT` | `30` | Screenshot deadline in seconds. |
+
+### Vision fallback and OmniParser
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_VISION_FALLBACK` | `omni` (default) | Fallback after DOM actions fail: `omni` (`vision-mark omni`) or `manual` (screenshot and cursor marker). |
+| `PI_NODRIVER_VISION_ONLY` | `0` | `1` disables DOM actions (vision benchmarks only). |
+| `PI_NODRIVER_VISION_PREVIEW_TTL` | `30` | Seconds a vision-mark preview stays valid for follow-up clicks. |
+| `PI_NODRIVER_OMNIPARSER_URL` | `http://127.0.0.1:8012/parse` | OmniParser detector endpoint. |
+| `PI_NODRIVER_OMNIPARSER_TIMEOUT` | `30` | Detector request deadline in seconds. |
+| `PI_NODRIVER_OMNI_SCALE` | `0.8` | Detector downscale of the page-content crop (input clamped to 800–1280 px). |
+| `PI_NODRIVER_OMNI_IMAGE_SIZE` | dynamic | Force the detector input size. |
+| `PI_NODRIVER_OMNI_LIMIT` | dynamic (30–80) | Force the candidate box cap. |
+| `PI_NODRIVER_OMNI_THRESHOLD` | service default | Detector confidence threshold. |
+| `PI_NODRIVER_OMNI_LABELS` | `1` | Attach the DOM element under each box so text models can choose. |
+| `PI_NODRIVER_CROSS_ORIGIN_FRAMES` | `1` | List and operate controls inside visible cross-origin iframes. |
+
+### Pointer interaction
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_DEFAULT_LONG_PRESS_MS` (alias `…_DURATION`) | `1000` | Long-press duration when none is given. |
+| `PI_NODRIVER_FORCE_LONG_PRESS_MS` (alias `…_DURATION`) | unset | Force every long press to this duration. |
+| `PI_NODRIVER_LONG_PRESS_JITTER` | `1` | Human-like micro-drift during long presses. |
+| `PI_NODRIVER_LONG_PRESS_JITTER_PX` | `2.0` | Maximum drift radius in pixels. |
+
+### Images and PDFs
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_IMAGE_FETCH_TIMEOUT` | `15` | `fetch_image(s)` deadline in seconds. |
+| `PI_NODRIVER_IMAGE_MAX_BYTES` | `20971520` (20 MiB) | Maximum fetched image size. |
+| `PI_NODRIVER_IMAGE_MAX_WIDTH` / `_HEIGHT` | `8192` / `8192` | Maximum decoded image dimensions. |
+| `PI_NODRIVER_IMAGE_MAX_TOTAL_PIXELS` | `40000000` | Maximum decoded pixels. |
+| `PI_NODRIVER_IMAGE_MAX_FRAMES` | `100` | Maximum frames of an animated image. |
+| `PI_NODRIVER_ALLOW_PRIVATE_IMAGE_URLS` | `0` | `1` allows private/loopback image URLs (test fixtures). |
+| `PI_NODRIVER_PDF_MAX_BYTES` | `104857600` | Maximum source PDF size. |
+| `PI_NODRIVER_PDF_TEXT_MAX_BYTES` | `33554432` | Maximum extracted text per PDF. |
+| `PI_NODRIVER_PDF_IMAGES_MAX_BYTES` / `_MAX_COUNT` | `134217728` / `100` | Extracted-image limits per PDF. |
+| `PI_NODRIVER_PDF_MAX_CONCURRENCY` | `2` | Concurrent Poppler extractions. |
+| `PI_NODRIVER_PDF_EXTRACTION_TIMEOUT` | `60` | Total extraction deadline (s). |
+| `PI_NODRIVER_PDF_QUEUE_TIMEOUT` | `5` | Wait for an extraction slot (s). |
+| `PI_NODRIVER_PDF_TEXT_TIMEOUT` / `_IMAGES_TIMEOUT` | `40` / `15` | `pdftotext` / `pdfimages` phase deadlines (s). |
+| `PI_NODRIVER_PDF_INLINE_MAX_CHARS` | `12000` | Larger texts go to a searchable temporary wiki instead of inline. |
+
+### Browser Intent (`browser_intent`, `intent/`)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAYA_INTENT_URL` | `http://127.0.0.1:8011` | Intent router the tool calls. |
+| `LAYA_INTENT_MODE` | unset | `task` lets the agent only hand over goals and inspect, not issue single steps. |
+| `LAYA_INTENT_IMAGES` | `1` | `0` drops screenshots from tool results. |
+| `LAYA_URL` | `http://127.0.0.1:8000/v1/systemone` | Laya model server used by the router. |
+| `JUDGE_URL` / `JUDGE_MODEL` / `JUDGE_MAX_TOKENS` | router defaults / `96` | LLM judge that breaks ties between candidate elements. |
+| `INTENT_CLICK_MODE` | `dom` | How the router clicks the chosen element. |
+| `INTENT_VISION_DECIDER` | `laya` | Decider for the vision path. |
+| `INTENT_MEMORY` | `~/.cache/laya-browser-intent/memory.json` | Router memory of past groundings. |
+| `EMBED_THREADS` | `8` | CPU threads for the e5 embedder. This host: set in `laya-intent.service`. |
+
+### Benchmark-only
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PI_NODRIVER_BENCHMARK_ACTION_POLICY` | unset | Fail-closed action policy for benchmarks: `forced-omni`, `hybrid` or `semantic-manual`. |
 
 ## 🚀 Installation & Setup
 
