@@ -234,24 +234,30 @@ export class ResearchPlanner {
   private registry: ExtensionContext['modelRegistry'];
   private jobId: string;
   private clock: ReturnType<typeof hostClock>;
-  private options: Record<string, unknown>;
+  private options: Record<string, unknown> = {};
+  /** Why this model cannot plan, checked lazily: with agent-written queries the planner is never called. */
+  private unusable?: Error;
   private counts: PlannerDiagnostics = {modelCalls:0,formatRepairs:0,formatFailures:0};
   usage: Usage = {input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}};
 
   get diagnostics(): PlannerDiagnostics { return {...this.counts}; }
 
   constructor(ctx: Pick<ExtensionContext,'model'|'modelRegistry'>, jobId: string, clock: ReturnType<typeof hostClock>) {
-    if (!ctx.model || typeof ctx.modelRegistry.complete !== 'function') throw new Error('research_active_model_unavailable');
-    if (!Number.isSafeInteger(ctx.model.contextWindow) || ctx.model.contextWindow <= 8192 ||
-        !Number.isSafeInteger(ctx.model.maxTokens) || ctx.model.maxTokens < 1) throw new Error('research_model_limits_unsupported');
-    this.model = structuredClone(ctx.model);
-    const compat = this.model.compat;
-    if (compat && ('allowedFallbackModels' in compat || 'vercelGatewayRouting' in compat ||
-        ('openRouterRouting' in compat && compat.openRouterRouting?.allow_fallbacks !== false))) {
-      throw new Error('research_model_fallback_unsupported');
-    }
+    this.model = structuredClone(ctx.model) as Model<Api>;
     this.registry = ctx.modelRegistry; this.jobId = jobId; this.clock = structuredClone(clock);
-    this.options = thinkingOptions(this.model);
+    try {
+      if (!ctx.model || typeof ctx.modelRegistry?.complete !== 'function') throw new Error('research_active_model_unavailable');
+      if (!Number.isSafeInteger(ctx.model.contextWindow) || ctx.model.contextWindow <= 8192 ||
+          !Number.isSafeInteger(ctx.model.maxTokens) || ctx.model.maxTokens < 1) throw new Error('research_model_limits_unsupported');
+      const compat = this.model.compat;
+      if (compat && ('allowedFallbackModels' in compat || 'vercelGatewayRouting' in compat ||
+          ('openRouterRouting' in compat && compat.openRouterRouting?.allow_fallbacks !== false))) {
+        throw new Error('research_model_fallback_unsupported');
+      }
+      this.options = thinkingOptions(this.model);
+    } catch (error) {
+      this.unusable = error as Error;
+    }
   }
 
   private recordUsage(usage: Usage) {
@@ -266,6 +272,7 @@ export class ResearchPlanner {
   }
 
   async plan(view: View, providers: string[], signal?: AbortSignal): Promise<PlannerProposal> {
+    if (this.unusable) throw this.unusable;
     if (signal?.aborted) throw new Error('research_planner_cancelled');
     if (view.job_id !== this.jobId) throw new Error('research_planner_job_mismatch');
     // Bind to the ORIGINAL request snapshot, never whatever state exists after

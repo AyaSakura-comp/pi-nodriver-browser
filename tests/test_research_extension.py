@@ -44,7 +44,7 @@ assert.equal(worker.pending.size,0,'disconnect must settle and clear pending req
 assert.equal(await observed,'rejected');
 ''',suffix='.mts')
 
-    def test_progress_is_appended_to_pi_core_prefill_handle(self):
+    def test_committed_evidence_is_sent_as_cumulative_progress_updates(self):
         source=(ROOT/'index.ts').read_text()
         source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
         self.run_node('''
@@ -59,7 +59,7 @@ let prefixes=[];
 class NodriverWorker {
  async research(params,_sid,_planner,_signal,onEvidence) {
    (globalThis.researchCalls ??= []).push(params);
-   assert.equal(params.evidence,onEvidence ? 'progressive' : 'passages');
+   assert.equal(params.evidence,'progressive');
    if (!params.streaming) { assert.equal(params.question,'使用者的問題');assert.deepEqual(params.queries,['q1','q2']); }
    for (const p of prefixes) onEvidence?.(p);
    return {action:'research',jobId:'job',fullEvidenceDelivered:true,text:'stable prefix\\nfooter',authorizations:[],sources:[]};
@@ -72,19 +72,16 @@ class NodriverWorker {
 const tools=new Map(),handlers=new Map();
 register({on:(n,h)=>handlers.set(n,h),registerTool:t=>tools.set(t.name,t)});
 const log=[];
-const handle={append:t=>{log.push(['append',t]);return true;},end:()=>log.push(['end']),
-  cancel:r=>log.push(['cancel',r]),stats:()=>({state:'ended'})};
+const onUpdate=u=>log.push(u.content.map(c=>c.text).join(''));
 const ctx={getContextUsage:()=>({tokens:1000,contextWindow:200000}),sessionManager:{getSessionId:()=> 'owner',
   getBranch:()=>[{type:'message',message:{role:'user',content:[{type:'text',text:'使用者的問題'}]}}]},
-  prefill:{begin:id=>{log.push(['begin',id]);return handle;}}};
+  prefill:{begin:()=>{throw new Error('research must not drive the prefill API');}}};
 assert.equal(handlers.has('before_provider_request'),false,'the extension no longer talks to the model itself');
 prefixes=['stable','stable prefix','stable prefix'];
-const result=await tools.get('research').execute('call-1',{q1:'q1',q2:'q2'},undefined,undefined,ctx);
-assert.deepEqual(log,[['begin','call-1'],['append','stable'],['append',' prefix'],['end']]);
-assert.deepEqual(result.details.prefill,{state:'ended'});
-log.length=0; prefixes=['abc','xbc'];
-await tools.get('research').execute('call-2',{q1:'q1',q2:'q2'},undefined,undefined,ctx);
-assert.deepEqual(log,[['begin','call-2'],['append','abc'],['cancel','prefix_rewritten'],['end']]);
+const result=await tools.get('research').execute('call-1',{q1:'q1',q2:'q2'},undefined,onUpdate,ctx);
+assert.deepEqual(log,['','stable','stable prefix'],'status first (no text), then each longer committed prefix once');
+assert.ok(result.content[0].text.startsWith(log.at(-1)),'the result extends the last update');
+assert.equal(result.details.prefill,undefined);
 const upd=handlers.get('message_update');
 const part=(id,name)=>({content:[{type:'toolCall',id,name}]});
 const ev=(delta,name='research',id='tc-1',type='toolcall_delta')=>({assistantMessageEvent:{type,contentIndex:0,delta,partial:part(id,name)}});
@@ -101,9 +98,9 @@ upd(ev('','research','tc-1','toolcall_end'),ctx);
 assert.equal(globalThis.added.at(-1).done,true,'the end of the call closes the query stream');
 upd(ev('{"q1": "other"}','browser','tc-x'),ctx);
 assert.equal(globalThis.researchCalls.length,1,'other tools are ignored');
-const adopted=await tools.get('research').execute('tc-1',{q1:'台積電 收盤價 2026-09-30',q2:'TSMC close'},undefined,undefined,ctx);
+const adopted=await tools.get('research').execute('tc-1',{q1:'台積電 收盤價 2026-09-30',q2:'TSMC close'},undefined,onUpdate,ctx);
 assert.equal(globalThis.researchCalls.length,1,'execute adopts the running job instead of starting another');
-assert.deepEqual(log,[['begin','tc-1'],['append','stable prefix'],['end']],'evidence committed before adoption is replayed');
+assert.deepEqual(log,['','stable prefix'],'evidence committed before adoption is replayed as one update');
 assert.ok(adopted.content[0].text.startsWith('stable prefix'));
 // A started job whose call is never executed is cancelled at message end.
 upd(ev('{"q1": "orphan query", '),ctx);
@@ -114,7 +111,30 @@ assert.equal(globalThis.researchCalls.length,orphan+1,'the session is free again
 handlers.get('message_end')({message:{role:'assistant',stopReason:'stop',content:[]}});
 log.length=0;
 await tools.get('research').execute('call-3',{q1:'q1',q2:'q2'},undefined,undefined,{...ctx,prefill:undefined});
-assert.deepEqual(log,[]);
+assert.deepEqual(log,[],'no onUpdate callback: nothing is sent');
+await handlers.get('input')({text:'台積電收盤價'},ctx);
+await handlers.get('tool_result')({toolName:'research',isError:false,content:[{type:'text',text:'evidence'}],details:{}},ctx);
+const beforeBlocked=globalThis.researchCalls.length;
+upd(ev('{"q1": "blocked follow-up query", ','research','tc-9'),ctx);
+assert.equal(globalThis.researchCalls.length,beforeBlocked,'a call the guard will block starts no speculative job');
+await handlers.get('input')({text:'幫我再查更多'},ctx);
+upd(ev('{"q1": "requested follow-up query", ','research','tc-10'),ctx);
+assert.equal(globalThis.researchCalls.length,beforeBlocked+1,'an explicit request for more still starts one');
+handlers.get('message_end')({message:{role:'assistant',stopReason:'stop',content:[]}});
+''',suffix='.mts')
+
+    def test_stale_query_years_move_to_the_current_year_unless_the_user_asked_for_them(self):
+        source=(ROOT/'index.ts').read_text()
+        start=source.index('const PAST_INTENT'); end=source.index('export default function')
+        self.run_node(source[start:end]+r'''
+import assert from 'node:assert/strict';
+assert.equal(currentYearQuery('台南活動 2025年10月4日','明天台南還有什麼特別的活動',2026),'台南活動 2026年10月4日');
+assert.equal(currentYearQuery('Tainan events October 4 2025','明天台南有什麼活動',2026),'Tainan events October 4 2026');
+assert.equal(currentYearQuery('台南 2025 煙火','2025年台南煙火有幾場',2026),'台南 2025 煙火','the user named the year');
+assert.equal(currentYearQuery('台南 2025 煙火','去年台南煙火有幾場',2026),'台南 2025 煙火','the user asked about the past');
+assert.equal(currentYearQuery('颱風 2015 統計','颱風統計',2026),'颱風 2015 統計','older than five years is left alone');
+assert.equal(currentYearQuery('台南 2026 10月','明天台南',2026),'台南 2026 10月');
+assert.equal(currentYearQuery('訂單 120251004','查訂單',2026),'訂單 120251004','digits inside a longer number are not a year');
 ''',suffix='.mts')
 
     def test_tool_registers_only_typed_exact_sources_and_returns_evidence_once(self):

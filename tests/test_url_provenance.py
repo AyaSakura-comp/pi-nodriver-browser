@@ -221,7 +221,15 @@ const research = isError => handlers.get('tool_result')({toolName:'research', to
   content:[{type:'text', text:'evidence'}], details:{}}, ctx);
 
 await handlers.get('input')({text:'這禮拜南部有什麼活動'}, ctx);
-if ((await call('crawl'))?.block) throw new Error('crawl blocked before research');
+for (const name of ['google_search','crawl']) {
+  const r = await call(name);
+  if (!r?.block || !r.reason.includes('RESEARCH_FIRST')) throw new Error(name + ' before research must point to research');
+}
+await handlers.get('input')({text:'用 Google 搜南部活動'}, ctx);
+if ((await call('google_search'))?.block) throw new Error('an explicit Google request is allowed');
+await handlers.get('input')({text:'幫我爬 https://a.example/ 這頁'}, ctx);
+if ((await call('crawl'))?.block) throw new Error('crawling a user URL is allowed');
+await handlers.get('input')({text:'這禮拜南部有什麼活動'}, ctx);
 await research(false);
 for (const name of ['crawl','google_search','fetch_images','fetch_image','research','browser','browser_intent']) {
   const r = await call(name);

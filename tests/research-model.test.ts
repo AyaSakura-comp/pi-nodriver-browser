@@ -39,7 +39,7 @@ test('planner prompt requests semantic content and required gap references, not 
   assert.doesNotMatch(prompt,/Copy view\.revision|parent_task_id/);
 });
 
-test('fallback descriptors fail before transport without mutating the invoking model', () => {
+test('fallback descriptors fail before transport without mutating the invoking model', async () => {
   for (const compat of [
     {allowedFallbackModels:[{provider:'owner-provider',model:'substitute'}]},
     {allowedFallbackModels:[]},
@@ -50,8 +50,9 @@ test('fallback descriptors fail before transport without mutating the invoking m
     let calls=0;
     const selected={...model,api:'anthropic-messages',compat};
     const original=structuredClone(selected);
-    assert.throws(() => new ResearchPlanner({model:selected,modelRegistry:{complete:async()=>{calls++;return message();}}} as never,
-      'job',hostClock()), /research_model_fallback_unsupported/);
+    const planner=new ResearchPlanner({model:selected,modelRegistry:{complete:async()=>{calls++;return message();}}} as never,
+      'job',hostClock());
+    await assert.rejects(planner.plan(view,['4get']), /research_model_fallback_unsupported/);
     assert.equal(calls,0);
     assert.deepEqual(selected,original);
   }
@@ -104,5 +105,14 @@ test('bounded request rejects oversize without model dispatch and cancellation p
   await assert.rejects(planner.plan({...view,question:'x'.repeat(100000)},['4get']), /research_planner_input_too_large/);
   const signal = AbortSignal.abort();
   await assert.rejects(planner.plan(view,['4get'],signal), /research_planner_cancelled/);
+  assert.equal(calls,0);
+});
+
+test('a model the planner cannot drive (e.g. openai-codex) can still run research with agent-written queries', async () => {
+  let calls=0;
+  const codex={...model,provider:'openai-codex',api:'openai-codex-responses',reasoning:true};
+  const planner=new ResearchPlanner({model:codex,modelRegistry:{complete:async()=>{calls++;return message();}}} as never,'job',hostClock());
+  assert.deepEqual(planner.diagnostics,{modelCalls:0,formatRepairs:0,formatFailures:0});
+  await assert.rejects(planner.plan(view,['4get']), /research_planner_api_unsupported/);
   assert.equal(calls,0);
 });

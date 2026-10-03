@@ -11,14 +11,6 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/** Subset of Pi's ctx.prefill (pi-coding-agent PrefillApi); absent on older Pi builds. */
-interface PrefillHandle {
-  append(text: string): boolean;
-  end(): void;
-  cancel(reason?: string): void;
-  stats(): Record<string, unknown>;
-}
-interface PrefillApi { begin(toolCallId: string): PrefillHandle | undefined; }
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -452,6 +444,20 @@ function isSearchEngineUrl(url: string): boolean {
   }
 }
 
+// Models (especially with little thinking) often write last year into queries
+// for "tomorrow"/"this week"; stale years return last year's pages. A year in the
+// past five years is moved to the current year unless the user named that year or
+// asked about the past.
+const PAST_INTENT = /去年|前年|上一年|往年|歷年|過去|歷史|以前|當年|last year|previous year|history|historical/i;
+function currentYearQuery(query: string, userText: string | undefined, year = new Date().getFullYear()): string {
+  const asked = userText ?? "";
+  if (PAST_INTENT.test(asked)) return query;
+  return query.replace(/(?<!\d)(20\d{2})(?!\d)/g, (match) => {
+    const value = Number(match);
+    return value < year && value >= year - 5 && !asked.includes(match) ? String(year) : match;
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   const { browserMode } = readBrowserConfig();
   const worker = new NodriverWorker();
@@ -470,12 +476,14 @@ export default function (pi: ExtensionAPI) {
   // unless that message asks for them (a URL, Google, crawling, images, more search).
   const researchDone = new Map<string, boolean>();
   const researchBlocks = new Map<string, number>();
+  const researchTried = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
   const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
   const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|browser|瀏覽|打開|開啟|網站|網頁|點/i;
   pi.on("input", (event, ctx) => {
     researchDone.set(sessionId(ctx), false);
     researchBlocks.set(sessionId(ctx), 0);
+    researchTried.set(sessionId(ctx), false);
     lastInput.set(sessionId(ctx), typeof event.text === "string" ? event.text : "");
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.text)) allowed.add(url);
@@ -483,6 +491,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event, ctx) => {
+    if (event.toolName === "research") researchTried.set(sessionId(ctx), true);
     if (event.toolName === "research" && !event.isError) researchDone.set(sessionId(ctx), true);
     if (event.isError || !isSearchResultEvent(event)) return;
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
@@ -490,7 +499,21 @@ export default function (pi: ExtensionAPI) {
     searchedUrls.set(sessionId(ctx), allowed);
   });
 
+  // research is the default web lookup (AGENTS.md); with little thinking models
+  // still reach for google_search/crawl first. Those are for explicit requests.
+  const USER_WANTS_GOOGLE = /google|谷歌/i;
+  const USER_GAVE_URL_OR_CRAWL = /https?:\/\/|crawl|爬/i;
   pi.on("tool_call", (event, ctx) => {
+    const asked = lastInput.get(sessionId(ctx)) ?? "";
+    // After research ran (even if it failed) these are legitimate fallbacks.
+    if (!researchTried.get(sessionId(ctx)) &&
+        ((event.toolName === "google_search" && !USER_WANTS_GOOGLE.test(asked)) ||
+         (event.toolName === "crawl" && !USER_GAVE_URL_OR_CRAWL.test(asked)))) {
+      return {
+        block: true,
+        reason: "RESEARCH_FIRST: use the research tool for web lookups (four keyword queries q1-q4). google_search is only for an explicit Google request and crawl only for URLs the user gave.",
+      };
+    }
     if (FOLLOW_UP_LOOKUPS.has(event.toolName) && researchDone.get(sessionId(ctx))
         && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")) {
       const blocks = (researchBlocks.get(sessionId(ctx)) ?? 0) + 1;
@@ -572,15 +595,13 @@ export default function (pi: ExtensionAPI) {
     }
     return undefined;
   };
-  // Speculative prefill is owned by the Pi harness (ctx.prefill, opt-in via the
-  // `prefill` setting): it previews the exact next request, leases a slot per
-  // session, warms it with the evidence committed so far, and pins the final
-  // request. This extension only reports what text is committed. Older Pi
-  // builds have no ctx.prefill; research then runs without prefill.
+  // Prefill is owned by the Pi harness: its passive prefill warms the next
+  // request from this tool's progress updates (the committed evidence prefix)
+  // and pins the final request. This extension only reports committed text.
   // Speculative research: the job starts as soon as q1 of a research call is
   // written (search, crawl and evidence assembly need only the queries and
   // the user's question). q2..q4 join the running job as they are written.
-  // execute() adopts the job; only prefill and the tool result need the
+  // execute() adopts the job; only the progress updates and the result need the
   // finished call. A call that never executes is cancelled.
   type Speculative = {jobId: string; sid: string; clock: ReturnType<typeof hostClock>; planner: ResearchPlanner;
     promise: Promise<Record<string, any>>; lastPrefix: string; listener?: (prefix: string) => void;
@@ -614,10 +635,13 @@ export default function (pi: ExtensionAPI) {
       let query: string;
       try { query = JSON.parse(`"${m[2]}"`); } catch { continue; }
       if (!query.trim() || query.length > 80) continue;
+      query = currentYearQuery(query, lastUserText(ctx));
       state.sent.add(index);
       const spec = speculative.get(id);
       if (!spec) {
         if (activeResearch.has(sid)) continue;  // another research owns this session
+        // RESEARCH_DONE_GUARD will block this call; do not search and crawl for it.
+        if (researchDone.get(sid) && !USER_WANTS_MORE.test(lastInput.get(sid) ?? "")) continue;
         const jobId = randomUUID();
         const clock = hostClock();
         const abort = new AbortController();
@@ -672,6 +696,7 @@ export default function (pi: ExtensionAPI) {
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
       "Do not call gettime before research: the system prompt's Today line is the current local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates in the queries.",
       "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
+      "Make answers based on research as detailed as the evidence allows: list every relevant item with its specifics (names, dates and times, venues and addresses, prices, how to book or get there), group them by day, area or type, and end each item with its source as a markdown link, e.g. ([來源](https://…)); an answer without source links is incomplete. Prefer a complete list over a summary; do not drop items the evidence supports.",
       "Always end an answer based on research with one short question asking the user whether to search for more, naming what is still missing if anything.",
       "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the paragraphs they illustrate; never fetch images yourself.",
     ],
@@ -692,38 +717,43 @@ export default function (pi: ExtensionAPI) {
       const jobId = spec?.jobId ?? randomUUID();
       const clock = spec?.clock ?? hostClock();
       const planner = spec?.planner ?? new ResearchPlanner(ctx, jobId, clock);
-      // Committed evidence is appended once, in order; the final packet must
-      // start with it or Pi drops the prefill (never affects correctness).
-      const prefill = (ctx as {prefill?: PrefillApi}).prefill?.begin(_toolCallId);
       // Evidence is ranked against what the user actually asked, taken from
       // the session instead of making the model copy it into the tool call.
-      const queries = [params.q1, params.q2, params.q3, params.q4].filter((q): q is string => typeof q === "string" && q.trim().length > 0);
-      const question = lastUserText(ctx) ?? queries.join(" ; ");
-      let committed = "";
+      const asked = lastUserText(ctx);
+      const queries = [params.q1, params.q2, params.q3, params.q4]
+        .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+        .map((q) => currentYearQuery(q, asked));
+      const question = asked ?? queries.join(" ; ");
       let delivered = false;
-      const onPrefix = prefill ? (prefix: string) => {
-        if (!prefix.startsWith(committed)) { prefill.cancel("prefix_rewritten"); return; }
-        if (prefix.length > committed.length && prefill.append(prefix.slice(committed.length))) committed = prefix;
-      } : undefined;
+      // Evidence is committed append-only and the final packet starts with it,
+      // so each progress update carries the whole committed prefix. Pi's
+      // passive prefill warms the model from these updates while pages are
+      // still being crawled; no prefill API call is needed here.
+      let sent = "";
+      const onPrefix = (prefix: string) => {
+        if (prefix.length <= sent.length) return;
+        sent = prefix;
+        onUpdate?.({content:[{type:"text",text:prefix}],details:{jobId,status:"evidence"}});
+      };
       activeResearch.add(sid);
       try {
-        onUpdate?.({content:[{type:"text",text:"Research running; evidence will be returned once at completion."}],details:{jobId,status:"running"}});
+        // Status lives in details: update text must stay a prefix of the result.
+        onUpdate?.({content:[],details:{jobId,status:"running"}});
         // The model only chooses queries; the tool owns every other knob.
         let response: Record<string, any>;
         if (spec) {
           // Adopt the job that started while the call was being written:
           // replay the evidence committed so far, then follow it live.
-          if (onPrefix) { spec.listener = onPrefix; if (spec.lastPrefix) onPrefix(spec.lastPrefix); }
+          spec.listener = onPrefix; if (spec.lastPrefix) onPrefix(spec.lastPrefix);
           signal?.addEventListener("abort", () => spec.abort.abort(), { once: true });
           response = await spec.promise;
         } else {
           response = await worker.research({jobId,question,provider:"auto",
             searchBudget:8,searchConcurrency:4,layaConcurrency:2,crawlWordBudget:crawlWordBudget,
             rankBatchSize:4,ranker:"none",crawlConcurrency,searchRounds:1,queries,
-            evidence:prefill ? "progressive" : "passages",clock},sid,planner,signal,
+            evidence:"progressive",clock},sid,planner,signal,
             onPrefix);
         }
-        prefill?.end();
         if (response.action !== "research" || response.jobId !== jobId) throw new Error("research_invalid_terminal_frame");
         const allowed = searchedUrls.get(sid) || new Set<string>();
         // Only typed provider-success records from this owned job grant authority.
@@ -755,11 +785,10 @@ export default function (pi: ExtensionAPI) {
         const {text: _packet,...details}=response;
         delivered = true;
         return {content:[{type:"text" as const,text}],details:{...details,estimatedInputTokens,
-          plannerDiagnostics:planner.diagnostics,...(prefill ? {prefill:prefill.stats()} : {})},usage:planner.usage};
+          plannerDiagnostics:planner.diagnostics},usage:planner.usage};
       } finally {
         activeResearch.delete(sid);
         speculative.delete(_toolCallId);
-        if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
       }
     },
   });

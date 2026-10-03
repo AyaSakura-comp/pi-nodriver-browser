@@ -18,12 +18,19 @@ class ResearchImages:
     """Collects at most `per_page` candidates per crawled page, starts at most
     `max_fetch` downloads, and reports at most `max_deliver` finished ones."""
 
-    def __init__(self, question, fetch, *, max_deliver=3, max_fetch=6, per_page=2, min_side=200):
+    def __init__(self, question, fetch, *, max_deliver=3, max_fetch=6, per_page=2, min_side=200,
+                 on_ready=None, is_delivered=None):
         self._question = _bigrams(question)
         self._fetch = fetch
         self.max_deliver, self.max_fetch, self.per_page, self.min_side = max_deliver, max_fetch, per_page, min_side
         self._tasks = []  # (source_id, title, candidate, relevance, task)
         self._urls = set()
+        # Streaming delivery: a finished download from a page whose passages are in
+        # the evidence is committed right away (append-only, so it is prefilled while
+        # crawling); the rest wait for section() at the end.
+        self._on_ready, self._is_delivered = on_ready, is_delivered
+        self._digests, self._listed = set(), set()
+        self.delivered = 0
 
     def _relevance(self, title, candidate):
         described = _bigrams(f"{candidate.get('caption') or ''} {candidate.get('alt') or ''}")
@@ -50,8 +57,44 @@ class ResearchImages:
                 return
             self._urls.add(candidate['url'])
             task = asyncio.create_task(self._fetch(candidate['url']))
-            task.add_done_callback(lambda t: t.cancelled() or t.exception())
-            self._tasks.append((source_id, title, candidate, relevance, task))
+            entry = (source_id, title, candidate, relevance, task)
+            task.add_done_callback(lambda t, entry=entry: self._finished(entry))
+            self._tasks.append(entry)
+
+    def _line(self, entry):
+        """Marker line for a finished, non-duplicate download, or None."""
+        source_id, title, candidate, _, task = entry
+        if not task.done() or task.cancelled() or task.exception() is not None or id(task) in self._listed:
+            return None
+        image = task.result() or {}
+        if not image.get('path'):
+            return None
+        try:  # the same picture is often linked under several URLs
+            with open(image['path'], 'rb') as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+        if digest in self._digests:
+            return None
+        self._digests.add(digest)
+        self._listed.add(id(task))
+        self.delivered += 1
+        description = candidate.get('caption') or candidate.get('alt') or title or ''
+        size = f" ({image['width']}x{image['height']})" if image.get('width') and image.get('height') else ''
+        return f"- [[image: {image['path']}]] [{source_id}] {description[:120]}{size}"
+
+    def _finished(self, entry):
+        task = entry[4]
+        if task.cancelled() or task.exception() is not None:
+            return
+        if self._on_ready is None or self.delivered >= self.max_deliver:
+            return
+        if self._is_delivered is not None and not self._is_delivered(entry[0]):
+            return  # page not used by the evidence (yet): keep it for section()
+        line = self._line(entry)
+        if line:
+            header = _HEADER if self.delivered == 1 else ''
+            self._on_ready(f'{header}{line}\n')
 
     async def settle(self, timeout):
         """Give in-flight downloads at most `timeout` seconds once crawling is done."""
@@ -65,33 +108,27 @@ class ResearchImages:
                 task.cancel()
 
     def section(self, delivered_sources=()):
-        """Markdown listing finished downloads, pages with delivered passages first."""
+        """Markdown for finished downloads not committed while crawling (pages with
+        delivered passages first), up to max_deliver images in total."""
         done = []
-        for source_id, title, candidate, relevance, task in self._tasks:
-            if not task.done() or task.cancelled() or task.exception() is not None:
-                continue
-            image = task.result() or {}
-            if not image.get('path'):
-                continue
-            done.append((source_id in delivered_sources, relevance, source_id, title, candidate, image))
+        for entry in self._tasks:
+            source_id, _, _, relevance, task = entry
+            if task.done() and not task.cancelled() and task.exception() is None and id(task) not in self._listed:
+                done.append((source_id in delivered_sources, relevance, entry))
         done.sort(key=lambda item: (not item[0], -item[1]))
-        lines, digests = [], set()
-        for _, _, source_id, title, candidate, image in done:
-            if len(lines) >= self.max_deliver:
+        lines = []
+        for _, _, entry in done:
+            if self.delivered >= self.max_deliver:
                 break
-            try:  # the same picture is often linked under several URLs
-                with open(image['path'], 'rb') as handle:
-                    digest = hashlib.sha256(handle.read()).hexdigest()
-            except OSError:
-                continue
-            if digest in digests:
-                continue
-            digests.add(digest)
-            description = candidate.get('caption') or candidate.get('alt') or title or ''
-            size = f" ({image['width']}x{image['height']})" if image.get('width') and image.get('height') else ''
-            lines.append(f"- [[image: {image['path']}]] [{source_id}] {description[:120]}{size}")
+            line = self._line(entry)
+            if line:
+                lines.append(line)
         if not lines:
             return ''
-        return ('\n## Images (already downloaded; do not fetch)\n' + '\n'.join(lines) + '\n'
-                'To illustrate a point, copy its [[image: …]] marker exactly onto its own line inside the '
-                'paragraph it supports (at most 3). Skip images that do not match the answer.\n')
+        header = _HEADER if self.delivered == len(lines) else '\n'
+        return header + '\n'.join(lines) + '\n'
+
+
+_HEADER = ('\n## Images (already downloaded; do not fetch). To illustrate a point, copy its [[image: …]] '
+           'marker exactly onto its own line inside the paragraph it supports (at most 3); skip images that '
+           'do not match the answer.\n')

@@ -189,6 +189,13 @@ class ProgressivePassages:
         self.text += chunk
         return chunk
 
+    def append_note(self, text):
+        """Append budget-exempt text (e.g. a downloaded image marker); append-only like passages."""
+        if self._finished or not text:
+            return False
+        self.text += text
+        return True
+
     def finalize(self):
         """No top-up: the packet is exactly what was committed while crawling."""
         self._finished = True

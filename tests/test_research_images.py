@@ -66,3 +66,30 @@ class ResearchImagesTests(unittest.IsolatedAsyncioTestCase):
         await images.settle(0.5)
         self.assertEqual(images.section(), '')
         self.assertEqual(ResearchImages('q', fetch).section(), '')
+
+
+class StreamingImagesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_images_of_delivered_pages_stream_in_and_the_rest_wait_for_the_end(self):
+        import os, tempfile
+        folder = tempfile.mkdtemp()
+        async def fetch(url):
+            path = os.path.join(folder, url.rsplit('/', 1)[-1] + '.jpg')
+            with open(path, 'wb') as handle:
+                handle.write(b'dup' if 'dup' in url else url.encode())
+            return dict(path=path, width=800, height=600)
+        streamed = []
+        delivered = {'s1', 's2'}
+        images = ResearchImages('q', fetch, max_deliver=3, on_ready=streamed.append,
+                                is_delivered=lambda sid: sid in delivered)
+        images.offer('s1', 't', [candidate('https://a.example/one'), candidate('https://a.example/dup1')])
+        images.offer('s2', 't', [candidate('https://b.example/dup2')])
+        images.offer('s9', 't', [candidate('https://z.example/late')])
+        await images.settle(1)
+        self.assertEqual(len(streamed), 2, 'duplicate content streamed once; page s9 not in evidence')
+        self.assertTrue(streamed[0].startswith('\n## Images'), 'header comes with the first image')
+        self.assertNotIn('## Images', streamed[1])
+        tail = images.section(delivered_sources=delivered)
+        self.assertIn('late.jpg', tail, 'the held image fills the remaining slot at the end')
+        self.assertNotIn('## Images', tail)
+        self.assertEqual(images.delivered, 3)
+        self.assertEqual(images.section(delivered_sources=delivered), '', 'nothing is listed twice')

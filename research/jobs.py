@@ -310,7 +310,16 @@ class ResearchConnection:
                 async with self.engine.image_fetch_semaphore:
                     path,mime,width,height,_=await self.engine.run_fetch_image(url,session_id or owner)
                 return dict(path=str(path),mime=mime,width=width,height=height)
-            images=ResearchImages(params['question'],fetch_image,max_deliver=RESEARCH_IMAGES,max_fetch=2*RESEARCH_IMAGES)
+            def image_ready(text):
+                if not accepting[0] or not progressive.append_note(text): return
+                frame = dict(type='progress', id=request_id, jobId=job_id, phase='evidence',
+                             prefix=local_date_line(clock)+'\n'+progressive.text)
+                if progress_queue is not None:
+                    if progress_queue.full():
+                        progress_queue.get_nowait(); progress_queue.task_done()
+                    progress_queue.put_nowait(frame)
+            images=ResearchImages(params['question'],fetch_image,max_deliver=RESEARCH_IMAGES,max_fetch=2*RESEARCH_IMAGES,
+                                  on_ready=image_ready,is_delivered=lambda sid: sid in progressive.delivered_sources)
         progress_queue = asyncio.Queue(maxsize=1) if progressive is not None else None
         progress_task = None
         def on_page(source, text):
@@ -471,11 +480,14 @@ class ResearchConnection:
                 # as "evidence incomplete" and sent agents off to crawl/fetch more;
                 # those stay in the tool details. The text closes the lookup instead.
                 packet+=('\nEnd of evidence. This is enough to answer: answer now from the passages and '
-                         'search results above, cite their URLs, and say plainly what they do not cover. Do '
+                         'search results above, as detailed as they allow: every relevant item with its '
+                         'specifics (names, dates and times, venues, prices, how to book or get there), grouped '
+                         'clearly, each item ending with its source as a markdown link ([來源](URL)); say '
+                         'plainly what they do not cover. Do '
                          'not search, crawl, browse or fetch images on your own. Finish your answer by asking '
                          'the user, in their language, whether they want you to search for more (name what '
                          'is missing, if anything).\n')
-                if image_section:
+                if images is not None and images.delivered:
                     packet+=('This evidence includes downloaded images: put the one or two most relevant '
                              '[[image: …]] markers from the Images list, copied exactly, on their own lines '
                              'inside the paragraphs they illustrate.\n')
