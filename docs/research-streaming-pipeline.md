@@ -108,7 +108,9 @@ prefills 69 tokens instead of ~5,400.
 | `RESEARCH_PARTIAL_ON_TIMEOUT` | unset | capture partially loaded pages on timeout (hurt quality) |
 | `PI_NODRIVER_CRAWL_POOL_TABS` | 48 | crawl pool size |
 
-## Measurements (qwen-mtp 35B on gfx1151, real Pi binary, live 4get/Google/Chrome)
+## Measurements & Time Breakdown Evaluation Standard
+
+> **Mandatory Evaluation Standard**: When analyzing latency, regressions, or prefill effectiveness, **always use the Time Breakdown Analysis tool** in [`benchmarks/time_breakdown/`](../benchmarks/time_breakdown/) (see [`docs/research-time-breakdown-analysis.md`](research-time-breakdown-analysis.md)). Single end-to-end duration numbers conflate search, network crawl, GPU prefill, thinking budget, and generation volume. All performance reports must include the multi-lane Gantt chart and metrics (TTFT, settlement wait, warm volume, final prefill).
 
 Cold-start Pi with only the research tool, thinking off, 10 questions, medians:
 

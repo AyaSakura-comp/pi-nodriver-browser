@@ -1117,6 +1117,20 @@ Review the diff for credentials and unsafe process/shell changes, then run an in
 
 ---
 
+## ⏱️ Time Breakdown Analysis & Benchmarking
+
+When analyzing research execution speed, latency regressions, or speculative prefill efficiency, **always use the Time Breakdown Analysis tool** under [`benchmarks/time_breakdown/`](benchmarks/time_breakdown/) (see [`docs/research-time-breakdown-analysis.md`](docs/research-time-breakdown-analysis.md) for full methodology).
+
+```bash
+# Automated A/B evaluation of Passive vs Active Prefill with Gantt charts:
+bash benchmarks/time_breakdown/run_ab_comparison.sh /tmp/eval-ab
+
+# Plot multi-lane Gantt chart from any completed benchmark directory:
+python3 benchmarks/time_breakdown/plot_breakdown.py /tmp/eval-ab/active
+```
+
+---
+
 ## 📄 License
 
 MIT License. Developed with ❤️ for advanced agentic pair-programming workflows.
