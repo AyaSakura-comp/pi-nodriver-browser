@@ -11,6 +11,15 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+/** Subset of Pi's ctx.prefill (pi-coding-agent PrefillApi); absent on older Pi builds. */
+interface PrefillHandle {
+  append(text: string): boolean;
+  end(): void;
+  cancel(reason?: string): void;
+  stats(): Record<string, unknown>;
+}
+interface PrefillApi { begin(toolCallId: string): PrefillHandle | undefined; }
+
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -461,6 +470,7 @@ function currentYearQuery(query: string, userText: string | undefined, year = ne
 export default function (pi: ExtensionAPI) {
   const { browserMode } = readBrowserConfig();
   const worker = new NodriverWorker();
+  const ACTIVE_PREFILL = process.env.RESEARCH_ACTIVE_PREFILL !== "0";
   if (browserMode === "intent") registerIntent(pi, () => worker.ensureStarted());
   let queue = Promise.resolve<unknown>(undefined);
   const searchedUrls = new Map<string, Set<string>>();
@@ -696,9 +706,14 @@ export default function (pi: ExtensionAPI) {
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
       "Do not call gettime before research: the system prompt's Today line is the current local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates in the queries.",
       "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
-      "Make answers based on research as detailed as the evidence allows: list every relevant item with its specifics (names, dates and times, venues and addresses, prices, how to book or get there), group them by day, area or type, and end each item with its source as a markdown link, e.g. ([來源](https://…)); an answer without source links is incomplete. Prefer a complete list over a summary; do not drop items the evidence supports.",
-      "Always end an answer based on research with one short question asking the user whether to search for more, naming what is still missing if anything.",
-      "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the paragraphs they illustrate; never fetch images yourself.",
+      "Embody an enthusiastic knowledge curator persona: love sharing comprehensive, exhaustive intelligence without cutting corners. Avoid a monotonous wall of bullets; combine clean, well-formatted tables with in-depth narrative highlight sections.",
+      "Domain Archetypes (範例引導):",
+      "• 旅遊 / 活動 / 美食：提供完整人事時地物與交通，務必包含「費用明細 ($$)（門票/低消/預算）」與「網友真實評價與心得 / 避坑提醒（人潮時段/必看亮點/注意事項）」。",
+      "• 學術 / 理論 / 技術：深入清楚解釋概念原理、底層機制、步驟邏輯、業界最佳實踐與優劣對比，避免空泛名詞。",
+      "• 3C / 產品 / 規格：提供詳細規格對比表、售價與配置 ($$)、社群真實評測心得、優缺點與適合客群。",
+      "Ensure table readability: use informative columns, concise entries, and <br>• for sub-points. End every item and table row with its markdown link ([來源](https://…)). Never omit details or say 'refer to official website'; list all items the evidence supports.",
+      "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the narrative highlight paragraphs they illustrate; never fetch images yourself.",
+      "Always end an answer based on research with an objective note on what is missing, and one short question asking the user whether to search for more.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -717,6 +732,9 @@ export default function (pi: ExtensionAPI) {
       const jobId = spec?.jobId ?? randomUUID();
       const clock = spec?.clock ?? hostClock();
       const planner = spec?.planner ?? new ResearchPlanner(ctx, jobId, clock);
+      // Committed evidence is appended once, in order; the final packet must
+      // start with it or Pi drops the prefill (never affects correctness).
+      const prefill = ACTIVE_PREFILL ? (ctx as {prefill?: PrefillApi}).prefill?.begin(_toolCallId) : undefined;
       // Evidence is ranked against what the user actually asked, taken from
       // the session instead of making the model copy it into the tool call.
       const asked = lastUserText(ctx);
@@ -724,13 +742,16 @@ export default function (pi: ExtensionAPI) {
         .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
         .map((q) => currentYearQuery(q, asked));
       const question = asked ?? queries.join(" ; ");
+      let committed = "";
       let delivered = false;
-      // Evidence is committed append-only and the final packet starts with it,
-      // so each progress update carries the whole committed prefix. Pi's
-      // passive prefill warms the model from these updates while pages are
-      // still being crawled; no prefill API call is needed here.
       let sent = "";
       const onPrefix = (prefix: string) => {
+        if (prefill) {
+          if (!prefix.startsWith(committed)) { prefill.cancel("prefix_rewritten"); }
+          else if (prefix.length > committed.length) {
+            if (prefill.append(prefix.slice(committed.length))) committed = prefix;
+          }
+        }
         if (prefix.length <= sent.length) return;
         sent = prefix;
         onUpdate?.({content:[{type:"text",text:prefix}],details:{jobId,status:"evidence"}});
@@ -754,6 +775,7 @@ export default function (pi: ExtensionAPI) {
             evidence:"progressive",clock},sid,planner,signal,
             onPrefix);
         }
+        prefill?.end();
         if (response.action !== "research" || response.jobId !== jobId) throw new Error("research_invalid_terminal_frame");
         const allowed = searchedUrls.get(sid) || new Set<string>();
         // Only typed provider-success records from this owned job grant authority.
@@ -785,10 +807,11 @@ export default function (pi: ExtensionAPI) {
         const {text: _packet,...details}=response;
         delivered = true;
         return {content:[{type:"text" as const,text}],details:{...details,estimatedInputTokens,
-          plannerDiagnostics:planner.diagnostics},usage:planner.usage};
+          plannerDiagnostics:planner.diagnostics,...(prefill ? {prefill:prefill.stats()} : {})},usage:planner.usage};
       } finally {
         activeResearch.delete(sid);
         speculative.delete(_toolCallId);
+        if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
       }
     },
   });

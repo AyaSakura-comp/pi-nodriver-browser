@@ -75,18 +75,27 @@ told to embed them in the paragraphs they illustrate and never fetch images itse
 ## Prefill
 
 Prefill is owned by the Pi harness (`ctx.prefill`, pi-coding-agent `feat/prefill-api`,
-`prefill` setting). The extension only reports committed text
-(`begin` / `append` / `end`); Pi previews the exact next request, warms its slot
-and pins the final request. Sibling tool calls in the same assistant message
-(e.g. `gettime` + `research` in parallel) are supported: the preview waits for
-the real results of calls placed before `research` and ignores calls after it.
-Verified live: with parallel `gettime` + `research` the final request prefills
-69 tokens instead of ~5,400.
+`prefill` setting). When `RESEARCH_ACTIVE_PREFILL=1` (default), the extension actively
+drives committed text into the engine via explicit `begin` / `append` / `end` hooks:
+- **Chunk-Aligned Warming**: New passages are pushed incrementally as pages settle,
+  avoiding arbitrary character slicing or Subword fragmentation.
+- **Telemetry Reporting**: The finished tool result surfaces `details.prefill` stats
+  (`warmPromptTokens`, `warmPromptMs`, `warmedChars`, `warms`).
+- **Graceful Fallback**: On providers without slot prefill support (e.g. cloud models like
+  `openai-codex/gpt-5.6-luna`), `begin()` safely returns `undefined` and the tool execution
+  seamlessly continues as a no-op.
+- **Passive Fallback**: Setting `RESEARCH_ACTIVE_PREFILL=0` falls back to passive buffering.
+
+Sibling tool calls in the same assistant message (e.g. `gettime` + `research` in parallel)
+are supported: the preview waits for the real results of calls placed before `research` and
+ignores calls after it. Verified live: with parallel `gettime` + `research` the final request
+prefills 69 tokens instead of ~5,400.
 
 ## Settings
 
 | Variable | Default | Effect |
 |---|---|---|
+| `RESEARCH_ACTIVE_PREFILL` | 1 | 1 = active progressive prefill via begin/append/end; 0 = passive buffer fallback |
 | `RESEARCH_CRAWL_CONCURRENCY` | 32 | parallel crawl tabs per job |
 | `RESEARCH_CRAWL_WORD_BUDGET` | 20000 | stop dispatching crawls after this many words |
 | `RESEARCH_CRAWL_TIMEOUT` | 3 | per-page load timeout (s) |

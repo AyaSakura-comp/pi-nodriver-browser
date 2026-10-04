@@ -894,13 +894,14 @@ lists the value used on the reference deployment when it differs from the defaul
 |---|---|---|---|
 | `~/.pi/agent/browser-config.json` (override path: `PI_BROWSER_CONFIG`, or `$PI_AGENT_DIR/browser-config.json`) | `browserMode` | `direct` | `direct` registers the low-level `browser` tool; `intent` registers `browser_intent` (natural-language actions through the integrated Laya intent router). This host: `intent`. |
 | `~/.pi/agent/settings.json` (Pi) | `prefill.enabled` / `providers` / `slots` | off | Enables Pi's speculative prefill (`ctx.prefill`): research evidence is prefilled into a llama.cpp slot while pages are still being crawled. Needs a Pi build with the prefill API. This host: `{ "enabled": true, "providers": ["local-llama"], "slots": [0] }`. |
-| `~/.pi/agent/settings.json` (Pi) | `thinkingBudgets` | Pi defaults | Thinking-token budget per level; `minimal` is the level used by the piweb Life channel. This host: minimal 256, low 1024, medium 2048, high 4096, xhigh 12000. |
-| `~/.pi/agent/AGENTS.md` (Pi) | section 1 | — | Makes `research` the default web lookup and reserves `google_search`/`crawl` for explicit requests. |
+| `~/.pi/agent/settings.json` (Pi) | `thinkingBudgets` | Pi defaults | Thinking-token budget per level; `minimal` is the level used by the piweb Life channel. This host: minimal 128 (golden sweet spot: 0.3s buffer avoiding token exhaustion while maximizing TTFT speed), low 1024, medium 2048, high 4096, xhigh 12000. |
+| `~/.pi/agent/AGENTS.md` (Pi) | global guidelines | — | Makes `research` the default web lookup, and injects the Enthusiastic Knowledge Curator persona and 5W1H Domain Archetype guidelines (exhaustive details, multi-column tables, $$ pricing, netizen tips & avoid-crowd guidance, core mechanisms, 3C specs & audience matrix). |
 
 ### Research (`research` tool)
 
 | Variable | Default | What it does |
 |---|---|---|
+| `RESEARCH_ACTIVE_PREFILL` | `1` | `1` drives active progressive prefill via `begin`/`append`/`end` on streaming chunk boundaries (warmed on local LLM slots, reported in `details.prefill`); `0` falls back to passive buffer prefill. Auto-no-ops gracefully on unsupported or cloud providers (e.g. OpenAI/GPT Luna). |
 | `RESEARCH_CRAWL_CONCURRENCY` | `32` | Pages crawled in parallel per research job (1–64). The 8/16/24/32 sweep found 32 fastest at the same success rate. |
 | `RESEARCH_CRAWL_TOP_PER_QUERY` | `5` | Crawl only the first N results of each search query, in search-engine order; `0` = no cap. Results beyond the top 5 were mostly pages that missed the crawl timeout, and capping cuts ~30 % of evidence tokens. |
 | `RESEARCH_IMAGES` | `3` | While pages are crawled, their main/content images (no logos, icons, thumbnails or images under 200 px) are downloaded in the background, at most 2 per page and 6 per job; up to this many finished downloads are listed in the evidence as `[[image: …]]` markers for the answer to embed in the paragraphs they illustrate. `0` = off. Files go to the Pi session's download directory (`PI_NODRIVER_DOWNLOAD_DIR`). |

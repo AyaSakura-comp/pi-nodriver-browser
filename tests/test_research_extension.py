@@ -49,6 +49,7 @@ assert.equal(await observed,'rejected');
         source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
         self.run_node('''
 import assert from 'node:assert/strict';
+process.env.RESEARCH_ACTIVE_PREFILL = '0';
 const Type=new Proxy({}, {get:()=> (...args)=>args[0]});
 const readBrowserConfig=()=>({browserMode:'direct'});
 const DESCRIPTION='',VISION_FALLBACK_GUIDANCE='',SEARCH_FIRST_URL_RULE='';
@@ -187,3 +188,41 @@ const large=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.equal(large.details.status,'incomplete'); assert.equal(large.details.fullEvidenceDelivered,false);
 assert.equal(large.details.reason,'packet_too_large'); assert.ok(large.content[0].text.length<1000);
 ''',suffix='.mts')
+
+    def test_active_prefill_drives_begin_append_end_and_reports_stats(self):
+        source=(ROOT/'index.ts').read_text()
+        source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
+        self.run_node('''
+import assert from 'node:assert/strict';
+process.env.RESEARCH_ACTIVE_PREFILL = '1';
+const Type=new Proxy({}, {get:()=> (...args)=>args[0]});
+const readBrowserConfig=()=>({browserMode:'direct'});
+const DESCRIPTION='',VISION_FALLBACK_GUIDANCE='',SEARCH_FIRST_URL_RULE='';
+const DEFAULT_MAX_LINES=2000,DEFAULT_MAX_BYTES=50*1024;
+const randomUUID=()=> 'job';const hostClock=()=>({iso:'2026-01-01T00:00:00Z',timezone:'UTC'});
+class ResearchPlanner {usage={totalTokens:0};diagnostics={};}
+let prefixes=[];
+class NodriverWorker {
+ async research(params,_sid,_planner,_signal,onEvidence) {
+   for (const p of prefixes) onEvidence?.(p);
+   return {action:'research',jobId:'job',fullEvidenceDelivered:true,text:'stable prefix\\nfooter',authorizations:[],sources:[]};
+ }
+ async cleanupSession() {} disconnect() {}
+ async prefetch(q,i,sid) { (globalThis.prefetched ??= []).push([q,i,sid]); }
+ async addQuery(sid,p) { (globalThis.added ??= []).push(p); }
+}
+''' + source + '''
+const tools=new Map(),handlers=new Map();
+register({on:(n,h)=>handlers.set(n,h),registerTool:t=>tools.set(t.name,t)});
+const log=[];
+const handle={append:t=>{log.push(['append',t]);return true;},end:()=>log.push(['end']),
+  cancel:r=>log.push(['cancel',r]),stats:()=>({state:'ended',warmedChars:13})};
+const ctx={getContextUsage:()=>({tokens:1000,contextWindow:200000}),sessionManager:{getSessionId:()=> 'owner',
+  getBranch:()=>[{type:'message',message:{role:'user',content:[{type:'text',text:'使用者的問題'}]}}]},
+  prefill:{begin:id=>{log.push(['begin',id]);return handle;}}};
+prefixes=['stable','stable prefix'];
+const result=await tools.get('research').execute('call-1',{q1:'q1',q2:'q2'},undefined,undefined,ctx);
+assert.deepEqual(log,[['begin','call-1'],['append','stable'],['append',' prefix'],['end']]);
+assert.deepEqual(result.details.prefill,{state:'ended',warmedChars:13});
+''',suffix='.mts')
+

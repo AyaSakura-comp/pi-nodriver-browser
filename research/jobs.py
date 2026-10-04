@@ -479,18 +479,30 @@ class ResearchConnection:
                 # A list of unread sources, the stop reason or the capture path reads
                 # as "evidence incomplete" and sent agents off to crawl/fetch more;
                 # those stay in the tool details. The text closes the lookup instead.
-                packet+=('\nEnd of evidence. This is enough to answer: answer now from the passages and '
-                         'search results above, as detailed as they allow: every relevant item with its '
-                         'specifics (names, dates and times, venues, prices, how to book or get there), grouped '
-                         'clearly, each item ending with its source as a markdown link ([來源](URL)); say '
-                         'plainly what they do not cover. Do '
-                         'not search, crawl, browse or fetch images on your own. Finish your answer by asking '
-                         'the user, in their language, whether they want you to search for more (name what '
-                         'is missing, if anything).\n')
+                packet+=('\nEnd of evidence. This is enough to answer: answer now from the passages and search results above. '
+                         'Deliver a highly structured, well-formatted, and exhaustive answer matching the question archetype:\n'
+                         '1. Structure & Readability: Do not rely solely on simple bullet lists. Structure the response with clear '
+                         'Markdown sections (##), informative summary tables, and detailed narrative highlight sections. '
+                         'In tables, use informative headers (Name, Time, Location, Highlights, Cost/Specs, Source) and use <br>• '
+                         'for sub-points so cells remain clean and easy to scan.\n'
+                         '2. Domain Archetypes (範例引導):\n'
+                         '   • 旅遊 / 活動 / 美食 / 行程類：提供完整「人事時地物」與交通指南，務必詳列「費用明細 ($$)（門票/低消/預算/購票通路）」'
+                         '以及「網友真實心得與評價 / 避坑踩雷提醒（人潮時段/必點必看/優缺點/推薦理由）」；精選亮點撰寫專屬段落深度介紹。\n'
+                         '   • 學術 / 理論 / 技術 / 科普類：深入清楚解釋概念原理與底層機制（核心定義、推導/步驟邏輯、優劣對比、實務意義與業界實踐），'
+                         '避免空泛名詞堆砌，以白話易懂且專業的語調深入剖析。\n'
+                         '   • 3C / 科技產品 / 評測類：列出規格對比表、官方定價與配置方案 ($$)、社群與媒體實測心得、真實優缺點與適合客群。\n'
+                         '3. Exhaustive 5W1H Detail: Extract every supported detail (Who/What/When/Where/How/$$); never omit details or '
+                         'write "refer to official site". Prefer a complete list over a summary: if 10 items exist, detail all 10.\n'
+                         '4. Inline Sources & Media: End every item and table row with its markdown link ([來源](URL)). '
+                         'If downloaded images are listed below, place the most relevant [[image: …]] markers on their own '
+                         'lines inside the narrative highlight paragraphs they illustrate.\n'
+                         '5. Boundaries & Closure: Do not search, crawl, browse or fetch images on your own. Finish your answer '
+                         'by stating clearly what the evidence does not cover, and ask the user whether they want you to '
+                         'search further for specific missing details.\n')
                 if images is not None and images.delivered:
-                    packet+=('This evidence includes downloaded images: put the one or two most relevant '
+                    packet+=('This evidence includes downloaded images: place the one or two most relevant '
                              '[[image: …]] markers from the Images list, copied exactly, on their own lines '
-                             'inside the paragraphs they illustrate.\n')
+                             'inside the narrative highlight paragraphs they illustrate.\n')
                 response=deliver_progressive(result.snapshot,packet,max_bytes=2*1024*1024,max_lines=20000)
             elif self.ranked and evidence_mode=='passages':
                 response=deliver(result.snapshot,max_bytes=2*1024*1024,max_lines=20000,
