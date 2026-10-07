@@ -18,7 +18,7 @@ class ExactUrlGuardTests(unittest.TestCase):
                     helpers = helpers[:helpers.index('const DESCRIPTION')]
                 hooks = text[text.index('  const searchedUrls ='):text.index('  // Close this session') if helper == 'extractHttpUrls' else text.index('  pi.on("before_agent_start"')]
                 # browser declares queue before searchedUrls, which the hooks do not use.
-                script = helpers + '\nfunction register(pi) {\n' + hooks + '\n}\n'
+                script = helpers + '\nfunction register(pi) {\nconst crawlGuards = true;\n' + hooks + '\n}\n'
                 script += '''
 const handlers = new Map();
 register({on(n,f){handlers.set(n,f);}});

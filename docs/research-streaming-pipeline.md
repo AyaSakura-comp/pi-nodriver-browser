@@ -27,8 +27,15 @@ GPU prefill (Pi core API)       warm … warm … warm … → final request reu
   Status, stop reason, unread sources and the artifact path stay in the tool
   `details`; printing them in the text sent agents off to crawl again.
 - `RESEARCH_DONE_GUARD` (`tool_call` hook): after a successful research in the
-  current user message, `crawl`, `google_search`, `fetch_image(s)` and a second
-  `research` are blocked unless that message asks for more (URL, Google, 爬, 圖, 再查…).
+  current user message, `crawl`, `google_search`, `fetch_image(s)`, `browser`,
+  `browser_intent` and a second `research` are blocked unless that message asks for
+  more (URL, Google, 爬, 圖, 再查…). A short yes (好啊/要/OK…) counts as asking when
+  the previous assistant message offered to search more. After an image-generation
+  skill is read in the turn, `crawl`/`fetch_image(s)`/`browser`/`browser_intent`
+  stay allowed so the agent can fetch references.
+- `crawlGuards: false` (`browser-config.json`) exempts `crawl` from this guard and
+  from `RESEARCH_FIRST`, and the research guideline then tells the agent to crawl
+  result URLs when the evidence is thin.
 
 ## Speculative job
 

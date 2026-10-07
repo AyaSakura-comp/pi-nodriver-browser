@@ -12,6 +12,10 @@ if (parseBrowserConfig({browserMode:'intent'}).browserMode !== 'intent') throw E
 if (parseBrowserConfig({browserMode:'direct'}).browserMode !== 'direct') throw Error('direct');
 let failed=false; try {parseBrowserConfig({browserMode:'both'});} catch {failed=true;}
 if (!failed) throw Error('invalid mode accepted');
+if (parseBrowserConfig({}).crawlGuards !== true) throw Error('crawlGuards default');
+if (parseBrowserConfig({crawlGuards:false}).crawlGuards !== false) throw Error('crawlGuards false');
+failed=false; try {parseBrowserConfig({crawlGuards:'off'});} catch {failed=true;}
+if (!failed) throw Error('non-boolean crawlGuards accepted');
 ''', suffix='.mts')
         source = (ROOT / 'index.ts').read_text()
         self.assertIn('if (browserMode === "direct") pi.registerTool', source)

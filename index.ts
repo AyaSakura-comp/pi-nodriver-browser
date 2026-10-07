@@ -468,7 +468,8 @@ function currentYearQuery(query: string, userText: string | undefined, year = ne
 }
 
 export default function (pi: ExtensionAPI) {
-  const { browserMode } = readBrowserConfig();
+  // crawlGuards: false exempts crawl from RESEARCH_FIRST and RESEARCH_DONE_GUARD.
+  const { browserMode, crawlGuards } = readBrowserConfig();
   const worker = new NodriverWorker();
   const ACTIVE_PREFILL = process.env.RESEARCH_ACTIVE_PREFILL !== "0";
   if (browserMode === "intent") registerIntent(pi, () => worker.ensureStarted());
@@ -490,11 +491,40 @@ export default function (pi: ExtensionAPI) {
   const lastInput = new Map<string, string>();
   const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
   const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|browser|瀏覽|打開|開啟|網站|網頁|點/i;
+  // The guard tells the agent to ask "search for more?"; a bare yes to that
+  // question must unlock follow-up lookups like an explicit request does.
+  const AFFIRMATIVE = /^(好|好啊|好喔|好的|好呀|要|要啊|可以|可|嗯|對|是|行|麻煩|麻煩了|請|拜託|查|搜|ok|okay|yes|yep|sure|go|y)[\s!！。.~～，,]*$/i;
+  const OFFERED_MORE_SEARCH = /查|搜|search|crawl|爬|look up|more/i;
+  // Image-generation skills legitimately need reference pages and images.
+  const IMAGE_SKILL_PATH = /skills\/(create-image|qwen-image|photo-editing|create-gif|image-to-3d)\//;
+  const IMAGE_TASK_LOOKUPS = new Set(["crawl", "fetch_image", "fetch_images", "browser", "browser_intent"]);
+  const imageTask = new Map<string, boolean>();
+  const userBody = (text: string) => text.replace(/^\[[^\]\n]*user:[^\]\n]*\]\s*/i, "").trim();
+  const lastAssistantText = (ctx: {sessionManager?: {getBranch?: () => unknown[]}}): string => {
+    const entries = ctx.sessionManager?.getBranch?.() ?? [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i] as {type?: string; message?: {role?: string; content?: unknown}};
+      if (entry?.type !== "message") continue;
+      if (entry.message?.role === "user") return "";
+      if (entry.message?.role !== "assistant") continue;
+      const content = entry.message.content;
+      const text = typeof content === "string" ? content
+        : Array.isArray(content) ? content.filter((c: {type?: string}) => c?.type === "text").map((c: {text?: string}) => c.text ?? "").join("\n") : "";
+      if (text.trim()) return text.trim();
+    }
+    return "";
+  };
   pi.on("input", (event, ctx) => {
     researchDone.set(sessionId(ctx), false);
     researchBlocks.set(sessionId(ctx), 0);
     researchTried.set(sessionId(ctx), false);
-    lastInput.set(sessionId(ctx), typeof event.text === "string" ? event.text : "");
+    imageTask.set(sessionId(ctx), false);
+    const text = typeof event.text === "string" ? event.text : "";
+    let accepted = false;
+    try {
+      accepted = AFFIRMATIVE.test(userBody(text)) && OFFERED_MORE_SEARCH.test(lastAssistantText(ctx as any).slice(-600));
+    } catch { /* branch unavailable: fall back to the literal text */ }
+    lastInput.set(sessionId(ctx), accepted ? `${text}\n[accepted offer: 再查]` : text);
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.text)) allowed.add(url);
     searchedUrls.set(sessionId(ctx), allowed);
@@ -515,17 +545,21 @@ export default function (pi: ExtensionAPI) {
   const USER_GAVE_URL_OR_CRAWL = /https?:\/\/|crawl|爬/i;
   pi.on("tool_call", (event, ctx) => {
     const asked = lastInput.get(sessionId(ctx)) ?? "";
+    if (event.toolName === "read" && IMAGE_SKILL_PATH.test(String((event.input as {path?: unknown})?.path ?? "")))
+      imageTask.set(sessionId(ctx), true);
     // After research ran (even if it failed) these are legitimate fallbacks.
     if (!researchTried.get(sessionId(ctx)) &&
         ((event.toolName === "google_search" && !USER_WANTS_GOOGLE.test(asked)) ||
-         (event.toolName === "crawl" && !USER_GAVE_URL_OR_CRAWL.test(asked)))) {
+         (event.toolName === "crawl" && crawlGuards && !USER_GAVE_URL_OR_CRAWL.test(asked)))) {
       return {
         block: true,
         reason: "RESEARCH_FIRST: use the research tool for web lookups (four keyword queries q1-q4). google_search is only for an explicit Google request and crawl only for URLs the user gave.",
       };
     }
-    if (FOLLOW_UP_LOOKUPS.has(event.toolName) && researchDone.get(sessionId(ctx))
-        && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")) {
+    if (FOLLOW_UP_LOOKUPS.has(event.toolName) && (crawlGuards || event.toolName !== "crawl")
+        && researchDone.get(sessionId(ctx))
+        && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")
+        && !(imageTask.get(sessionId(ctx)) && IMAGE_TASK_LOOKUPS.has(event.toolName))) {
       const blocks = (researchBlocks.get(sessionId(ctx)) ?? 0) + 1;
       researchBlocks.set(sessionId(ctx), blocks);
       // Agents that keep retrying blocked lookups lose ~3.5 s per round; escalate.
@@ -535,7 +569,7 @@ export default function (pi: ExtensionAPI) {
       };
       return {
         block: true,
-        reason: "RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want you to search for more. crawl, google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.",
+        reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want you to search for more. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " crawl is still allowed."}`,
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
@@ -708,7 +742,9 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
       "For research queries, use the latest browser-date-context Today line for the local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates. Use gettime when exact current time is needed.",
-      "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
+      crawlGuards
+        ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
+        : "Answer from the evidence research returns and cite its source URLs; when it is thin or you need a page's full text or images, crawl the relevant result URLs. Do not follow up with google_search unless the user asks.",
       "Embody an enthusiastic knowledge curator persona: love sharing comprehensive, exhaustive intelligence without cutting corners. Avoid a monotonous wall of bullets; combine clean, well-formatted tables with in-depth narrative highlight sections.",
       "Domain Archetypes (範例引導):",
       "• 旅遊 / 活動 / 美食：提供完整人事時地物與交通，務必包含「費用明細 ($$)（門票/低消/預算）」與「網友真實評價與心得 / 避坑提醒（人潮時段/必看亮點/注意事項）」。",

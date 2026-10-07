@@ -210,10 +210,16 @@ Every stage overlaps the next:
   `[[image: …]]` markers and the answer embeds them in the paragraphs they illustrate.
 
 The evidence closes by telling the agent it is enough, and the answer ends by
-asking the user whether to search for more. Guards: `RESEARCH_DONE_GUARD` blocks
-follow-up `crawl`/`google_search`/`fetch_image(s)`/`browser`/`browser_intent`/
-`research` in the same user message unless the user asks for more, and tells a
-retrying agent to stop calling tools; URL provenance rules are unchanged.
+asking the user whether to search for more. Guards: `RESEARCH_FIRST` blocks
+`google_search`/`crawl` before research unless the user asked for Google or gave a
+URL; `RESEARCH_DONE_GUARD` blocks follow-up `crawl`/`google_search`/`fetch_image(s)`/
+`browser`/`browser_intent`/`research` in the same user message unless the user asks
+for more, and tells a retrying agent to stop calling tools. "Asks for more" also
+covers a bare yes (好啊/要/OK…) to the agent's "search for more?" question, and an
+image-generation turn (a `create-image`/`qwen-image`/`photo-editing`/`create-gif`/
+`image-to-3d` skill was read) may still `crawl`/`fetch_image(s)`/`browser` for
+references. `"crawlGuards": false` in `browser-config.json` exempts `crawl` from both
+guards. URL provenance rules are unchanged.
 
 Tunables (all in the [Configuration Reference](#-configuration-reference)): `RESEARCH_CRAWL_CONCURRENCY` (32),
 `RESEARCH_CRAWL_TOP_PER_QUERY` (5; 0 = off — each query's top 5 keep answer quality
@@ -893,6 +899,7 @@ lists the value used on the reference deployment when it differs from the defaul
 | File | Key | Default | What it does |
 |---|---|---|---|
 | `~/.pi/agent/browser-config.json` (override path: `PI_BROWSER_CONFIG`, or `$PI_AGENT_DIR/browser-config.json`) | `browserMode` | `direct` | `direct` registers the low-level `browser` tool; `intent` registers `browser_intent` (natural-language actions through the integrated Laya intent router). This host: `intent`. |
+| same file | `crawlGuards` | `true` | `false` exempts `crawl` from `RESEARCH_FIRST` and `RESEARCH_DONE_GUARD` and tells the agent to crawl result URLs when research evidence is thin; the other follow-up lookups stay guarded. Read when Pi loads the extension (`/reload` or restart after editing). This host: `false`. |
 | `~/.pi/agent/settings.json` (Pi) | `prefill.enabled` / `providers` / `slots` | off | Enables Pi's speculative prefill (`ctx.prefill`): research evidence is prefilled into a llama.cpp slot while pages are still being crawled. Needs a Pi build with the prefill API. This host: `{ "enabled": true, "providers": ["local-llama"], "slots": [0] }`. |
 | `~/.pi/agent/settings.json` (Pi) | `thinkingBudgets` | Pi defaults | Thinking-token budget per level; `minimal` is the level used by the piweb Life channel. This host: minimal 128 (golden sweet spot: 0.3s buffer avoiding token exhaustion while maximizing TTFT speed), low 1024, medium 2048, high 4096, xhigh 12000. |
 | `~/.pi/agent/AGENTS.md` (Pi) | global guidelines | — | Makes `research` the default web lookup, and injects the Enthusiastic Knowledge Curator persona and 5W1H Domain Archetype guidelines (exhaustive details, multi-column tables, $$ pricing, netizen tips & avoid-crowd guidance, core mechanisms, 3C specs & audience matrix). |

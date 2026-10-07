@@ -15,7 +15,7 @@ class UrlProvenanceJavaScriptTests(unittest.TestCase):
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
-const readBrowserConfig = () => ({browserMode:"direct"});
+const readBrowserConfig = () => ({browserMode:"direct", crawlGuards:true});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -73,7 +73,7 @@ if (blocked?.block) throw new Error('non-open browser command was blocked');
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
-const readBrowserConfig = () => ({browserMode:"direct"});
+const readBrowserConfig = () => ({browserMode:"direct", crawlGuards:true});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -99,7 +99,7 @@ if (decision?.block) throw new Error('browser google-search result URL was block
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
-const readBrowserConfig = () => ({browserMode:"direct"});
+const readBrowserConfig = () => ({browserMode:"direct", crawlGuards:true});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
@@ -205,7 +205,7 @@ class ResearchDoneGuardJavaScriptTests(unittest.TestCase):
         start = text.index('function extractSearchResultUrls')
         source = text[start:].replace('export default function', 'function register', 1)
         self.run_node(r'''
-const readBrowserConfig = () => ({browserMode:"direct"});
+const readBrowserConfig = () => ({browserMode:"direct", crawlGuards:true});
 const Type = new Proxy({}, { get: () => (...args) => args[0] });
 const DESCRIPTION = '', VISION_FALLBACK_GUIDANCE = '', SEARCH_FIRST_URL_RULE = '';
 const DEFAULT_MAX_LINES = 2000, DEFAULT_MAX_BYTES = 50000;
