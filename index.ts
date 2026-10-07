@@ -587,7 +587,10 @@ export default function (pi: ExtensionAPI) {
     return `Today: ${day} (週${weekday}), timezone ${Intl.DateTimeFormat().resolvedOptions().timeZone}. Resolve relative dates (今天/明天/這週…) against this.`;
   };
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\n${SEARCH_FIRST_URL_RULE}\n\n${localDateLine()}\n\n${RESEARCH_QUERY_RULE}`,
+    systemPrompt: `${event.systemPrompt}\n\n${SEARCH_FIRST_URL_RULE}\n\n${RESEARCH_QUERY_RULE}`,
+    // Persist an appended context message. Never rewrite earlier date messages:
+    // the system/tool prefix and existing conversation KV remain reusable.
+    message: { customType: "browser-date-context", content: localDateLine(), display: false },
   }));
 
   const activeResearch = new Set<string>();
@@ -704,7 +707,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Default web search: four keyword queries in, crawled source-labelled evidence out (searches, crawls and dates handled by the tool)",
     promptGuidelines: [
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
-      "Do not call gettime before research: the system prompt's Today line is the current local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates in the queries.",
+      "For research queries, use the latest browser-date-context Today line for the local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates. Use gettime when exact current time is needed.",
       "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks.",
       "Embody an enthusiastic knowledge curator persona: love sharing comprehensive, exhaustive intelligence without cutting corners. Avoid a monotonous wall of bullets; combine clean, well-formatted tables with in-depth narrative highlight sections.",
       "Domain Archetypes (範例引導):",

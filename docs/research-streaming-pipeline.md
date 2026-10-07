@@ -17,8 +17,9 @@ GPU prefill (Pi core API)       warm … warm … warm … → final request reu
 - Parameters are four strings `q1`–`q4` (2–6 keywords each, concrete dates), not
   an array: llama.cpp streams one finished string parameter at a time, so q1
   reaches the extension while q2–q4 are still being decoded.
-- The extension injects the local `Today:` line into the system prompt, so the
-  agent resolves 今天/明天/這禮拜 itself; no `gettime` call is needed before research.
+- The extension appends the local `Today:` line as a hidden `browser-date-context`
+  message (never the system prompt, so the cached prefix survives midnight); the
+  agent resolves 今天/明天/這禮拜 from the latest one. `gettime` is only for exact times.
 - `research` is the default web lookup (`promptSnippet`/`promptGuidelines`);
   `google_search` is for explicit Google requests only.
 - The evidence ends with `End of evidence …`: the evidence is enough, answer now,
