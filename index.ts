@@ -490,11 +490,11 @@ export default function (pi: ExtensionAPI) {
   const researchTried = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
   const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
-  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|browser|瀏覽|打開|開啟|網站|網頁|點/i;
-  // The guard tells the agent to ask "search for more?"; a bare yes to that
+  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|再研究|深入|深度|deep|browser|瀏覽|打開|開啟|網站|網頁|點/i;
+  // The guard tells the agent to offer a deep crawl or more research; a bare yes to that
   // question must unlock follow-up lookups like an explicit request does.
   const AFFIRMATIVE = /^(好|好啊|好喔|好的|好呀|要|要啊|可以|可|嗯|對|是|行|麻煩|麻煩了|請|拜託|查|搜|ok|okay|yes|yep|sure|go|y)[\s!！。.~～，,]*$/i;
-  const OFFERED_MORE_SEARCH = /查|搜|search|crawl|爬|look up|more/i;
+  const OFFERED_MORE_SEARCH = /查|搜|研究|深度|search|crawl|爬|look up|more|deep/i;
   // Image-generation skills legitimately need reference pages and images.
   const IMAGE_SKILL_PATH = /skills\/(create-image|qwen-image|photo-editing|create-gif|image-to-3d)\//;
   const IMAGE_TASK_LOOKUPS = new Set(["crawl", "fetch_image", "fetch_images", "browser", "browser_intent"]);
@@ -565,11 +565,11 @@ export default function (pi: ExtensionAPI) {
       // Agents that keep retrying blocked lookups lose ~3.5 s per round; escalate.
       if (blocks > 1) return {
         block: true,
-        reason: `RESEARCH_DONE_GUARD (blocked ${blocks} times): STOP calling tools. Your next message must be the final answer, written only from the research evidence you already have, ending with a question asking the user whether to search for more.`,
+        reason: `RESEARCH_DONE_GUARD (blocked ${blocks} times): STOP calling tools. Your next message must be the final answer, written only from the research evidence you already have, ending with a question asking the user whether to deep-crawl specific sources or research more.`,
       };
       return {
         block: true,
-        reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want you to search for more. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " crawl is still allowed."}`,
+        reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want a deep crawl of specific sources or more research. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " research already crawled its result pages, so do not crawl on your own either."}`,
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
@@ -744,7 +744,7 @@ export default function (pi: ExtensionAPI) {
       "For research queries, use the latest browser-date-context Today line for the local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates. Use gettime when exact current time is needed.",
       crawlGuards
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
-        : "Answer from the evidence research returns and cite its source URLs; when it is thin or you need a page's full text or images, crawl the relevant result URLs. Do not follow up with google_search unless the user asks.",
+        : "Answer from the evidence research returns and cite its source URLs. research already crawled its result pages, so do not crawl on your own afterwards, even when the evidence is thin: offer a deep crawl instead, and crawl only after the user asks for it or gives a URL. Do not follow up with google_search unless the user asks.",
       "Embody an enthusiastic knowledge curator persona: love sharing comprehensive, exhaustive intelligence without cutting corners. Avoid a monotonous wall of bullets; combine clean, well-formatted tables with in-depth narrative highlight sections.",
       "Domain Archetypes (範例引導):",
       "• 旅遊 / 活動 / 美食：提供完整人事時地物與交通，務必包含「費用明細 ($$)（門票/低消/預算）」與「網友真實評價與心得 / 避坑提醒（人潮時段/必看亮點/注意事項）」。",
@@ -752,7 +752,7 @@ export default function (pi: ExtensionAPI) {
       "• 3C / 產品 / 規格：提供詳細規格對比表、售價與配置 ($$)、社群真實評測心得、優缺點與適合客群。",
       "Ensure table readability: use informative columns, concise entries, and <br>• for sub-points. End every item and table row with its markdown link ([來源](https://…)). Never omit details or say 'refer to official website'; list all items the evidence supports.",
       "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the narrative highlight paragraphs they illustrate; never fetch images yourself.",
-      "Always end an answer based on research with an objective note on what is missing, and one short question asking the user whether to search for more.",
+      "Always end an answer based on research with an objective note on what is missing, and one short question offering the next step: a deep crawl of specific sources for their full text, or another research round for the missing details.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -1255,6 +1255,7 @@ export default function (pi: ExtensionAPI) {
       "Use crawl when you need the full content of one or multiple web pages or direct PDF URLs.",
       "Never guess a crawl URL. Use web_search or google_search first, then pass only exact URLs returned by search results or supplied by the user.",
       "Reach for it right after web_search whenever the snippets are too thin to answer from: crawl the promising result URLs rather than guessing at what the pages say.",
+      "Not after research: research already crawled its result pages. Answer from its evidence and offer a deep crawl; crawl those sources only after the user asks for it.",
       "Always pass every URL you want in a SINGLE call. Splitting them costs one agent round-trip per URL, which dwarfs the fetch itself — measured on this setup, four real pages came back in about 1.5s in one call, so the fetching was never the bottleneck.",
       "Do not pre-filter down to a single 'best' URL out of caution. Crawling several and comparing is cheap here, and a failed page is reported per-URL without affecting the others.",
       "Crawl executes JavaScript, bypasses anti-bot barriers, and extracts clean readable text plus ranked image candidates from all pages simultaneously.",

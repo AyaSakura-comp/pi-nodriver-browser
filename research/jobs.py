@@ -497,8 +497,8 @@ class ResearchConnection:
                          'If downloaded images are listed below, place the most relevant [[image: …]] markers on their own '
                          'lines inside the narrative highlight paragraphs they illustrate.\n'
                          '5. Boundaries & Closure: Do not search, crawl, browse or fetch images on your own. Finish your answer '
-                         'by stating clearly what the evidence does not cover, and ask the user whether they want you to '
-                         'search further for specific missing details.\n')
+                         'by stating clearly what the evidence does not cover, then ask the user whether they want a deep '
+                         'crawl of specific sources above (full page text) or another research round for the missing details.\n')
                 if images is not None and images.delivered:
                     packet+=('This evidence includes downloaded images: place the one or two most relevant '
                              '[[image: …]] markers from the Images list, copied exactly, on their own lines '

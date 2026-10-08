@@ -39,6 +39,8 @@ test('guarded: research done blocks follow-up lookups unless the user asked for 
  assert.deepEqual(await turn({assistant: 'Want me to search for more?', user: 'ok'}), {crawl: false, research: false});
  assert.deepEqual(await turn({assistant: '要用這張當頭像嗎？', user: '好啊'}), {crawl: true, research: true});
  assert.deepEqual(await turn({user: '生成兔娘', skill: true}), {crawl: false, research: true});
+ assert.deepEqual(await turn({assistant: '要我深度爬取這幾個來源，還是再研究缺的部分？', user: '好'}), {crawl: false, research: false});
+ assert.deepEqual(await turn({user: '深入看第二個來源'}), {crawl: false, research: false});
 });
 
 test('crawlGuards false exempts only crawl', async () => {
