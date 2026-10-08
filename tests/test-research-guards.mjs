@@ -35,6 +35,8 @@ test('guarded: research done blocks follow-up lookups unless the user asked for 
  const turn = await load({crawlGuards: true});
  assert.deepEqual(await turn({user: '[Discord user: a]\n台北天氣如何', research: false}).then(r => r.crawl), true);
  assert.deepEqual(await turn({user: '[Discord user: a]\n台北天氣如何'}), {crawl: true, research: true});
+ assert.deepEqual(await turn({user: '台南安平一日遊推薦景點'}), {crawl: true, research: true});
+ assert.deepEqual(await turn({user: '點開第一個來源'}), {crawl: false, research: false});
  assert.deepEqual(await turn({assistant: '需要我再搜尋更多資料嗎？', user: '[Discord user: a]\n好啊'}), {crawl: false, research: false});
  assert.deepEqual(await turn({assistant: 'Want me to search for more?', user: 'ok'}), {crawl: false, research: false});
  assert.deepEqual(await turn({assistant: '要用這張當頭像嗎？', user: '好啊'}), {crawl: true, research: true});

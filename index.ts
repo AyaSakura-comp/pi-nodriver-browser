@@ -490,7 +490,7 @@ export default function (pi: ExtensionAPI) {
   const researchTried = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
   const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
-  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|再研究|深入|深度|deep|browser|瀏覽|打開|開啟|網站|網頁|點/i;
+  const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|再研究|深入|深度|deep|browser|瀏覽|打開|開啟|網站|網頁|點擊|點開|點進|點選/i;
   // The guard tells the agent to offer a deep crawl or more research; a bare yes to that
   // question must unlock follow-up lookups like an explicit request does.
   const AFFIRMATIVE = /^(好|好啊|好喔|好的|好呀|要|要啊|可以|可|嗯|對|是|行|麻煩|麻煩了|請|拜託|查|搜|ok|okay|yes|yep|sure|go|y)[\s!！。.~～，,]*$/i;
