@@ -1,10 +1,13 @@
 """Operator-requested worker replacement, preserving existing Chrome and Xvfb.
 Never invokes Browser.close, restarts Chrome, or touches its profile/cookies.
+Only for the legacy layout (worker spawned as a plain child of a Pi process); a worker in
+its own pi-nodriver-browser-* unit cannot be replaced without stopping that unit.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -19,6 +22,12 @@ UNIT = 'nodriver-browser-worker.service'
 
 def argv(pid):
     return (Path('/proc') / str(pid) / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+
+
+def browser_unit_of(cgroup):
+    """Dedicated browser unit (worker-launch.ts) of a worker, or None for the legacy layout."""
+    match = re.search(r'/(pi-nodriver-browser-[0-9a-f]+\.service)$', cgroup.strip())
+    return match.group(1) if match else None
 
 
 def main():
@@ -40,6 +49,14 @@ def main():
     expected = [str(ROOT / '.venv/bin/python'), str(ROOT / 'worker.py'), '--server', str(SOCKET)]
     if argv(pid) != expected:
         raise ValueError('worker argv mismatch; refusing process control')
+    # In its own unit the worker's xvfb-run wrapper is the unit's main process: killing it
+    # ends the unit, and systemd then stops Xvfb and every Chrome helper too.
+    browser_unit = browser_unit_of((proc / 'cgroup').read_text())
+    if browser_unit:
+        raise ValueError(
+            f'worker runs in its own browser unit {browser_unit} together with Xvfb and Chrome; '
+            'replacing only the worker would stop Chrome as well. To restart the whole browser '
+            f'(profile and cookies are kept, open tabs are not): systemctl --user stop {browser_unit}')
     status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
     parent = int(status['PPid'])
     parent_args = argv(parent)
@@ -50,7 +67,7 @@ def main():
     env = {}
     for field in (proc / 'environ').read_bytes().split(b'\0'):
         key, sep, value = field.partition(b'=')
-        if sep and key.decode().startswith(('PI_NODRIVER_', 'PI_RESEARCH_')):
+        if sep and key.decode().startswith(('PI_NODRIVER_', 'PI_RESEARCH_', 'RESEARCH_')):
             env[key.decode()] = value.decode()
     if args.reload and (not active or env.get('PI_NODRIVER_ATTACH_PORT') != str(args.port)):
         raise ValueError('reload requires the active, attach-only managed worker on the same Chrome port')

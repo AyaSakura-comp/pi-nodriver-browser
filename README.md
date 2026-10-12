@@ -181,6 +181,7 @@ on a clean machine; do not treat it as a one-command, fully automated installer.
 
 ## 📚 Design Documents
 
+- [Shared Browser Restart Isolation](docs/shared-browser-restart-isolation.md) — why every PiWeb/Pi service restart killed the shared Chrome (its helpers and Xvfb lived in the restarted unit), the reproduction, the dedicated `pi-nodriver-browser-*` user unit, attach-only self-exit, prompt worker shutdown, and the resulting behavior changes.
 - [Browser Timeout Recovery: Cyclic DOM Walks and Connection Cleanup](docs/browser-timeout-recovery.md) — confirmed traversal-loop diagnosis, bounded walkers, disconnected-client cancellation, attach-only recovery through the existing service hub, regression tests, and verification limitations.
 - [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
@@ -447,6 +448,7 @@ flowchart LR
 #### 6. Daemon Lifecycle, Self-Healing & Zombie Lock Reclamation
 * **Cycle-safe DOM walks**: Snapshot and semantic-action walkers deduplicate document roots/nodes and enforce traversal budgets; snapshots mark returned rows when truncated. Literal-ref click resolution avoids measuring unrelated page nodes. See [timeout diagnosis and limits](docs/browser-timeout-recovery.md).
 * **Disconnected client cleanup**: A closed socket cancels that connection's active command tasks before draining them, allowing cooperative commands to release their session locks. This does not authorize replaying an action whose outcome is uncertain.
+* **Restart-isolated browser**: On Linux, when the user systemd manager outlives the Pi process (Pi runs under it, or the user lingers), the worker, Xvfb and Chrome run in their own transient `pi-nodriver-browser-<id>` unit instead of the unit of whichever Pi process started them, so restarting PiWeb or another Pi host no longer kills the shared browser. Environment variables are forwarded by name only (values never in argv). Otherwise (no user manager, a login session without lingering, or `PI_NODRIVER_SYSTEMD=0`) the worker starts as a detached child as before. See [restart isolation](docs/shared-browser-restart-isolation.md).
 * **Attach-only maintenance**: An explicitly configured local `PI_NODRIVER_ATTACH_PORT` reconnects the worker to existing Chrome. Normal attached shutdown detaches CDP rather than closing the shared browser; session/ref maps are not transferred. Operator scripts and caveats are documented in the [recovery guide](docs/browser-timeout-recovery.md).
 * **Active Socket Probing**: When `worker.py --server` starts, if `nodriver-browser.sock.lock` is currently held, it performs a real-time health probe on the UNIX socket. If the lock holder is dead, hung, or missing its socket, the new worker automatically terminates the zombie process and reclaims the lock without deadlock.
 * **Dead Socket Unlinking & Transparent Auto-Retry**: The TypeScript extension (`index.ts`) unlinks stale sockets prior to spawning and transparently retries requests if a connection drop occurs, ensuring zero agent disruption during worker respawns.
@@ -941,7 +943,8 @@ Laya decisions at `http://127.0.0.1:8000/v1/systemone`.
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix socket between Pi and the browser worker (the intent router uses the same one). |
 | `PI_NODRIVER_PROFILE` | built-in profile dir | Chrome user-data directory (cookies and logins persist here). |
 | `PI_NODRIVER_CHROME` | auto-detect | Path to the Chrome/Chromium executable. |
-| `PI_NODRIVER_ATTACH_PORT` | unset | Explicit operator-maintenance mode: attach to existing Chrome on `127.0.0.1:<port>` instead of launching it. Worker session/ref maps are not migrated. |
+| `PI_NODRIVER_SYSTEMD` | `1` | `0` starts the worker as a detached child of the Pi process (the previous layout) instead of its own `pi-nodriver-browser-*` user unit. Only that layout lets a restart of the Pi host's service kill the shared browser. |
+| `PI_NODRIVER_ATTACH_PORT` | unset | Explicit operator-maintenance mode: attach to existing Chrome on `127.0.0.1:<port>` instead of launching it. Worker session/ref maps are not migrated. The worker exits by itself once nothing listens on that port any more. |
 | `PI_NODRIVER_DETACH_TIMEOUT` | `2` | Best-effort CDP-detach await in seconds for an attached worker; not a hard bound on entire service shutdown. |
 | `PI_NODRIVER_NO_SANDBOX` | unset | `1` starts Chrome with `--no-sandbox` (containers/root only). |
 | `PI_NODRIVER_DOWNLOAD_DIR` | worker default | Where downloads are saved. |
@@ -1072,8 +1075,10 @@ The test strategy is layered so fast state-machine checks run on every change, w
 |---|---|---|---|
 | Pure logic | `tests/test_browser_logic.py`, `tests/test_popup_logic.py` | Parsing, snapshots, repeated-command guards, open streaks, LRU ordering, protected targets, download isolation | Always runs |
 | Worker state machine | `tests/test_worker_integration.py` unit cases | 30-tab LRU simulation, failed-close rollback, stale-target reconciliation, hung-preflight isolation, durable popup quarantine, target-bound close races, nested popup opener recovery, active-target cleanup, download-route preservation, crawl slot reservation, frame-route cleanup | Always runs with fake tabs/browser |
+| Worker lifecycle | `tests/test_worker_lifecycle.py`, `tests/worker-launch.test.ts`, `tests/test_worker_reconnect.py` | Prompt SIGTERM with idle clients, attach-only startup guard and Chrome-loss exit, systemd-run argv/environment forwarding and fallbacks, operator-helper layout detection | Always runs (no Chrome) |
 | Packaging | `tests/test_install.py` | Staging-only runtime copy/imports and static installer contracts; lifecycle commands stubbed | Always runs in a temporary directory; never installs or stops services |
 | Real browser | `tests/test_worker_integration.py`, `tests/test_daemon_integration.py` | Headful Chrome navigation, popups, downloads, multi-session isolation, cancellation, daemon persistence | Opt-in with `RUN_BROWSER_INTEGRATION=1` |
+| Restart isolation | `tests/test_systemd_browser_unit.py` | Real Chrome started by the launcher from a disposable parent unit survives stopping that unit; stopping the browser unit is prompt and complete | Opt-in with `RUN_SYSTEMD_INTEGRATION=1` (user systemd, xvfb-run, node) |
 | Agent E2E | Manual release gate | Pi/Qwen tool routing, third-open rejection, real 30-tab LRU behavior, recently touched tab survival, eight-part CoolPC selection, same-origin iframe report generation | Run before deployment of lifecycle or semantic-action changes |
 
 ### Fast Suite
@@ -1085,9 +1090,13 @@ Use the extension's isolated Python environment so the Nodriver version matches 
 ```bash
 PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
+# TypeScript tests (Node.js 22.18+ strips types natively):
+for test in tests/*.test.ts tests/test-*.mjs; do node --test "$test" || exit; done
+# Restart isolation with real Chrome under user systemd (opt-in):
+RUN_SYSTEMD_INTEGRATION=1 "$PYTHON" -m unittest tests.test_systemd_browser_unit -v
 ```
 
-The 2026-10-13 staged-source offline verification discovered **731 tests**: **641 executed successfully and 90 skipped**. The matching baseline passed 712 tests with the same 90 skips; the change adds 19 focused methods. Counts evolve with the suite; use the actual runner output as authoritative. Real-browser integration remains opt-in.
+For the 2026-10-13 restart-isolation change, the staged-source offline run discovered **739 tests**: **648 executed successfully and 91 skipped** (the added skip is the opt-in systemd test). The matching baseline passed 731 tests with 90 skips. All 50 TypeScript tests pass with `node --test`. Counts evolve with the suite; use the actual runner output as authoritative. Real-browser and systemd integration remain opt-in.
 
 ### Real Headful Chrome / Xvfb Suite
 

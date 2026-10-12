@@ -44,11 +44,14 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("'command': 'shutdown'", installer_source)
             extension = agent_dir / 'extensions/nodriver-browser'
             self.assertTrue((extension / 'index.ts').is_file())
+            self.assertTrue((extension / 'worker-launch.ts').is_file(), 'index.ts imports worker-launch.ts')
             self.assertTrue((extension / 'worker.py').is_file())
             self.assertTrue((extension / 'browser_logic.py').is_file())
             extension_source = (extension / 'index.ts').read_text()
             self.assertIn('createConnection', extension_source)
-            self.assertIn('--server', extension_source)
+            # The worker is started in server mode by the staged launcher module.
+            self.assertIn('launchWorker', extension_source)
+            self.assertIn('--server', (extension / 'worker-launch.ts').read_text())
             self.assertIn('worker.disconnect()', extension_source)
             self.assertIn('ctx.sessionManager.getSessionId()', extension_source)
             self.assertIn('sessionId', extension_source)

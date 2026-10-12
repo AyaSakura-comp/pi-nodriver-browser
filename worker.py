@@ -2348,11 +2348,49 @@ PAGE_PROGRESS_FINGERPRINT_JS = r'''(() => {
 })()'''
 
 
+# An attach-only worker (PI_NODRIVER_ATTACH_PORT) does not own the Chrome it drives. When
+# that Chrome exits, the worker must exit too: otherwise it keeps the shared socket, Pi never
+# starts a fresh browser, and every call stalls (2026-10-13: research hit its 30 s deadline).
+SHARED_BROWSER_PROBE_INTERVAL = 2.0
+SHARED_BROWSER_LOST_AFTER_REFUSALS = 2
+
+
+def shared_browser_attach_port():
+    """PI_NODRIVER_ATTACH_PORT as an int, or None for a worker that launches its own Chrome."""
+    value = os.environ.get('PI_NODRIVER_ATTACH_PORT')
+    if not value:
+        return None
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError('PI_NODRIVER_ATTACH_PORT must be a valid local port')
+    return port
+
+
+async def cdp_port_state(port, timeout=1.0):
+    """'refused' only when nothing listens on the DevTools port any more. A busy or hung
+    Chrome still completes the TCP handshake, so slowness never counts as death."""
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection('127.0.0.1', port), timeout=timeout)
+    except ConnectionRefusedError:
+        return 'refused'
+    except (OSError, asyncio.TimeoutError):
+        return 'unknown'
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return 'listening'
+
+
 class BrowserWorker:
     def __init__(self):
         self.browser = None
         self.launched_browser = None
         self.shared_browser_attached = False
+        # Set by server_main: asks the server to exit when an attached shared Chrome is gone.
+        self.on_shared_browser_lost = None
         self.pages = {}
         self.image_search_jobs = {}
         self.lens_result_refs = {}
@@ -3997,13 +4035,18 @@ class BrowserWorker:
                 self.active_target_counts.clear()
                 self.session_action_targets.clear()
                 self.quarantined_target_ids.clear()
-        attach_port = os.environ.get('PI_NODRIVER_ATTACH_PORT')
-        if self.browser is None and attach_port:
-            port = int(attach_port)
-            if not 1 <= port <= 65535:
-                raise ValueError('PI_NODRIVER_ATTACH_PORT must be a valid local port')
+        attach_port = shared_browser_attach_port()
+        if self.browser is None and attach_port is not None:
+            if await cdp_port_state(attach_port) == 'refused':
+                # Never launch a replacement from an attach-only worker (the profile may still
+                # be locked); exit so Pi starts a normal worker that owns a fresh browser.
+                if self.on_shared_browser_lost is not None:
+                    self.on_shared_browser_lost(f'shared Chrome on 127.0.0.1:{attach_port} has exited')
+                raise RuntimeError(
+                    f'shared Chrome on 127.0.0.1:{attach_port} has exited; this attach-only worker '
+                    'is shutting down. Retry: the next browser call starts a fresh browser.')
             # Reconnect a repaired worker without launching/resetting shared Chrome.
-            self.browser = await uc.start(host='127.0.0.1', port=port)
+            self.browser = await uc.start(host='127.0.0.1', port=attach_port)
             self.shared_browser_attached = True
             await self.configure_browser_connection()
             return self.browser
@@ -5077,7 +5120,8 @@ class BrowserWorker:
                     pass
             else:
                 try:
-                    await self.browser.send(uc.cdp.browser.close())
+                    # Bounded: a hung browser must not hold worker shutdown; stop() follows.
+                    await asyncio.wait_for(self.browser.send(uc.cdp.browser.close()), timeout=5)
                 except Exception:
                     pass
                 self.browser.stop()
@@ -9982,13 +10026,34 @@ async def stdio_main():
 
 async def server_main(socket_path):
     from research.jobs import ResearchConnection
+    try:
+        attach_port = shared_browser_attach_port()
+    except ValueError:
+        # A hand-set typo must not become a Restart=on-failure crash loop with a traceback.
+        print(f"invalid PI_NODRIVER_ATTACH_PORT={os.environ.get('PI_NODRIVER_ATTACH_PORT')!r}: "
+              'expected a local port 1-65535', file=sys.stderr, flush=True)
+        sys.exit(2)
+    if attach_port is not None and await cdp_port_state(attach_port) == 'refused':
+        # Nothing to attach to. Exit 0 (no Restart=on-failure loop) without taking the
+        # shared socket, so Pi starts a normal worker with its own browser.
+        print(f'attach-only worker: nothing listens on 127.0.0.1:{attach_port}; exiting',
+              file=sys.stderr, flush=True)
+        return
     worker = BrowserWorker()
     session_locks = {}
     browser_structure_lock = asyncio.Lock()
     research_slots = asyncio.Semaphore(2)
     research_connections = set()
     client_writers = set()
+    inflight_requests = set()
     stop = asyncio.Event()
+
+    def request_exit(reason):
+        if not stop.is_set():
+            print(f'browser worker exiting: {reason}', file=sys.stderr, flush=True)
+            stop.set()
+
+    worker.on_shared_browser_lost = request_exit
     path = Path(socket_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = path.with_name(path.name + '.lock').open('a+')
@@ -10130,6 +10195,8 @@ async def server_main(socket_path):
                     })
                     continue
                 task = asyncio.create_task(process_request(request))
+                inflight_requests.add(task)
+                task.add_done_callback(inflight_requests.discard)
                 active_tasks[request_id] = task
                 active_task_sessions[request_id] = str(request.get('sessionId') or 'default')
         except Exception as error:
@@ -10156,16 +10223,56 @@ async def server_main(socket_path):
         except NotImplementedError:
             pass
 
+    async def watch_shared_browser():
+        refusals = 0
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=SHARED_BROWSER_PROBE_INTERVAL)
+                return
+            except asyncio.TimeoutError:
+                pass
+            refusals = refusals + 1 if await cdp_port_state(attach_port) == 'refused' else 0
+            if refusals >= SHARED_BROWSER_LOST_AFTER_REFUSALS:
+                request_exit(f'shared Chrome on 127.0.0.1:{attach_port} stopped listening')
+                return
+
     server = await asyncio.start_unix_server(handle_client, path=str(path), limit=128*1024)
     path.chmod(0o600)
+    watchdog = asyncio.create_task(watch_shared_browser()) if attach_port is not None else None
     try:
-        async with server:
-            await stop.wait()
+        await stop.wait()
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         server.close()
-        await server.wait_closed()
-        await asyncio.gather(*(connection.close() for connection in tuple(research_connections)), return_exceptions=True)
-        await worker.close()
+        # Let requests that are already finishing deliver their responses first (e.g. the
+        # fast "shared Chrome has exited" error that triggered this exit), bounded.
+        unfinished = tuple(task for task in inflight_requests if not task.done())
+        if unfinished:
+            await asyncio.wait(unfinished, timeout=2)
+        # Python >= 3.12.1: wait_closed() (also via `async with server`) waits for every
+        # connected client, and each Pi process keeps one idle connection open. Close
+        # them first; otherwise SIGTERM blocks until systemd escalates to SIGKILL.
+        if hasattr(server, 'close_clients'):
+            server.close_clients()
+        for writer in tuple(client_writers):
+            writer.close()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        # Bounded so one wedged research job or browser connection cannot hold the exit
+        # until systemd's SIGKILL; the socket and lock below are released either way.
+        try:
+            await asyncio.wait_for(asyncio.gather(
+                *(connection.close() for connection in tuple(research_connections)),
+                return_exceptions=True), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.wait_for(worker.close(), timeout=10)
+        except asyncio.TimeoutError:
+            pass
         path.unlink(missing_ok=True)
         env_info_path.unlink(missing_ok=True)
         fcntl.flock(lock_file, fcntl.LOCK_UN)

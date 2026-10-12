@@ -10,7 +10,7 @@ PI_NODRIVER_SOCKET="${PI_NODRIVER_SOCKET:-$PI_AGENT_DIR/nodriver-browser.sock}"
 copy_runtime() {
   local target="$1"
   mkdir -p "$target/research" "$target/intent"
-  install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$target/"
+  install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$ROOT/worker-launch.ts" "$target/"
   install -m 0644 "$ROOT/intent/"*.py "$ROOT/intent/"*.ts "$target/intent/"
   install -m 0755 "$ROOT/worker.py" "$target/worker.py"
   install -m 0644 "$ROOT/browser_logic.py" "$ROOT/requirements.txt" "$target/"

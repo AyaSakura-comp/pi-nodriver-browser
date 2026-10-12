@@ -130,6 +130,12 @@ and operator approval are required. It is not a general-purpose tab killer.
 
 ### Worker reconnect / reload (explicit operator authorization required)
 
+> **Legacy layout only.** Since 2026-10-13 the launcher starts the worker in its own
+> `pi-nodriver-browser-*` user unit together with Xvfb and Chrome. Replacing only that
+> worker would stop the unit and Chrome, so the helper refuses it; restart the whole
+> unit instead. An attach-only worker now also exits by itself when its Chrome stops
+> listening. See [shared browser restart isolation](shared-browser-restart-isolation.md).
+
 ```sh
 bash "$HUB/resolve-browser.sh" --reconnect-worker --port "$CDP_PORT" --dry-run
 bash "$HUB/resolve-browser.sh" --reconnect-worker --port "$CDP_PORT"

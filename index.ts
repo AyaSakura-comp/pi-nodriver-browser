@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import { readBrowserConfig } from "./browser-config.ts";
+import { launchWorker, type LaunchedWorker } from "./worker-launch.ts";
 import registerIntent from "./intent/tool.ts";
 import { randomUUID } from "node:crypto";
 import { ResearchPlanner, hostClock } from "./research-model.ts";
@@ -222,7 +222,7 @@ class NodriverWorker {
     if (!existsSync(PYTHON)) {
       throw new Error(`Nodriver browser environment is missing. Run: python3 -m venv ${join(ROOT, ".venv")} && ${PYTHON} -m pip install nodriver`);
     }
-    let child: ReturnType<typeof spawn> | undefined;
+    let launched: LaunchedWorker | undefined;
     try {
       const socket = await this.openSocket();
       this.attach(socket);
@@ -232,14 +232,9 @@ class NodriverWorker {
         unlinkSync(SOCKET);
       } catch {}
       const screen = process.env.PI_NODRIVER_SCREEN || (process.env.PI_NODRIVER_FRAME_WIDTH === "390" ? "500x1000x24" : "1366x768x24");
-      const env = { ...process.env };
-      delete env.WAYLAND_DISPLAY;
-      child = spawn(
-        "xvfb-run",
-        ["-a", "-s", `-screen 0 ${screen}`, PYTHON, WORKER, "--server", SOCKET],
-        { cwd: ROOT, stdio: "ignore", detached: true, env },
-      );
-      child.unref();
+      // Own systemd unit when available: restarting this Pi process's service must not
+      // take the shared Xvfb/Chrome down with it (worker-launch.ts).
+      launched = await launchWorker({ root: ROOT, python: PYTHON, worker: WORKER, socket: SOCKET, screen });
     }
 
     let lastError: unknown;
@@ -253,13 +248,7 @@ class NodriverWorker {
         lastError = error;
       }
     }
-    if (child?.pid) {
-      try {
-        process.kill(-child.pid, "SIGTERM");
-      } catch {
-        // Process may already have exited while the final connection attempt ran.
-      }
-    }
+    launched?.stop();
     throw lastError instanceof Error ? lastError : new Error("Browser daemon did not start");
   }
 
