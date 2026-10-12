@@ -432,6 +432,12 @@ DISMISS_OVERLAY_JS = r'''JSON.stringify(((policy) => {
 
 SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
   const seen = new Set();
+  const visitedRoots = new Set();
+  const visitedNodes = new Set();
+  // Skipped roots may retain old attributes: bind refs to this snapshot's nodes.
+  const snapshotState = {refs: new WeakMap(), roots: visitedRoots};
+  document.__piSnapshotState = snapshotState;
+  let traversalTruncated = false;
   const entries = [];
   const semanticSelector = 'a,button,input,textarea,select,summary,details,' +
     '[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],' +
@@ -510,30 +516,39 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
     if (sibling && sibling.length <= 120) return sibling;
     return shortText(el.getAttribute('name') || el.id);
   };
-  const visit = (root, frames = []) => {
+  const visit = (root, frames = [], depth = 0) => {
+    if (!root || visitedRoots.has(root)) return;
+    if (depth > 12 || visitedRoots.size >= 256 || visitedNodes.size >= 20000) {
+      traversalTruncated = true;
+      return;
+    }
+    visitedRoots.add(root);
     try {
       root.querySelectorAll('[data-pi-ref]').forEach(el => {
         el.removeAttribute('data-pi-ref');
         el.removeAttribute('data-pi-full-page');
       });
       root.querySelectorAll('*').forEach(el => {
+        if (visitedNodes.has(el)) return;
+        if (visitedNodes.size >= 20000) { traversalTruncated = true; return; }
+        visitedNodes.add(el);
         if (!seen.has(el) && visible(el) && interactive(el)) {
           seen.add(el);
           entries.push({ el, frames });
         }
-        if (el.shadowRoot && visible(el)) visit(el.shadowRoot, frames);
+        if (el.shadowRoot && visible(el)) visit(el.shadowRoot, frames, depth + 1);
         if (el.tagName === 'IFRAME' && visible(el)) {
-          try { if (el.contentDocument) visit(el.contentDocument, [...frames, el]); } catch (_) {}
+          try { if (el.contentDocument) visit(el.contentDocument, [...frames, el], depth + 1); } catch (_) {}
         }
       });
     } catch (_) {}
   };
   visit(document);
 
-  return entries.map(({ el, frames }, index) => {
+  // Read geometry/text for every control before mutating ref attributes.
+  // Interleaving writes and reads forces repeated layout on large SPA pages.
+  const snapshot = entries.map(({ el, frames }, index) => {
     const ref = `e${index + 1 + (__PI_REF_OFFSET__)}`;
-    el.setAttribute('data-pi-ref', ref);
-    if (fullPage) el.setAttribute('data-pi-full-page', 'true');
     const frame = frames.map(item => {
       const named = item.getAttribute('title') || item.getAttribute('aria-label') || item.name || item.id;
       if (named) return named;
@@ -593,6 +608,7 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
     );
     return {
       ref,
+      snapshotTruncated: traversalTruncated || null,
       tag: el.tagName.toLowerCase(),
       text: (el.innerText || el.textContent || '').trim(),
       value: sensitive ? '' : (el.value || ''),
@@ -633,6 +649,12 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
         : null
     };
   });
+  entries.forEach(({ el }, index) => {
+    el.setAttribute('data-pi-ref', snapshot[index].ref);
+    snapshotState.refs.set(el, snapshot[index].ref);
+    if (fullPage) el.setAttribute('data-pi-full-page', 'true');
+  });
+  return snapshot;
 })(__PI_FULL_PAGE__))'''
 
 SNAPSHOT_JS = SNAPSHOT_JS_TEMPLATE.replace('__PI_FULL_PAGE__', 'false').replace('__PI_REF_OFFSET__', '0')
@@ -1090,11 +1112,20 @@ SELECT_OPTIONS_JS = r'''JSON.stringify((() => {
     return shortText(el.getAttribute('name') || el.id);
   };
   const results = [];
+  const snapshotState = document.__piSnapshotState;
+  const visitedRoots = new Set(), visitedNodes = new Set();
   const visit = (root, frames = []) => {
+    if (!root || visitedRoots.has(root) || visitedRoots.size >= 256 || frames.length > 12 ||
+        (snapshotState && !snapshotState.roots.has(root))) return;
+    visitedRoots.add(root);
     let elements = [];
     try { elements = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
     for (const element of elements) {
+      if (visitedNodes.has(element)) continue;
+      if (visitedNodes.size >= 20000) return;
+      visitedNodes.add(element);
       if (element.tagName === 'SELECT' && element.getAttribute('data-pi-ref') &&
+          (!snapshotState || snapshotState.refs.get(element) === element.getAttribute('data-pi-ref')) &&
           visible(element) && !element.matches(':disabled') && element.getAttribute('aria-disabled') !== 'true') {
         results.push({
           ref: element.getAttribute('data-pi-ref'),
@@ -1162,11 +1193,18 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
       el.getAttribute('title'));
   };
   const entries = [];
+  const snapshotState = document.__piSnapshotState;
+  const visitedRoots = new Set(), visitedNodes = new Set();
 
   const visit = (root, offsetX = 0, offsetY = 0, frames = []) => {
+    if (!root || visitedRoots.has(root) || visitedRoots.size >= 256 || frames.length > 12) return;
+    visitedRoots.add(root);
     let all = [];
     try { all = Array.from(root.querySelectorAll('*')); } catch (_) { return; }
     for (const el of all) {
+      if (visitedNodes.has(el)) continue;
+      if (visitedNodes.size >= 20000) return;
+      visitedNodes.add(el);
       if (visible(el)) entries.push({ el, offsetX, offsetY, frames });
       if (el.shadowRoot && visible(el)) visit(el.shadowRoot, offsetX, offsetY, frames);
       if (el.tagName === 'IFRAME' && visible(el)) {
@@ -1177,9 +1215,43 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
       }
     }
   };
-  visit(document);
+  // Snapshot refs already identify a small set of tagged controls. Measuring
+  // every unrelated DOM node here forces expensive layout on large dashboards.
+  // Resolve refs first; only descend into visible shadow/frame hosts if absent.
+  const visitedRefRoots = new Set();
+  const findRef = (root, offsetX = 0, offsetY = 0, frames = []) => {
+    if (!root || visitedRefRoots.has(root) || visitedRefRoots.size >= 256 || frames.length > 12 ||
+        (snapshotState && !snapshotState.roots.has(root))) return null;
+    visitedRefRoots.add(root);
+    let candidates = [], all = [];
+    try { candidates = Array.from(root.querySelectorAll('[data-pi-ref]')); }
+    catch (_) { return null; }
+    for (const el of candidates) {
+      if (el.getAttribute('data-pi-ref') === request.value &&
+          (!snapshotState || snapshotState.refs.get(el) === request.value) && visible(el)) {
+        return { el, offsetX, offsetY, frames };
+      }
+    }
+    try { all = Array.from(root.querySelectorAll('*')); } catch (_) { return null; }
+    for (const el of all) {
+      if (el.shadowRoot && visible(el)) {
+        const found = findRef(el.shadowRoot, offsetX, offsetY, frames);
+        if (found) return found;
+      }
+      if (el.tagName === 'IFRAME' && visible(el)) {
+        try {
+          const rect = el.getBoundingClientRect();
+          const found = findRef(el.contentDocument, offsetX + rect.left,
+            offsetY + rect.top, [...frames, el]);
+          if (found) return found;
+        } catch (_) {}
+      }
+    }
+    return null;
+  };
+  let match = request.kind === 'ref' ? findRef(document) : null;
+  if (request.kind !== 'ref') visit(document);
 
-  let match = null;
   let invalidSelector = false;
   if (request.kind === 'css') {
     try {
@@ -1190,7 +1262,7 @@ CLICK_TARGET_JS = r'''JSON.stringify(((request) => {
   }
   if (!invalidSelector) {
     if (request.kind === 'ref') {
-      match = entries.find(item => item.el.getAttribute('data-pi-ref') === request.value) || null;
+      // findRef above preserves visibility, frame offsets, and full-page refs.
     } else if (request.kind === 'css') {
       match = entries.find(item => {
         try { return item.el.matches(request.value); }
@@ -1334,11 +1406,21 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
         rect.bottom > 0 && rect.right > 0 && rect.top < view.innerHeight && rect.left < view.innerWidth;
     } catch (_) { return false; }
   };
+  const snapshotState = document.__piSnapshotState;
+  const visitedRoots = new Set(), visitedNodes = new Set();
   const visit = (root, frames = [], shadowHosts = []) => {
+    if (!root || visitedRoots.has(root) || visitedRoots.size >= 256 ||
+        frames.length + shadowHosts.length > 12 ||
+        (snapshotState && !snapshotState.roots.has(root))) return null;
+    visitedRoots.add(root);
     let elements = [];
     try { elements = Array.from(root.querySelectorAll('*')); } catch (_) { return null; }
     for (const element of elements) {
-      if (element.getAttribute?.('data-pi-ref') === request.ref) {
+      if (visitedNodes.has(element)) continue;
+      if (visitedNodes.size >= 20000) return null;
+      visitedNodes.add(element);
+      if (element.getAttribute?.('data-pi-ref') === request.ref &&
+          (!snapshotState || snapshotState.refs.get(element) === request.ref)) {
         return { element, frames, shadowHosts };
       }
       if (element.shadowRoot) {
@@ -2270,6 +2352,7 @@ class BrowserWorker:
     def __init__(self):
         self.browser = None
         self.launched_browser = None
+        self.shared_browser_attached = False
         self.pages = {}
         self.image_search_jobs = {}
         self.lens_result_refs = {}
@@ -3914,6 +3997,16 @@ class BrowserWorker:
                 self.active_target_counts.clear()
                 self.session_action_targets.clear()
                 self.quarantined_target_ids.clear()
+        attach_port = os.environ.get('PI_NODRIVER_ATTACH_PORT')
+        if self.browser is None and attach_port:
+            port = int(attach_port)
+            if not 1 <= port <= 65535:
+                raise ValueError('PI_NODRIVER_ATTACH_PORT must be a valid local port')
+            # Reconnect a repaired worker without launching/resetting shared Chrome.
+            self.browser = await uc.start(host='127.0.0.1', port=port)
+            self.shared_browser_attached = True
+            await self.configure_browser_connection()
+            return self.browser
         if self.browser is None:
             profile = resolve_profile_dir()
             profile.mkdir(parents=True, exist_ok=True)
@@ -3992,15 +4085,18 @@ class BrowserWorker:
                         continue
                 if self.browser is None:
                     raise startup_error
-            self.download_dir.mkdir(parents=True, exist_ok=True)
-            self.browser.add_handler(uc.cdp.target.TargetCreated, self.on_target_created)
-            self.browser.add_handler(uc.cdp.browser.DownloadWillBegin, self.on_download_will_begin)
-            self.browser.add_handler(uc.cdp.browser.DownloadProgress, self.on_download_progress)
-            await self.browser.send(uc.cdp.browser.set_download_behavior(
-                'allow', download_path=str(self.download_dir), events_enabled=True
-            ))
-            self.browser_verified_at = time.monotonic()
+            await self.configure_browser_connection()
         return self.browser
+
+    async def configure_browser_connection(self):
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.browser.add_handler(uc.cdp.target.TargetCreated, self.on_target_created)
+        self.browser.add_handler(uc.cdp.browser.DownloadWillBegin, self.on_download_will_begin)
+        self.browser.add_handler(uc.cdp.browser.DownloadProgress, self.on_download_progress)
+        await self.browser.send(uc.cdp.browser.set_download_behavior(
+            'allow', download_path=str(self.download_dir), events_enabled=True
+        ))
+        self.browser_verified_at = time.monotonic()
 
     @staticmethod
     def path_has_symlink_component(path):
@@ -4968,11 +5064,23 @@ class BrowserWorker:
                 # let artifact cleanup prevent later sessions or browser shutdown.
                 pass
         if self.browser is not None:
-            try:
-                await self.browser.send(uc.cdp.browser.close())
-            except Exception:
-                pass
-            self.browser.stop()
+            if self.shared_browser_attached:
+                # Close only our CDP connection. The browser and its login profile
+                # belong to all sessions, not to this reconnected worker.
+                try:
+                    await asyncio.wait_for(self.browser.aclose(), timeout=float(
+                        os.environ.get('PI_NODRIVER_DETACH_TIMEOUT', '2')
+                    ))
+                except TimeoutError:
+                    # A stuck CDP listener must not hold worker replacement forever.
+                    # Do not fall back to stop/Browser.close on a shared browser.
+                    pass
+            else:
+                try:
+                    await self.browser.send(uc.cdp.browser.close())
+                except Exception:
+                    pass
+                self.browser.stop()
             if self.launched_browser is not None and self.launched_browser is not self.browser:
                 self.launched_browser.stop()
             self.browser = None
@@ -9940,6 +10048,8 @@ async def server_main(socket_path):
 
         async def send_response(response):
             async with write_lock:
+                if writer.is_closing():
+                    return
                 writer.write((MARKER + json.dumps(response, ensure_ascii=False) + '\n').encode())
                 await writer.drain()
 
@@ -10025,12 +10135,18 @@ async def server_main(socket_path):
         except Exception as error:
             await send_response({'id': None, 'ok': False, 'error': f'{type(error).__name__}: {error}'})
         finally:
+            # A socket timeout closes the client, not the browser operation.
+            # Cancel connection-owned requests before awaiting cleanup so abandoned
+            # commands release session/structure locks instead of blocking retries.
+            writer.close()
+            pending = tuple(active_tasks.values())
+            for task in pending:
+                task.cancel()
             await research.close()
             research_connections.discard(research)
-            if active_tasks:
-                await asyncio.gather(*tuple(active_tasks.values()), return_exceptions=True)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             client_writers.discard(writer)
-            writer.close()
             await writer.wait_closed()
 
     loop = asyncio.get_running_loop()

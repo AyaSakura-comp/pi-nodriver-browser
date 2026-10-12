@@ -181,6 +181,7 @@ on a clean machine; do not treat it as a one-command, fully automated installer.
 
 ## 📚 Design Documents
 
+- [Browser Timeout Recovery: Cyclic DOM Walks and Connection Cleanup](docs/browser-timeout-recovery.md) — confirmed traversal-loop diagnosis, bounded walkers, disconnected-client cancellation, attach-only recovery through the existing service hub, regression tests, and verification limitations.
 - [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
 - [Semantic Browser Actions: Technical Design, Workflow, and Architecture](docs/semantic-actions-technical-design.md) — same-origin iframe and Shadow DOM refs, searchable native dropdowns, transactional option selection, failure semantics, tests, and the CoolPC end-to-end workflow.
 - [Iframe Semantic Actions Implementation Plan](docs/plans/2026-08-23-iframe-semantic-actions.md) — the test-first implementation plan completed by commit `099de1b`.
@@ -444,6 +445,9 @@ flowchart LR
 ```
 
 #### 6. Daemon Lifecycle, Self-Healing & Zombie Lock Reclamation
+* **Cycle-safe DOM walks**: Snapshot and semantic-action walkers deduplicate document roots/nodes and enforce traversal budgets; snapshots mark returned rows when truncated. Literal-ref click resolution avoids measuring unrelated page nodes. See [timeout diagnosis and limits](docs/browser-timeout-recovery.md).
+* **Disconnected client cleanup**: A closed socket cancels that connection's active command tasks before draining them, allowing cooperative commands to release their session locks. This does not authorize replaying an action whose outcome is uncertain.
+* **Attach-only maintenance**: An explicitly configured local `PI_NODRIVER_ATTACH_PORT` reconnects the worker to existing Chrome. Normal attached shutdown detaches CDP rather than closing the shared browser; session/ref maps are not transferred. Operator scripts and caveats are documented in the [recovery guide](docs/browser-timeout-recovery.md).
 * **Active Socket Probing**: When `worker.py --server` starts, if `nodriver-browser.sock.lock` is currently held, it performs a real-time health probe on the UNIX socket. If the lock holder is dead, hung, or missing its socket, the new worker automatically terminates the zombie process and reclaims the lock without deadlock.
 * **Dead Socket Unlinking & Transparent Auto-Retry**: The TypeScript extension (`index.ts`) unlinks stale sockets prior to spawning and transparently retries requests if a connection drop occurs, ensuring zero agent disruption during worker respawns.
 
@@ -937,6 +941,8 @@ Laya decisions at `http://127.0.0.1:8000/v1/systemone`.
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | Unix socket between Pi and the browser worker (the intent router uses the same one). |
 | `PI_NODRIVER_PROFILE` | built-in profile dir | Chrome user-data directory (cookies and logins persist here). |
 | `PI_NODRIVER_CHROME` | auto-detect | Path to the Chrome/Chromium executable. |
+| `PI_NODRIVER_ATTACH_PORT` | unset | Explicit operator-maintenance mode: attach to existing Chrome on `127.0.0.1:<port>` instead of launching it. Worker session/ref maps are not migrated. |
+| `PI_NODRIVER_DETACH_TIMEOUT` | `2` | Best-effort CDP-detach await in seconds for an attached worker; not a hard bound on entire service shutdown. |
 | `PI_NODRIVER_NO_SANDBOX` | unset | `1` starts Chrome with `--no-sandbox` (containers/root only). |
 | `PI_NODRIVER_DOWNLOAD_DIR` | worker default | Where downloads are saved. |
 | `PI_NODRIVER_MAX_TABS` | `20` | Interactive tab limit; least-recently-used tabs are closed beyond it. |
@@ -1072,6 +1078,8 @@ The test strategy is layered so fast state-machine checks run on every change, w
 
 ### Fast Suite
 
+For the timeout fix, see the [19 focused offline checks and baseline limitations](docs/browser-timeout-recovery.md#reproducible-offline-checks). The JavaScript DOM fixtures require Node.js; target-recovery tests use the versioned `ops/` helper, not host-specific paths.
+
 Use the extension's isolated Python environment so the Nodriver version matches production:
 
 ```bash
@@ -1079,7 +1087,7 @@ PYTHON="$HOME/.pi/agent/extensions/nodriver-browser/.venv/bin/python"
 "$PYTHON" -m unittest discover -s tests -v
 ```
 
-The current suite contains **237 tests**: 180 fast tests run by default and 57 real-browser tests are skipped unless explicitly enabled.
+The 2026-10-13 staged-source offline verification discovered **731 tests**: **641 executed successfully and 90 skipped**. The matching baseline passed 712 tests with the same 90 skips; the change adds 19 focused methods. Counts evolve with the suite; use the actual runner output as authoritative. Real-browser integration remains opt-in.
 
 ### Real Headful Chrome / Xvfb Suite
 

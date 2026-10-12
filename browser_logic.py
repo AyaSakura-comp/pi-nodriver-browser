@@ -1423,6 +1423,8 @@ def format_snapshot(elements: list[dict]) -> str:
         )
     if has_select:
         lines.append('Dropdown options are searchable without opening them: find-option "keywords", then use the returned select @ref --index=N command.')
+    if any(item.get('snapshotTruncated') for item in elements):
+        lines.append('Snapshot truncated at the safe DOM traversal limit. These refs are valid, but this is not a complete listing; use a narrower view or visual inspection for omitted controls.')
     return '\n'.join(lines)
 
 
