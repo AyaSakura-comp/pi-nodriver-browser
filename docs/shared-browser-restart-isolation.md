@@ -121,10 +121,10 @@ shared Chrome were not touched. Signals and exit codes were traced with bpftrace
 | `tests/worker-launch.test.ts` (10) | Environment filtering, names-only argv, `$` escaping, unique units, fallbacks, stopping a possibly created unit before the fallback, user-manager durability (service context, lingering, login session) |
 | `tests/test_worker_reconnect.py` (2) | Dedicated-unit detection for the operator helper |
 | `tests/test_shared_browser_attach.py` (+1) | Attaching to an exited Chrome fails fast, never calls nodriver's connect, and requests the worker exit; the existing attach test now uses its own listener instead of a fixed production port |
-| Full offline suite (clean snapshots, same environment) | Baseline 731 tests, 90 skipped, OK; candidate 739 tests, 91 skipped (the opt-in systemd test), OK. TypeScript: 50 tests pass |
+| Full offline suite (clean snapshots, same environment) | Baseline 731 tests, 90 skipped, OK; candidate 740 tests, 91 skipped (the opt-in systemd test), OK. TypeScript: 53 tests pass |
 | `tests/test_systemd_browser_unit.py` (opt-in, real Chrome) | Stopping the starting unit leaves worker and Chrome alive and usable; stopping the browser unit with an idle client finishes within 10 s and removes everything. The socket path contains a literal `${HOME}`. Passes repeatedly. Negative controls fail as expected: `PI_NODRIVER_SYSTEMD=0` (worker in the starting unit) and a launcher without `$` escaping (socket created elsewhere) |
-| E6: production environment, new launcher | Worker in `pi-nodriver-browser-*`, no Chrome helper in the starting unit. Stopping it (PiWeb restart stand-in): worker and Chrome alive; research 3.51 s after the tool call, 17 pages, 9 Google results (4.79 s before the stop) |
-| E7: incident path with the new worker code | Chrome died 0.03 s after the trigger; the attach-only worker exited 0 after 2.81 s, closed its idle client, removed the socket and was not restarted. A fresh worker was listening 0.9 s later; research 3.75 s, 17 pages |
+| E6: production environment, new launcher (final code) | Worker in `pi-nodriver-browser-*`, no Chrome helper in the starting unit. Stopping it (PiWeb restart stand-in): worker and Chrome alive; research 4.14 s after the tool call, 20 pages, 9 Google results (4.02 s before the stop) |
+| E7: incident path with the new worker code (final code) | Chrome died 0.03 s after the trigger; the attach-only worker exited 0 after 2.86 s, closed its idle client, removed the socket and was not restarted. A fresh worker was listening 0.5 s later; research 3.24 s, 18 pages |
 
 ## Operations and behavior changes
 

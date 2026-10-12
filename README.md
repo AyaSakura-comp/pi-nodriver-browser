@@ -1096,7 +1096,7 @@ for test in tests/*.test.ts tests/test-*.mjs; do node --test "$test" || exit; do
 RUN_SYSTEMD_INTEGRATION=1 "$PYTHON" -m unittest tests.test_systemd_browser_unit -v
 ```
 
-For the 2026-10-13 restart-isolation change, the staged-source offline run discovered **739 tests**: **648 executed successfully and 91 skipped** (the added skip is the opt-in systemd test). The matching baseline passed 731 tests with 90 skips. All 50 TypeScript tests pass with `node --test`. Counts evolve with the suite; use the actual runner output as authoritative. Real-browser and systemd integration remain opt-in.
+For the 2026-10-13 restart-isolation change, the staged-source offline run discovered **740 tests**: **649 executed successfully and 91 skipped** (the added skip is the opt-in systemd test). The matching baseline passed 731 tests with 90 skips. All 53 TypeScript tests pass with `node --test`. Counts evolve with the suite; use the actual runner output as authoritative. Real-browser and systemd integration remain opt-in.
 
 ### Real Headful Chrome / Xvfb Suite
 
