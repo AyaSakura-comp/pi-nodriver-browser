@@ -706,7 +706,12 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                 if not ok:
                     status = "TASK_UNVERIFIED"
                     extra["hint"] = "Planner claimed done but the page text does not show the goal achieved; check before answering."
-            return {"status": status, "reason": step.get("reason"), **extra, "steps": trace, "url": st["url"],
+            if step["action"] == "done":
+                # The planner's reason is its own reading and was wrong once ($0.20/$5 for $4/$20);
+                # the verifier's evidence is what was checked against the page, so only that is kept.
+                rec["plan"].pop("reason", None)
+            reason = step.get("reason") if step["action"] == "fail" else None
+            return {"status": status, **({"reason": reason} if reason else {}), **extra, "steps": trace, "url": st["url"],
                     "title": st["title"], "text": rd["text"], "total_ms": round((time.perf_counter() - t0) * 1000)}
         box = next((b for b in (boxes if view == "full" else []) if str(b["id"]) == str(step.get("box"))), None)
         if box is not None and step["action"] == "click":

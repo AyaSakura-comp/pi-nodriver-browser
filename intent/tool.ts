@@ -408,8 +408,9 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
           }).join("\n");
           stepsBlock = `\n\n**執行動作細節序列 (${data.steps.length} 步)**:\n${stepLines}`;
         }
-        const excerpt = data.page_excerpt || data.text || data.answer || "";
-        humanSummary = `${title}${stepsBlock}\n\n- **當前網址**: ${data.url || ""}\n- **頁面標題**: ${data.title || ""}${excerpt ? `\n- **頁面資訊摘要**: ${excerpt.slice(0, 300)}` : ""}`;
+        // The page text itself is in the JSON below (text/page_excerpt); repeating it here only cost tokens.
+        const evidence = typeof data.evidence === "string" && data.evidence ? `\n- **驗證依據**: ${data.evidence}` : "";
+        humanSummary = `${title}${stepsBlock}\n\n- **當前網址**: ${data.url || ""}\n- **頁面標題**: ${data.title || ""}${evidence}`;
       } else if (data.status === "PLAN_DONE" || data.status === "PLAN_STOPPED") {
         const title = data.status === "PLAN_DONE" ? "📋 **[計劃步驟全部完成]**" : "⚠️ **[計劃步驟提前中斷]**";
         let stepsBlock = "";

@@ -89,6 +89,10 @@ class TaskAutopilotTests(unittest.TestCase):
         self.assertEqual([s["plan"]["action"] for s in res["steps"]], ["scroll", "done"])
         self.assertEqual(res["screenshot"], "/tmp/end.jpg")
         self.assertEqual(commands[-1], "screenshot")
+        # Only the verifier's evidence reaches the agent; the planner's own reading can be wrong.
+        self.assertNotIn("reason", res)
+        self.assertNotIn("reason", res["steps"][-1]["plan"])
+        self.assertEqual(res["evidence"], "Opus $4")
 
     def test_no_page_and_no_url_fails_without_screenshot(self):
         with patch.object(service, "_cmd", return_value={"text": ""}) as cmd:
@@ -173,6 +177,7 @@ class GoalExcerptTests(unittest.TestCase):
             res = service.do_task(req)
         self.assertEqual(res["status"], "TASK_FAILED")
         self.assertEqual([s["view"] for s in res["steps"]], ["compact", "full"])
+        self.assertEqual(res["reason"], "absent", "a failure keeps the planner's explanation")
         self.assertEqual(full.call_args.args[5], [], "no boxes without OmniParser")
 
 
