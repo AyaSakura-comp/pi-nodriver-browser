@@ -34,9 +34,30 @@ Laya server and multilingual-e5-small weights. Start:
 /path/to/intent-python /path/to/pi-nodriver-browser/intent/intent_service.py --port 8011
 ```
 
-The integrated extension ensures the Nodriver socket daemon is started before
-intent calls. The router's `/health` must be ready separately; direct mode does
-not require the router or its Python dependencies.
+The integrated extension checks `/health` before intent calls. If the default
+localhost:8011 router is missing, it starts `laya-intent.service` through
+`~/.hermes/skills/restart-service/scripts/resolve-browser.sh` and verifies readiness.
+It then ensures the Nodriver socket daemon is connected. A custom LAYA_INTENT_URL
+is diagnosed but never triggers repair of an unrelated local service. Direct mode
+does not require the router or its Python dependencies.
+
+### Failure resolver
+
+```json
+{"action":"resolve","target":"fetch failed / last error or status"}
+```
+
+Available in normal and task-only mode. Repairs missing local infrastructure and
+observes current page state, returning `RESOLVED` or `RESOLVE_BLOCKED`. `RESOLVED`
+means infrastructure plus observation succeeded, not that the original task or
+website is fixed. No page navigation, shared browser restart, auth bypass, guard
+reset, or original action replay occurs. Common DNS/TLS, timeout, stale target,
+NO_MATCH/AMBIGUOUS, rate limit, tab limit, provenance and confirmation failures
+return bounded next-step guidance; access gates require the user.
+
+Interrupted streams return `EXECUTION_UNCERTAIN`: observe before continuing.
+Only HTTP 404/405 from the streaming route permits falling back to `/act`;
+transport/partial-stream errors never resubmit a possibly executed action.
 
 For the existing user systemd unit, set WorkingDirectory to the installed
 `~/.pi/agent/extensions/nodriver-browser/intent`, preserving the existing Python

@@ -1,4 +1,7 @@
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { ensureIntentService, failureAdvice, streamFailure } from "./resolver.ts";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -10,7 +13,8 @@ const SERVICE = process.env.LAYA_INTENT_URL || "http://127.0.0.1:8011";
 // LAYA_INTENT_MODE=task: the agent can only hand over goals (task) and inspect (read/observe);
 // every page operation is decided inside the service.
 const TASK_ONLY = process.env.LAYA_INTENT_MODE === "task";
-const ACTIONS = TASK_ONLY ? ["task", "read", "observe", "screenshot"] : ["task", "plan", "open", "click", "fill", "select", "scroll", "read", "observe", "back", "screenshot"];
+const ACTIONS = TASK_ONLY ? ["task", "read", "observe", "screenshot", "resolve"] : ["task", "plan", "open", "click", "fill", "select", "scroll", "read", "observe", "back", "screenshot", "resolve"];
+const RESOLVE_HELP = 'Recovery: action "resolve" {target?: last error/status} checks the router, starts a missing local router through the restart-service hub, reconnects the worker and observes the page. Returns RESOLVED/RESOLVE_BLOCKED and common failure guidance. Never replays the original action, resets shared Chrome, or bypasses URL/auth/confirmation guards.';
 
 const DESCRIPTION = `Intent-level live browser (shares the nodriver Chrome session). You never see DOM or @refs: describe the element in words and the tool finds, clicks/fills, and verifies it.
 BEST DEFAULT: use action "task" {url, goal} with an exact user-supplied URL or an exact search-result URL. The browser service drives the site itself step by step (small fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with the goal-relevant page text), TASK_UNVERIFIED (check it), TASK_FAILED, TASK_STOPPED or TASK_NEEDS_CONFIRM. Put every constraint in the goal (e.g. "single unit, not a bundle; do not add to cart"). If an unindexed deep link is not returned and not provided by the user, start from the closest official parent URL that search did return and navigate through visible links to the requested item. You then only check the result and answer.
@@ -48,9 +52,9 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
     name: "browser_intent",
     label: "Browser (intent → Laya → click)",
     description: TASK_ONLY
-      ? `Live browser, goal-level only. Call {action:"task", url, goal} with an exact user-supplied URL or exact search-result URL and every constraint in the goal. If the requested deep link is not indexed and not provided by the user, use the closest official parent URL from search and navigate through visible links; never pass guessed deep URLs. The browser service performs all clicks/typing itself (fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with goal-relevant page text) / TASK_UNVERIFIED / TASK_FAILED / TASK_STOPPED / TASK_NEEDS_CONFIRM. Irreversible steps (buy, pay, delete, logout) stop with TASK_NEEDS_CONFIRM; repeat the task with confirm=true ONLY if the user explicitly asked. Use read {target} to look at the current page text. You cannot click yourself.`
-      : DESCRIPTION,
-    promptSnippet: "Operate web pages by describing what to click or fill; the tool grounds and verifies it",
+      ? RESOLVE_HELP + `\nLive browser, goal-level only. Call {action:"task", url, goal} with an exact user-supplied URL or exact search-result URL and every constraint in the goal. If the requested deep link is not indexed and not provided by the user, use the closest official parent URL from search and navigate through visible links; never pass guessed deep URLs. The browser service performs all clicks/typing itself (fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with goal-relevant page text) / TASK_UNVERIFIED / TASK_FAILED / TASK_STOPPED / TASK_NEEDS_CONFIRM. Irreversible steps (buy, pay, delete, logout) stop with TASK_NEEDS_CONFIRM; repeat the task with confirm=true ONLY if the user explicitly asked. Use read {target} to look at the current page text. You cannot click yourself.`
+      : DESCRIPTION + "\n" + RESOLVE_HELP,
+    promptSnippet: "Operate web pages by intent; resolve diagnoses and safely repairs browser failures",
     promptGuidelines: TASK_ONLY ? [
       "For web tasks, call task ONCE with an exact user-supplied URL or exact search-result URL plus the full goal. If the exact deep link is absent and not provided by the user, use the closest official parent URL returned by search and ask it to navigate through visible links; never reuse or construct the deep URL.",
       "If the result is TASK_STOPPED/TASK_FAILED/TASK_UNVERIFIED, restate the goal more precisely in one more task call or report what was found; do not loop.",
@@ -63,6 +67,7 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
       "After CLICKED, trust the returned url/title/screenshot as the new page state and decide the next intent from it.",
       "On NO_MATCH, do not repeat the same target: rephrase once with page wording, use read, or conclude the element is not available.",
       "Never set confirm=true unless the user explicitly asked for that irreversible action.",
+      'For browser_intent transport/errors, call action "resolve" with target=last error; inspect current state before retrying. Never guess URLs or blindly replay actions.',
     ],
     parameters: Type.Object({
       action: Type.Union(ACTIONS.map((a) => Type.Literal(a))),
@@ -74,7 +79,7 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         submit: Type.Optional(Type.Boolean()),
       }), { maxItems: 8, description: "plan: ordered steps" })),
       url: Type.Optional(Type.String({ description: "open: exact URL (from user, search, page candidates, or a search engine query)" })),
-      target: Type.Optional(Type.String({ description: "click/fill/scroll: description of one element; read: what to look for" })),
+      target: Type.Optional(Type.String({ description: "click/fill/scroll: description of one element; read: what to look for; resolve: last failure message/status" })),
       value: Type.Optional(Type.String({ description: "fill: text to enter; scroll: direction or offset (e.g. top, bottom, down 600)" })),
       submit: Type.Optional(Type.Boolean({ description: "fill: press Enter after typing" })),
       goal: Type.Optional(Type.String({ description: "task: the full goal with all constraints; otherwise overall task for disambiguation" })),
@@ -83,8 +88,42 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
       confirm: Type.Optional(Type.Boolean({ description: "Only for user-requested irreversible actions" })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      await ensureBrowser?.();
       const session = `intent-${ctx.sessionManager.getSessionId()}`;
+      const boundedSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(120000)]);
+      const result = (data: Record<string, unknown>) => ({
+        content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], details: data,
+      });
+      try {
+        await ensureIntentService(SERVICE, async () => {
+          try {
+            const res = await fetch(`${SERVICE}/health`, { signal: AbortSignal.any([boundedSignal, AbortSignal.timeout(3000)]) });
+            return res.ok && (await res.json()).ok === true;
+          } catch { boundedSignal.throwIfAborted(); return false; }
+        }, async () => {
+          onUpdate?.({ content: [{ type: "text", text: "🔧 Browser resolver: starting missing intent router through restart-service hub" }] });
+          const repair = await pi.exec("bash", [join(homedir(), ".hermes/skills/restart-service/scripts/resolve-browser.sh")], { signal: boundedSignal, timeout: 60000 });
+          if (repair.code !== 0) throw new Error(`Browser hub repair failed: ${repair.stderr || repair.stdout}`);
+        });
+        await ensureBrowser?.();
+        boundedSignal.throwIfAborted();
+        if (params.action === "resolve") {
+          // Observation only: no navigation, reload, original click/task, or guard reset.
+          const res = await fetch(`${SERVICE}/act`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ session, action: "observe" }), signal: boundedSignal,
+          });
+          if (!res.ok) throw new Error(`Intent observation HTTP ${res.status}`);
+          const state = await res.json();
+          return result({ status: state.status === "OBSERVED" ? "RESOLVED" : "RESOLVE_BLOCKED",
+            infrastructure: "healthy", state, retry_original: false,
+            advice: failureAdvice(params.target || state.message || ""),
+            note: "Infrastructure checked; original operation and website success are not implied. No action was replayed." });
+        }
+      } catch (error) {
+        if (boundedSignal.aborted) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        return result({ status: "RESOLVE_BLOCKED", phase: "preflight", message, advice: failureAdvice(message), retry_original: false });
+      }
       const isPlan = params.action === "plan" && Array.isArray(params.steps) && params.steps.length > 0;
       const isTask = params.action === "task";
 
@@ -195,9 +234,17 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
-          signal,
+          signal: boundedSignal,
         });
-        if (streamRes.ok && streamRes.body) {
+        // A missing streaming route cannot have dispatched the page action.
+        if (streamRes.status === 404 || streamRes.status === 405) {
+          const res = await fetch(`${SERVICE}/act`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload), signal: boundedSignal,
+          });
+          if (!res.ok) throw new Error(`Intent HTTP ${res.status}`);
+          data = await res.json();
+        } else if (streamRes.ok && streamRes.body) {
           const reader = streamRes.body.getReader();
           const decoder = new TextDecoder();
           let buf = "";
@@ -270,14 +317,12 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         if (!data || Object.keys(data).length === 0) {
           throw new Error("No data received from stream");
         }
-      } catch {
-        const res = await fetch(`${SERVICE}/act`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
-          signal,
-        });
-        data = (await res.json()) as Record<string, unknown>;
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        data = streamFailure(error);
+      }
+      if (["ERROR", "NO_MATCH", "AMBIGUOUS", "PICK_EXPIRED", "TASK_FAILED", "TASK_STOPPED", "NEEDS_CONFIRM", "TASK_NEEDS_CONFIRM"].includes(String(data.status))) {
+        data.resolver = { action: "resolve", advice: failureAdvice(`${data.status} ${data.message || data.hint || ""}`) };
       }
       const shot = typeof data.screenshot === "string" ? data.screenshot : undefined;
       const { screenshot: _s, ...rest } = data;
