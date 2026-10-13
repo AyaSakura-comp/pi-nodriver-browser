@@ -37,3 +37,7 @@ test('lost stream never authorizes replay', () => {
   assert.equal(r.retry_original, false);
   assert.match(r.hint, /resolve/);
 });
+test('busy planner gets a safe-retry hint, not the may-have-executed timeout hint', () => {
+  const advice = failureAdvice('ERROR RuntimeError: planner model at 127.0.0.1:8001 did not answer within 30s (server busy or down); no page action was taken for this step');
+  assert.equal(advice.code, 'PLANNER_BUSY');
+});

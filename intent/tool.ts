@@ -10,10 +10,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // shortlist judge, executes it on the shared nodriver browser, and returns the verified
 // post-action page state. No @refs or raw DOM ever enter the agent context.
 const SERVICE = process.env.LAYA_INTENT_URL || "http://127.0.0.1:8011";
-// LAYA_INTENT_MODE=task: the agent can only hand over goals (task) and inspect (read/observe);
-// every page operation is decided inside the service.
-const TASK_ONLY = process.env.LAYA_INTENT_MODE === "task";
-const ACTIONS = TASK_ONLY ? ["task", "read", "observe", "screenshot", "resolve"] : ["task", "plan", "open", "click", "fill", "select", "scroll", "read", "observe", "back", "screenshot", "resolve"];
+// Default: goal-only. The agent hands over {url?, goal}; the service's planner decides every
+// open/click/fill/scroll itself and the tool returns the outcome plus the planner's event log.
+// LAYA_INTENT_MODE=full restores the single-step actions (open/click/plan/...) for debugging.
+export const FULL = process.env.LAYA_INTENT_MODE === "full";
+const ACTIONS = ["task", "plan", "open", "click", "fill", "select", "scroll", "read", "observe", "back", "screenshot", "resolve"];
+// Planner APIs the router can call with the session's own model over /chat/completions.
+// Anthropic serves an OpenAI-compatible endpoint under /v1; Codex/Responses/Google do not fit.
+export function plannerEndpoint(api: string | undefined, baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined;
+  const base = baseUrl.replace(/\/+$/, "");
+  if (api === "openai-completions") return `${base}/chat/completions`;
+  if (api === "anthropic-messages") return base.endsWith("/v1") ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+  return undefined;
+}
 const RESOLVE_HELP = 'Recovery: action "resolve" {target?: last error/status} checks the router, starts a missing local router through the restart-service hub, reconnects the worker and observes the page. Returns RESOLVED/RESOLVE_BLOCKED and common failure guidance. Never replays the original action, resets shared Chrome, or bypasses URL/auth/confirmation guards.';
 
 const DESCRIPTION = `Intent-level live browser (shares the nodriver Chrome session). You never see DOM or @refs: describe the element in words and the tool finds, clicks/fills, and verifies it.
@@ -34,6 +44,22 @@ Actions:
 - back: return to the previous page URL this tool visited (never construct URLs yourself).
 CLICKED_UNCONFIRMED / FILLED_UNCONFIRMED mean the action ran but no page change was detectable; verify with read if it matters.`;
 
+const GOAL_DESCRIPTION = `Live browser autopilot (shares the logged-in nodriver Chrome). Give it a start URL and a goal; a planner inside the browser service opens the page, clicks, types, selects and scrolls by itself, verifies the result against the page text, and returns:
+- TASK_DONE: verified; text = the goal-relevant page text, evidence = why it counts as done.
+- TASK_UNVERIFIED: the planner thinks it is done but the page text does not show it; check text before answering.
+- TASK_STOPPED / TASK_FAILED: not reached; steps and events say how far it got and why.
+- TASK_NEEDS_CONFIRM: an irreversible step (buy, pay, submit order, delete, log out) was reached and NOT taken.
+Every result has events (what the planner did, step by step, with timings) and a screenshot of where it ended.
+url must be an exact URL from the user or from search results; a Google search URL (https://www.google.com/search?q=...) also works as a start. Omit url to continue from the page this conversation's last task ended on (e.g. a follow-up question about the same page, or "take a screenshot").`;
+const GOAL_GUIDELINES = [
+  "browser_intent takes only {url, goal}: describe the destination and every constraint, never the clicks. One call per user goal; the planner does the navigation.",
+  "If the exact deep link was not given by the user or returned by search, start from the closest official page or a Google search URL and say in the goal what to navigate to. Never guess deep URLs.",
+  "TASK_DONE means the text was already checked against the page by an independent verifier and the screenshot is attached: answer from text right away. Do not call again just to look at or re-confirm the same answer.",
+  "For a follow-up about the page already open (another detail, a screenshot), call again WITHOUT url and with the new goal.",
+  "On TASK_STOPPED/TASK_FAILED/TASK_UNVERIFIED, read events and text, then either restate the goal more precisely once or report what was found. Do not loop.",
+  "Set confirm=true only when the user explicitly asked for the irreversible step that TASK_NEEDS_CONFIRM stopped at.",
+];
+
 export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) {
   // Close this session's browser tab(s) when the pi session ends; otherwise every run leaks a tab
   // toward the worker's 20-tab cap.
@@ -51,14 +77,11 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
   pi.registerTool({
     name: "browser_intent",
     label: "Browser (intent → Laya → click)",
-    description: TASK_ONLY
-      ? RESOLVE_HELP + `\nLive browser, goal-level only. Call {action:"task", url, goal} with an exact user-supplied URL or exact search-result URL and every constraint in the goal. If the requested deep link is not indexed and not provided by the user, use the closest official parent URL from search and navigate through visible links; never pass guessed deep URLs. The browser service performs all clicks/typing itself (fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with goal-relevant page text) / TASK_UNVERIFIED / TASK_FAILED / TASK_STOPPED / TASK_NEEDS_CONFIRM. Irreversible steps (buy, pay, delete, logout) stop with TASK_NEEDS_CONFIRM; repeat the task with confirm=true ONLY if the user explicitly asked. Use read {target} to look at the current page text. You cannot click yourself.`
-      : DESCRIPTION + "\n" + RESOLVE_HELP,
-    promptSnippet: "Operate web pages by intent; resolve diagnoses and safely repairs browser failures",
-    promptGuidelines: TASK_ONLY ? [
-      "For web tasks, call task ONCE with an exact user-supplied URL or exact search-result URL plus the full goal. If the exact deep link is absent and not provided by the user, use the closest official parent URL returned by search and ask it to navigate through visible links; never reuse or construct the deep URL.",
-      "If the result is TASK_STOPPED/TASK_FAILED/TASK_UNVERIFIED, restate the goal more precisely in one more task call or report what was found; do not loop.",
-    ] : [
+    description: FULL ? DESCRIPTION + "\n" + RESOLVE_HELP : GOAL_DESCRIPTION,
+    promptSnippet: FULL
+      ? "Operate web pages by intent; resolve diagnoses and safely repairs browser failures"
+      : "Hand a live-browser goal (and start URL) to an autopilot that does the clicking and reports back",
+    promptGuidelines: FULL ? [
       "Prefer ONE task call {url, goal} using an exact user-supplied URL or exact search-result URL. If an exact deep link is absent and not provided by the user, use the closest official parent URL returned by search and navigate through visible links; never reuse or construct the deep URL.",
       "When a page is opened or read, examine the '頁面候選跳轉連結' list in the output. To follow a link from the current page, use action: 'open' with pick: <number> (e.g. pick: 1) or copy the exact candidate URL. Never guess, infer, or construct deep URLs yourself.",
       "To search within the browser, open a Google search URL directly: action: 'open', url: 'https://www.google.com/search?q=<query>'.",
@@ -68,8 +91,8 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
       "On NO_MATCH, do not repeat the same target: rephrase once with page wording, use read, or conclude the element is not available.",
       "Never set confirm=true unless the user explicitly asked for that irreversible action.",
       'For browser_intent transport/errors, call action "resolve" with target=last error; inspect current state before retrying. Never guess URLs or blindly replay actions.',
-    ],
-    parameters: Type.Object({
+    ] : GOAL_GUIDELINES,
+    parameters: FULL ? Type.Object({
       action: Type.Union(ACTIONS.map((a) => Type.Literal(a))),
       steps: Type.Optional(Type.Array(Type.Object({
         action: Type.Union([Type.Literal("open"), Type.Literal("click"), Type.Literal("fill"), Type.Literal("select"), Type.Literal("scroll"), Type.Literal("read"), Type.Literal("observe"), Type.Literal("back"), Type.Literal("screenshot")]),
@@ -86,8 +109,13 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
       max_steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 12, description: "task: step limit (default 8)" })),
       pick: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Option number after AMBIGUOUS, or candidate link index to navigate to with action: 'open'" })),
       confirm: Type.Optional(Type.Boolean({ description: "Only for user-requested irreversible actions" })),
+    }) : Type.Object({
+      url: Type.Optional(Type.String({ description: "Start page: an exact URL from the user or from search results (a Google search URL is fine). Omit to continue on this conversation's current page." })),
+      goal: Type.String({ description: "The destination: what to find or do, with every constraint (e.g. \"price and stock of the single-unit DGX Spark, not a bundle; do not add to cart\")." }),
+      confirm: Type.Optional(Type.Boolean({ description: "Only when the user explicitly asked for the irreversible step a previous TASK_NEEDS_CONFIRM stopped at." })),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, rawParams, signal, onUpdate, ctx) {
+      const params: any = FULL ? rawParams : { action: "task", url: (rawParams as any).url, goal: (rawParams as any).goal, confirm: (rawParams as any).confirm };
       const session = `intent-${ctx.sessionManager.getSessionId()}`;
       const boundedSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(120000)]);
       const result = (data: Record<string, unknown>) => ({
@@ -211,8 +239,10 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
 
       const payload: Record<string, unknown> = { session, ...params };
       const model = (ctx as any).model;
-      if (model) {
-        if (model.id) payload.model = model.id;
+      // Plan with the conversation's own model when its API fits /chat/completions; otherwise
+      // (Codex, Responses, Google) leave the router on its local default planner.
+      let plannerNote = "local default planner";
+      if (model && plannerEndpoint(model.api, model.baseUrl) !== undefined) {
         let baseUrl = model.baseUrl;
         let headers: Record<string, string> = { ...(model.headers || {}) };
         try {
@@ -225,9 +255,18 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
             }
           }
         } catch {}
-        if (baseUrl) payload.base_url = baseUrl;
-        if (Object.keys(headers).length > 0) payload.headers = headers;
+        const endpoint = plannerEndpoint(model.api, baseUrl);
+        if (endpoint) {
+          payload.model = model.id;
+          payload.base_url = endpoint;
+          if (Object.keys(headers).length > 0) payload.headers = headers;
+          plannerNote = `${model.provider ?? ""}/${model.id}`.replace(/^\//, "");
+        }
+      } else if (model) {
+        plannerNote = `local default planner (${model.api} models cannot plan over /chat/completions)`;
       }
+      const events: string[] = [];
+      const started = Date.now();
       let data: Record<string, unknown> = {};
       try {
         const streamRes = await fetch(`${SERVICE}/act/stream`, {
@@ -260,6 +299,7 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
                   try {
                     const evt = JSON.parse(line.slice(6));
                     if (evt.type === "progress" && evt.message) {
+                      events.push(`${((Date.now() - started) / 1000).toFixed(1)}s ${evt.message}`);
                       if (isPlan) {
                         if (evt.stage === "plan_step") {
                           const stepIdx = (evt.current_step ? evt.current_step - 1 : 0);
@@ -322,7 +362,13 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         data = streamFailure(error);
       }
       if (["ERROR", "NO_MATCH", "AMBIGUOUS", "PICK_EXPIRED", "TASK_FAILED", "TASK_STOPPED", "NEEDS_CONFIRM", "TASK_NEEDS_CONFIRM"].includes(String(data.status))) {
-        data.resolver = { action: "resolve", advice: failureAdvice(`${data.status} ${data.message || data.hint || ""}`) };
+        const advice = failureAdvice(`${data.status} ${data.message || data.hint || ""}`);
+        data.resolver = FULL ? { action: "resolve", advice } : { advice };
+      }
+      if (isTask) {
+        data.planner = plannerNote;
+        // The agent only sees the final result, so hand it the planner's own event log.
+        if (events.length) data.events = events.length > 40 ? [...events.slice(0, 5), `… ${events.length - 35} events omitted …`, ...events.slice(-30)] : events;
       }
       const shot = typeof data.screenshot === "string" ? data.screenshot : undefined;
       const { screenshot: _s, ...rest } = data;
@@ -399,7 +445,7 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         humanSummary = `📖 **[已讀取頁面內容]**\n${data.text || ""}`;
       }
 
-      if (Array.isArray(data.links) && data.links.length > 0) {
+      if (FULL && Array.isArray(data.links) && data.links.length > 0) {
         const linkLines = data.links.slice(0, 10).map((l: any, idx: number) => {
           const t = l.title ? `「${l.title}」 ` : "";
           return `  [${idx + 1}] ${t}${l.url}`;

@@ -4,10 +4,14 @@ import { createRequire } from 'node:module';
 const require = createRequire('/home/chihmin/src/pi-agent/package.json');
 const { createJiti } = require('jiti');
 const jiti = createJiti(import.meta.url, { alias: { typebox: require.resolve('typebox') }, moduleCache: false });
+// FULL is read at import time: load the module once per mode.
+process.env.LAYA_INTENT_MODE = 'full';
 const register = (await jiti.import('../intent/tool.ts')).default;
-function setup() {
+delete process.env.LAYA_INTENT_MODE;
+const goalModule = await jiti.import('../intent/tool.ts');
+function setup(reg = register) {
   let tool, ensured = 0;
-  register({ on() {}, registerTool(t) { tool = t; }, async exec() { throw Error('unexpected hub call'); } }, async () => { ensured++; });
+  reg({ on() {}, registerTool(t) { tool = t; }, async exec() { throw Error('unexpected hub call'); } }, async () => { ensured++; });
   return { tool, ensured: () => ensured, ctx: { sessionManager: { getSessionId: () => 'test' } } };
 }
 test('resolve is available and verifies by observe without replay', async () => {
@@ -78,5 +82,55 @@ test('failed preflight never dispatches original action', async () => {
     const r = await s.tool.execute('1', { action: 'click', target: 'Pay' }, undefined, undefined, s.ctx);
     assert.equal(r.details.status, 'RESOLVE_BLOCKED');
     assert.ok(calls.every(c => c.endsWith('/health')));
+  } finally { globalThis.fetch = old; }
+});
+
+const streamOf = (...events) => new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''));
+function captureStream(result, progress = []) {
+  const posted = [];
+  globalThis.fetch = async (url, opts) => {
+    if (url.endsWith('/health')) return Response.json({ ok: true });
+    posted.push(JSON.parse(opts.body));
+    return streamOf(...progress.map(message => ({ type: 'progress', stage: 'task_step', message })), { type: 'result', data: result });
+  };
+  return posted;
+}
+test('goal-only mode exposes only url, goal and confirm and always dispatches a task', async () => {
+  const old = globalThis.fetch;
+  try {
+    assert.equal(goalModule.FULL, false);
+    const s = setup(goalModule.default);
+    assert.deepEqual(Object.keys(s.tool.parameters.properties).sort(), ['confirm', 'goal', 'url']);
+    assert.deepEqual(s.tool.parameters.required, ['goal']);
+    const posted = captureStream({ status: 'TASK_DONE', text: 'price $4' }, ['📋 step 1 click "Pricing"', '✓ step 1 CLICKED']);
+    const r = await s.tool.execute('1', { url: 'https://example.test/', goal: 'Opus price', action: 'click', target: 'Buy' }, undefined, undefined, s.ctx);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].action, 'task');
+    assert.equal(posted[0].target, undefined, 'single-step fields never reach the service');
+    assert.equal(r.details.status, 'TASK_DONE');
+    assert.equal(r.details.events.length, 2);
+    assert.match(r.details.events[0], /^\d+\.\ds 📋 step 1 click "Pricing"$/);
+    assert.match(r.content[0].text, /"events"/, 'the event log reaches the agent, not just the UI');
+  } finally { globalThis.fetch = old; }
+});
+test('planner uses the session model only when its API speaks chat/completions', async () => {
+  const old = globalThis.fetch;
+  try {
+    const cases = [
+      [{ id: 'claude-opus-5-5', provider: 'anthropic', api: 'anthropic-messages', baseUrl: 'https://api.anthropic.com' }, 'https://api.anthropic.com/v1/chat/completions'],
+      [{ id: 'qwen', provider: 'local-llama', api: 'openai-completions', baseUrl: 'http://localhost:8001/v1' }, 'http://localhost:8001/v1/chat/completions'],
+      [{ id: 'gemini-3.5-flash', provider: 'gemini', api: 'openai-completions', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/' }, 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'],
+      [{ id: 'gpt-5.6-sol', provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' }, undefined],
+    ];
+    for (const [model, endpoint] of cases) {
+      const s = setup(goalModule.default);
+      const ctx = { ...s.ctx, model, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: 'k' }) } };
+      const posted = captureStream({ status: 'TASK_DONE' });
+      const r = await s.tool.execute('1', { goal: 'g' }, undefined, undefined, ctx);
+      assert.equal(posted[0].base_url, endpoint, model.id);
+      assert.equal(posted[0].model, endpoint ? model.id : undefined, model.id);
+      assert.equal(posted[0].headers?.Authorization, endpoint ? 'Bearer k' : undefined, 'no session credentials leave for an unused model');
+      assert.match(r.details.planner, endpoint ? new RegExp(model.id) : /local default planner/);
+    }
   } finally { globalThis.fetch = old; }
 });

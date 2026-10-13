@@ -1,6 +1,6 @@
 import { readBrowserConfig } from "./browser-config.ts";
 import { launchWorker, type LaunchedWorker } from "./worker-launch.ts";
-import registerIntent from "./intent/tool.ts";
+import registerIntent, { FULL as INTENT_FULL } from "./intent/tool.ts";
 import { randomUUID } from "node:crypto";
 import { ResearchPlanner, hostClock } from "./research-model.ts";
 import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
@@ -51,7 +51,7 @@ const SEARCH_FIRST_URL_RULE = `MANDATORY URL PROVENANCE RULE:
 - If no exact URL was provided by the user, you MUST search first (via research, google_search, or browser google-search). Never guess, infer, synthesize, or construct a URL from memory.
 - Copy one exact URL from search results without changing its domain, path, query, casing, or percent-encoding. If a requested deep link is not indexed and was not provided by the user, open the closest official parent URL returned by search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl. If search returns no usable parent URL, stop; never try a URL variant.
 - Browser's google-search command is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
-- In browser_intent, candidate links on the active page are listed as [1]..[N]. You may navigate to them using action: "open" with pick: <number> or by copying the exact candidate URL. Opening standard search engine queries (e.g. https://www.google.com/search?q=...) is also authorized.
+- ${INTENT_FULL ? 'In browser_intent, candidate links on the active page are listed as [1]..[N]. You may navigate to them using action: "open" with pick: <number> or by copying the exact candidate URL.' : "browser_intent's planner follows on-page links itself: give it the closest exact URL you have plus the destination in the goal."} Opening standard search engine queries (e.g. https://www.google.com/search?q=...) is also authorized.
 - image_search / image_search_batch (browser image-search / image-search-batch) uses an internally verified fixed provider entry, not an agent-supplied URL. Call it directly for authorized reverse-image searches; no preliminary URL search or manual navigation is needed.`;
 
 const DESCRIPTION = `Autonomous live browser automation (Android Chrome mobile viewport 390x844 by default; native Linux identity uses mobile-disabled desktop-fit scaling inside the same 390x844 frame). Strong CAPTCHA, challenge, access-denied, 429, or unexpected login-gate signals pin only the affected origin to fresh-target Linux while other origins remain Android.
@@ -566,7 +566,8 @@ export default function (pi: ExtensionAPI) {
     const targets = event.toolName === "browser"
       ? [browserOpenHttpUrl(input?.command)].filter(Boolean) as string[]
       : [input?.url, ...(input?.steps || []).map(s => s.url),
-          ...(!input?.url && input?.action === "task" ? extractSearchResultUrls(input.goal) : [])]
+          // Goal-only calls have no action; the service opens a URL found in the goal when no page is open.
+          ...(!input?.url && (input?.action === "task" || input?.action === undefined) ? extractSearchResultUrls(input.goal) : [])]
           .filter((url): url is string => typeof url === "string" && /^https?:\/\//i.test(url));
     if (!targets.length) return;
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
@@ -593,7 +594,7 @@ export default function (pi: ExtensionAPI) {
     if (!target) return;
     return {
       block: true,
-      reason: `URL_PROVENANCE_GUARD: ${target} was not supplied verbatim by the user, found on the current page, nor returned by a search result. If navigating the current page, use action: "open" with pick: <number> (or copy an exact link from the page candidates list). If searching, open a Google search query (e.g. open https://www.google.com/search?q=...) or use research. Never guess deep URLs.`,
+      reason: `URL_PROVENANCE_GUARD: ${target} was not supplied verbatim by the user, found on the current page, nor returned by a search result. ${event.toolName === "browser_intent" && !INTENT_FULL ? "To reach a page you have no exact URL for, start from the closest exact URL (or a Google search URL) and describe the destination in the goal." : 'If navigating the current page, use action: "open" with pick: <number> (or copy an exact link from the page candidates list).'} If searching, open a Google search query (e.g. open https://www.google.com/search?q=...) or use research. Never guess deep URLs.`,
     };
   });
 

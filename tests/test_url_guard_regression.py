@@ -18,7 +18,7 @@ class ExactUrlGuardTests(unittest.TestCase):
                     helpers = helpers[:helpers.index('const DESCRIPTION')]
                 hooks = text[text.index('  const searchedUrls ='):text.index('  // Close this session') if helper == 'extractHttpUrls' else text.index('  pi.on("before_agent_start"')]
                 # browser declares queue before searchedUrls, which the hooks do not use.
-                script = helpers + '\nfunction register(pi) {\nconst crawlGuards = true;\n' + hooks + '\n}\n'
+                script = helpers + '\nfunction register(pi) {\nconst crawlGuards = true;\nconst INTENT_FULL = false;\n' + hooks + '\n}\n'
                 script += '''
 const handlers = new Map();
 register({on(n,f){handlers.set(n,f);}});
@@ -36,5 +36,11 @@ await handlers.get('tool_result')({toolName:'web_search',isError:false,content:[
 if ((await check('https://search.test/item'))?.block) throw Error('search URL blocked');
 await handlers.get('tool_result')({toolName:'web_search',isError:true,content:[{type:'text',text:'https://failed.test/item'}]},ctx);
 if (!(await check('https://failed.test/item'))?.block) throw Error('failed search authorized');
+if (tool === 'browser_intent') {
+  // Goal-only calls carry no action; a URL inside the goal is still opened by the service.
+  const goalOnly = goal => handlers.get('tool_call')({toolName:tool,input:{goal}},ctx);
+  if (!(await goalOnly('price at https://guessed.test/deep/item'))?.block) throw Error('goal-only guessed URL authorized');
+  if ((await goalOnly('price at https://search.test/item'))?.block) throw Error('goal-only search URL blocked');
+}
 '''.replace('TOOL', repr(tool))
                 self.run_node(script, suffix='.mts')

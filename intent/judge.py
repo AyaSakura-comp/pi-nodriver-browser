@@ -1,5 +1,5 @@
 """System-2 fallback: ask a local LLM to pick among a SHORTLIST only (never the full DOM)."""
-import json, os, re, time, urllib.request
+import json, os, re, time, urllib.error, urllib.parse, urllib.request
 DEFAULT_JUDGE_URL = "http://127.0.0.1:8001/v1/chat/completions"
 DEFAULT_JUDGE_MODEL = "qwen3.6-35b-q4"
 JUDGE_URL = os.environ.get("JUDGE_URL", DEFAULT_JUDGE_URL)
@@ -38,6 +38,37 @@ def make_headers(custom_headers: dict | None = None, api_key: str | None = None)
     return hdrs
 
 
+def is_local(url: str) -> bool:
+    return (urllib.parse.urlparse(url).hostname or "") in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def chat_body(target_url: str, model: str, max_tokens: int, messages: list) -> dict:
+    """Greedy, no-thinking sampling is a llama.cpp knob; hosted models may reject it
+    (Claude Opus 5.5: `temperature` is deprecated -> HTTP 400), so only local servers get it."""
+    body = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if is_local(target_url):
+        body["temperature"] = 0
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    return body
+
+
+def chat(target_url: str, hdrs: dict, body: dict, timeout: float) -> str:
+    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        # The status line alone ("400 Bad Request") hides why the provider refused.
+        detail = e.read(400).decode("utf-8", "replace").strip()
+        raise RuntimeError(f"planner model HTTP {e.code} from {urllib.parse.urlparse(target_url).netloc}: {detail}") from None
+    except (TimeoutError, urllib.error.URLError) as e:
+        if isinstance(e, urllib.error.URLError) and not isinstance(e.reason, TimeoutError):
+            raise
+        # A shared local server with every slot busy queues the request past the timeout.
+        raise RuntimeError(f"planner model at {urllib.parse.urlparse(target_url).netloc} did not answer within "
+                           f"{timeout:g}s (server busy or down); no page action was taken for this step") from None
+
+
 PROMPT = """You map a browser user's intent to ONE on-page element.
 Intent: {intent}
 Candidates:
@@ -51,13 +82,10 @@ def judge(intent, cands, timeout=20, url=None, model=None, headers=None):
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = {"model": target_model, "temperature": 0, "max_tokens": int(os.environ.get("JUDGE_MAX_TOKENS", "96")),
-            "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "user", "content": PROMPT.format(intent=intent, lines=lines)}]}
+    body = chat_body(target_url, target_model, int(os.environ.get("JUDGE_MAX_TOKENS", "96")),
+                     [{"role": "user", "content": PROMPT.format(intent=intent, lines=lines)}])
     t = time.perf_counter()
-    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)["choices"][0]["message"]["content"]
+    out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
     m = re.search(r'"choice"\s*:\s*"([^"]+)"', out)
     choice = m.group(1).strip() if m else "none"
@@ -81,15 +109,11 @@ def vision_judge(intent, image_path, elements, timeout=40, url=None, model=None,
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = {"model": target_model, "temperature": 0, "max_tokens": 32,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}},
-                {"type": "text", "text": VISION_PROMPT.format(intent=intent, boxes=boxes)}]}]}
+    body = chat_body(target_url, target_model, 32, [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}},
+        {"type": "text", "text": VISION_PROMPT.format(intent=intent, boxes=boxes)}]}])
     t = time.perf_counter()
-    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)["choices"][0]["message"]["content"]
+    out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
     m = re.search(r'"id"\s*:\s*"?(\w+)"?', out)
     ids = {e["id"]: e for e in elements}

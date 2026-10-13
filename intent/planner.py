@@ -1,13 +1,13 @@
 """System-1 autopilot planner: a tiny-context, no-thinking LLM call that picks the NEXT browser step."""
-import json, re, time, urllib.request
-from judge import JUDGE_URL, JUDGE_MODEL, resolve_endpoint, resolve_model, make_headers
+import json, re, time
+from judge import resolve_endpoint, resolve_model, make_headers, chat_body, chat
 
 PROMPT = """You drive a web browser one step at a time toward the user's goal. Decide ONLY the next step.
 Goal: {goal}
 Steps done so far:
 {history}
 Current page: {title} | {url}
-Visible text (start): {excerpt}
+Page text most related to the goal (in page order, " | " between lines): {excerpt}
 Elements on the page (visible names; "(no text)" = icon/switch/custom control):
 {elements}
 
@@ -15,11 +15,12 @@ Rules:
 - click/fill/select: "target" = copy the element name from the list when possible, plus distinguishing words.
 - fill: put the text in "value"; set "submit": true to press Enter (e.g. a search box).
 - select: dropdown target + option text in "value".
-- done: the current page already shows what the goal asks for (or the goal's action is complete).
+- scroll: "value" = down, up, top or bottom, when what the goal needs is not in the visible text yet.
+- done: the page text above already shows what the goal asks for (or the goal's action is complete).
 - fail: the goal cannot be reached from here (explain in reason).
 - Never click a different control as a substitute for the one the goal needs.
 - Never buy, checkout, pay, delete or log out unless the goal explicitly says so.
-Reply with JSON only: {{"action":"click|fill|select|done|fail","target":"","value":"","submit":false,"reason":"<=12 words"}}"""
+Reply with JSON only: {{"action":"click|fill|select|scroll|done|fail","target":"","value":"","submit":false,"reason":"<=12 words"}}"""
 
 
 def next_step(goal, history, state, elements, timeout=30, url=None, model=None, headers=None):
@@ -28,22 +29,18 @@ def next_step(goal, history, state, elements, timeout=30, url=None, model=None, 
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = {"model": target_model, "temperature": 0, "max_tokens": 120,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "user", "content": PROMPT.format(
-                goal=goal, history=hist, title=state.get("title", ""), url=state.get("url", ""),
-                excerpt=state.get("page_excerpt", "")[:400], elements=els)}]}
+    body = chat_body(target_url, target_model, 120, [{"role": "user", "content": PROMPT.format(
+        goal=goal, history=hist, title=state.get("title", ""), url=state.get("url", ""),
+        excerpt=state.get("page_excerpt", "")[:900], elements=els)}])
     t = time.perf_counter()
-    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)["choices"][0]["message"]["content"]
+    out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
     m = re.search(r"\{.*\}", out, re.S)
     try:
         step = json.loads(m.group(0)) if m else {}
     except Exception:
         step = {}
-    if step.get("action") not in ("click", "fill", "select", "done", "fail"):
+    if step.get("action") not in ("click", "fill", "select", "scroll", "done", "fail"):
         step = {"action": "fail", "reason": f"unparseable planner output: {out[:80]}"}
     return step, ms
 
@@ -90,12 +87,9 @@ def next_step_full(goal, history, state, snapshot, screenshot_path=None, boxes=N
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = {"model": target_model, "temperature": 0, "max_tokens": 150,
-            "chat_template_kwargs": {"enable_thinking": False}, "messages": [{"role": "user", "content": content}]}
+    body = chat_body(target_url, target_model, 150, [{"role": "user", "content": content}])
     t = time.perf_counter()
-    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)["choices"][0]["message"]["content"]
+    out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
     m = re.search(r"\{.*\}", out, re.S)
     try:
@@ -121,14 +115,10 @@ def verify_done(goal, history, state, text, timeout=30, url=None, model=None, he
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = {"model": target_model, "temperature": 0, "max_tokens": 80,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "user", "content": VERIFY_PROMPT.format(
-                goal=goal, history="; ".join(history) or "(none)", title=state.get("title", ""), text=text[:1500])}]}
+    body = chat_body(target_url, target_model, 80, [{"role": "user", "content": VERIFY_PROMPT.format(
+        goal=goal, history="; ".join(history) or "(none)", title=state.get("title", ""), text=text[:1500])}])
     t = time.perf_counter()
-    req = urllib.request.Request(target_url, json.dumps(body).encode(), hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.load(r)["choices"][0]["message"]["content"]
+    out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
     ok = bool(re.search(r'"achieved"\s*:\s*true', out))
     m = re.search(r'"evidence"\s*:\s*"([^"]*)"', out)

@@ -24,7 +24,42 @@ standalone extension entry to `~/.pi/agent/extension-backups/`. `--stage DIRECTO
 only copies files and intentionally does not change configuration or services.
 Do not explicitly load the old standalone extension from Pi settings/CLI.
 
-## Backend
+## Goal-only tool surface (default)
+
+`browser_intent` takes only `{url?, goal, confirm?}`. The router's planner opens the page and
+decides every click, fill, select and scroll; the agent never issues single steps.
+
+- `url`: exact URL from the user or search results, or a Google search URL. Omit it to continue
+  on the page this conversation's last task ended on (a follow-up question, a screenshot).
+- Result: `TASK_DONE` (verified against the page text), `TASK_UNVERIFIED`, `TASK_STOPPED`,
+  `TASK_FAILED` or `TASK_NEEDS_CONFIRM`, plus `events` (the planner's step log with timings,
+  also streamed live to the UI), `planner` (which model planned) and a final screenshot.
+- `LAYA_INTENT_MODE=full` restores the single-step actions (`open`, `click`, `plan`, `read`,
+  `resolve`, ...) for debugging.
+
+### Planner model
+
+The planner, judge and verifier use the conversation's own model when its API speaks
+`/chat/completions`: `openai-completions` (`<baseUrl>/chat/completions`) and
+`anthropic-messages` (Anthropic's OpenAI-compatible `<baseUrl>/v1/chat/completions`).
+Other APIs (Codex, Responses, Google native) use the router's local default
+(`JUDGE_URL`, `:8001`), and no session credentials are sent to the router for them.
+`temperature: 0` and `chat_template_kwargs` are llama.cpp knobs and only go to localhost
+endpoints; Claude Opus 5.5 rejects `temperature` with HTTP 400. Provider errors and
+timeouts surface with the provider's reason (`planner model HTTP 400 from ...`,
+`planner model at ... did not answer within 30s`). A planner timeout usually means every slot
+of the shared local server was busy; no page step ran, so one retry is safe.
+
+### What the planner sees
+
+Each step the planner gets windows of page lines around the lines that best match the goal's
+words (rarer words weigh more), not the first 400 characters. Table cells arrive as one line
+each, so a window keeps a row together (`Opus 5.5 | ... | Input | $4 / MTok | Output | $20 / MTok`).
+`read {target}` and the task's returned `text` use the same windows. The planner can also
+`scroll` (down/up/top/bottom); the service turns relative scrolls into absolute
+`scroll to <y>` because the worker refuses relative scrolling. If OmniParser is down, the
+full-view fallback still runs with the snapshot alone.
+
 
 The HTTP router remains a separate process on localhost:8011. Provision its Python
 environment with torch, transformers, fastapi, uvicorn and pydantic; it uses the

@@ -575,7 +575,7 @@ The agent uses semantic tool guidelines to automatically determine tool necessit
 Every HTTP(S) `open` must use an authorized URL with verified provenance:
 - **Search Engine Query Allowlist**: Standard search engine queries (e.g. `https://www.google.com/search?q=...`, Bing, DuckDuckGo, Yahoo) are pre-authorized directly, allowing the agent to initiate or refine web searches without provenance deadlocks.
 - **Search Results & Research**: URLs returned earlier in the same session by `google_search`, `web_search`, `research`, or browser `google-search`.
-- **Page Candidate Links**: In `browser_intent`, candidate links extracted from the active page DOM are listed (`[1]..[N]`) and authorized for subsequent `open` actions via exact URL or `action: "open", pick: <number>`.
+- **Page Candidate Links** (`LAYA_INTENT_MODE=full` only): candidate links extracted from the active page DOM are listed (`[1]..[N]`) and authorized for subsequent `open` actions via exact URL or `action: "open", pick: <number>`. In the default goal-only mode the router's planner follows on-page links itself; a URL written into the goal is checked by the same URL guard as `url`.
 - **User-Supplied URLs**: Exact URLs provided verbatim in user messages.
 
 User-guessed, inferred, or invented deep URLs outside these authorized sources are blocked with `URL_PROVENANCE_GUARD`; local non-HTTP fixture URLs remain available for development. Browser-native search uses `google-search {"searches":[{"direction":"official","query":"search terms"}]}` or direct search query `open`.
@@ -1017,7 +1017,7 @@ Laya decisions at `http://127.0.0.1:8000/v1/systemone`.
 | Variable | Default | What it does |
 |---|---|---|
 | `LAYA_INTENT_URL` | `http://127.0.0.1:8011` | Intent router the tool calls. |
-| `LAYA_INTENT_MODE` | unset | `task` lets the agent only hand over goals and inspect, not issue single steps. |
+| `LAYA_INTENT_MODE` | unset (goal-only) | Unset: the agent passes only `{url?, goal, confirm?}` and the router's planner does every step. `full` restores the single-step actions (`open`, `click`, `plan`, `resolve`, ...) for debugging. |
 | `LAYA_INTENT_IMAGES` | `1` | `0` drops screenshots from tool results. |
 | `LAYA_URL` | `http://127.0.0.1:8000/v1/systemone` | Laya model server used by the router. |
 | `JUDGE_URL` / `JUDGE_MODEL` / `JUDGE_MAX_TOKENS` | router defaults / `96` | LLM judge that breaks ties between candidate elements. |

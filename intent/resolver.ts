@@ -27,6 +27,7 @@ export function failureAdvice(message: string): { code: string; hint: string } {
     [/429|rate.limit/i, 'RATE_LIMIT', 'Respect Retry-After; stop repeated requests.'],
     [/TAB_LIMIT|tab.cap|too.many.tabs/i, 'TAB_LIMIT', 'Close only unused tabs owned by this session; never shut down shared Chrome.'],
     [/ECONNREFUSED|fetch failed|connection|socket|FileNotFoundError/i, 'CONNECTION', 'Run browser_intent resolve to repair the local router and reconnect the worker; inspect before retrying.'],
+    [/planner model .* did not answer/i, 'PLANNER_BUSY', 'The planner model was busy and no page step ran. Retry the same task once; if it fails again, answer from other sources and say so.'],
     [/timeout|timed.out/i, 'TIMEOUT', 'Execution may have happened. Observe current state before deciding whether a safe read-only retry is needed.'],
   ];
   for (const [pattern, code, hint] of rules) if (pattern.test(message)) return { code, hint };

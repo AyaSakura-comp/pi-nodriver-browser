@@ -12,6 +12,7 @@ import argparse
 import os
 import hashlib
 import json
+import math
 import queue
 import re
 from urllib.parse import urlparse
@@ -71,6 +72,7 @@ class Act(BaseModel):
 
 TEXT_CACHE: dict[str, dict] = {}        # session -> last successful `get text` (worker LOOP_GUARD blocks repeats)
 PAGE_LINKS: dict[str, list[dict]] = {}        # session -> candidate links on the active page
+SCROLL_Y: dict[str, tuple[str, int]] = {}     # session -> (url, last scrollY the worker reported)
 
 
 def _cmd(session: str, command: str) -> dict:
@@ -217,11 +219,16 @@ def do_read(req: Act) -> dict:
     text = gt.get("pageText") or gt.get("text", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     if req.target and len(text) > 1500:
-        # keep paragraphs most related to the question, in page order
-        paras = [p for p in text.split("\n") if p.strip()]
-        scores = ROUTER.E.scores(req.target, [p[:200] for p in paras]) if paras else []
-        keep = sorted(sorted(range(len(paras)), key=lambda i: -scores[i])[:40])
-        text = "\n".join(paras[i] for i in keep)
+        # Windows around the best-matching lines keep table rows together (cells are one line each);
+        # the e5 line ranking below scrambled them, so it is only the fallback for no shared words.
+        excerpt = goal_excerpt(text, req.target, anchors=8, limit=4000)
+        if excerpt:
+            text = excerpt.replace(" | ", "\n")
+        else:
+            paras = [p for p in text.split("\n") if p.strip()]
+            scores = ROUTER.E.scores(req.target, [p[:200] for p in paras]) if paras else []
+            keep = sorted(sorted(range(len(paras)), key=lambda i: -scores[i])[:40])
+            text = "\n".join(paras[i] for i in keep)
     return {"status": "READ", "text": text[:4000], "truncated": len(text) > 4000}
 
 
@@ -449,26 +456,26 @@ def do_scroll(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     p("grounding", f"🎯 正在定位捲動目標：「{req.target or req.value or '頁面'}」...")
     r = None
     label = ""
-    if any(k in combined for k in ("頂部", "top", "to-top")):
+    goal_y = None
+    if re.search(r"頂部|\btop\b", combined):
         r = _cmd(session, "scroll top")
         label = "頁面頂部 (top)"
-    elif any(k in combined for k in ("底部", "bottom", "to-bottom")):
+    elif re.search(r"底部|\bbottom\b", combined):
         r = _cmd(session, "scroll bottom")
         label = "頁面底部 (bottom)"
-    elif any(k in combined for k in ("向上", "往上", "up")):
+    elif re.search(r"向上|往上|向下|往下|\b(up|down)\b", combined):
+        # The worker only takes absolute targets (relative scrolling was removed), so move from the
+        # last position it reported on this page.
+        up = bool(re.search(r"向上|往上|\bup\b", combined))
         amt = 600
         m = re.search(r"(\d+)", combined)
         if m:
             amt = int(m.group(1))
-        r = _cmd(session, f"scroll up {amt}")
-        label = f"向上捲動 {amt}px"
-    elif any(k in combined for k in ("向下", "往下", "down")):
-        amt = 600
-        m = re.search(r"(\d+)", combined)
-        if m:
-            amt = int(m.group(1))
-        r = _cmd(session, f"scroll down {amt}")
-        label = f"向下捲動 {amt}px"
+        url, y = SCROLL_Y.get(session, ("", 0))
+        y = y if url == before["url"] else 0
+        goal_y = max(0, y - amt) if up else y + amt
+        r = _cmd(session, f"scroll to {goal_y}")
+        label = f"{'向上' if up else '向下'}捲動 {amt}px"
     elif req.target:
         g, snap_used = _ground(req, session, "click", before["_snap"])
         if g.status == "match" and g.ref:
@@ -480,12 +487,20 @@ def do_scroll(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                 r = _cmd(session, "scroll top")
                 label = "頁面頂部導覽列 (top)"
             else:
-                r = _cmd(session, "scroll down 600")
+                url, y = SCROLL_Y.get(session, ("", 0))
+                goal_y = (y if url == before["url"] else 0) + 600
+                r = _cmd(session, f"scroll to {goal_y}")
                 label = f"向下捲動 600px (目標: {req.target})"
     else:
-        r = _cmd(session, "scroll down 600")
+        url, y = SCROLL_Y.get(session, ("", 0))
+        goal_y = (y if url == before["url"] else 0) + 600
+        r = _cmd(session, f"scroll to {goal_y}")
         label = "向下捲動 600px"
 
+    if goal_y is not None and r:
+        # Remember where we asked to go: the reported scrollY is sampled mid smooth-scroll.
+        max_y = r.get("maxY")
+        SCROLL_Y[session] = (before["url"], min(goal_y, int(max_y)) if isinstance(max_y, (int, float)) else goal_y)
     p("scrolling", f"📜 執行捲動：{label}...")
     after = _settled_state(session, before)
     _remember(session, after["url"])
@@ -568,7 +583,65 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30) -> li
     return labels
 
 
+GOAL_STOPWORDS = set("the a an and or of to for in on at by with from is are be do does not no any this that "
+                     "what which find show get page per up".split())
+
+
+def goal_excerpt(text: str, goal: str, anchors: int = 4, after: int = 11, limit: int = 1200) -> str:
+    """Windows of page lines around the lines that best match the goal's words (rarer words weigh
+    more), in page order. Table cells arrive as one line each, so a window keeps a row together:
+    'Opus 5.5 | ... | Input | $4 / MTok | Output | $20 / MTok'. Lexical on purpose: e5 ranked one-word
+    lines ('API', 'Opt-out') highest on the Claude pricing page and took ~2 s per step."""
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    terms = set()
+    for w in re.findall(r"[a-z0-9$][a-z0-9.$-]*|[\u4e00-\u9fff]+", goal.lower()):
+        if "\u4e00" <= w[0] <= "\u9fff":
+            terms.update(w[i:i + 2] for i in range(len(w) - 1))   # Chinese has no spaces: match bigrams
+        elif len(w.strip(".")) > 1 and w.strip(".") not in GOAL_STOPWORDS:
+            terms.add(w.strip("."))
+    low = [p.lower() for p in paras]
+    idf = {}
+    for w in terms:
+        df = sum(w in line for line in low)
+        if df:
+            idf[w] = math.log((len(paras) + 1) / (df + 0.5))
+    scores = [sum(v for w, v in idf.items() if w in line) / (1 + len(line) / 400) for line in low]
+    top = [i for i in sorted(range(len(paras)), key=lambda i: -scores[i])[:anchors] if scores[i] > 0]
+    keep = set()
+    for i in top:
+        keep.update(range(max(0, i - 1), min(len(paras), i + after + 1)))
+    out, prev = [], None
+    for i in sorted(keep):
+        if prev is not None and i != prev + 1:
+            out.append("…")
+        out.append(paras[i][:200])
+        prev = i
+    return " | ".join(out)[:limit]
+
+
+def _goal_text(session: str, goal: str, fallback: str) -> str:
+    """The planner used to see only the page's first 400 characters, which rarely hold the answer,
+    so it never recognized that it was done."""
+    try:
+        gt = _cmd(session, "get text")
+        return goal_excerpt(gt.get("pageText") or gt.get("text") or "", goal) or fallback
+    except Exception:
+        return fallback
+
+
 def do_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
+    """Every task result carries a screenshot of where the autopilot ended, so the agent can
+    show or check the page without issuing a step of its own."""
+    res = _run_task(req, progress)
+    if res.get("status") != "TASK_FAILED" or res.get("steps"):
+        try:
+            res["screenshot"] = _cmd(req.session, "screenshot").get("screenshotPath")
+        except Exception:
+            pass
+    return res
+
+
+def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     """Autopilot: the agent gives a goal; a no-thinking small-context planner picks each next step,
     grounding/safety/verification are the same tiers as single actions. Hands back on done/fail/confirm."""
     p = progress or (lambda s, m, **e: None)
@@ -594,9 +667,15 @@ def do_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     last = {}
     for i in range(1, max(1, min(req.max_steps, 12)) + 1):
         st = _page_state(session)
+        st = {**st, "page_excerpt": _goal_text(session, goal, st.get("page_excerpt", ""))}
         if escalate:
             # Fallback: the compact view failed; look at the full snapshot -i plus a screenshot.
-            om = _cmd(session, "vision-mark omni")      # annotated screenshot with numbered boxes
+            try:
+                om = _cmd(session, "vision-mark omni")  # annotated screenshot with numbered boxes
+            except Exception as exc:
+                # OmniParser down: still show the full snapshot, just without boxes.
+                p("task_step", f"⚠️ 視覺標註不可用（{str(exc)[:60]}），改用完整元素清單")
+                om = {}
             boxes = om.get("elements") or []
             step, pms = next_step_full(goal, history, st, st["_snap"], om.get("screenshotPath"), boxes,
                                        url=req.base_url, model=req.model, headers=req.headers)
@@ -659,6 +738,25 @@ def do_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                 if misses >= 2:
                     break
             continue
+        if step["action"] == "scroll":
+            p("task_exec", f"⚡ 執行步驟 {i}: scroll \"{step.get('value') or step.get('target') or 'down'}\"...")
+            try:
+                last = do_scroll(Act(session=session, action="scroll", target=step.get("target"),
+                                     value=step.get("value") or "down", goal=goal,
+                                     model=req.model, base_url=req.base_url, headers=req.headers), p)
+            except RuntimeError as exc:      # e.g. the worker's SCROLL_LOOP_GUARD
+                rec.update(status="ERROR", error=str(exc)[:160])
+                trace.append(rec)
+                misses += 1
+                history.append(f"scroll -> refused ({str(exc)[:80]}); stop scrolling, use the text you have")
+                if misses >= 2:
+                    break
+                continue
+            rec.update(status=last["status"], element=last.get("element"))
+            trace.append(rec)
+            misses, escalate = 0, False
+            history.append(f"scroll {last.get('element')} -> now: {(last.get('page_excerpt') or '')[:80]}")
+            continue
         ref = step.get("ref") if view == "full" and str(step.get("ref") or "").startswith("@e") else None
         sub = Act(session=session, action=step["action"], target=step.get("target") or (ref or ""),
                   value=step.get("value"), submit=bool(step.get("submit")), goal=goal, ref=ref, confirm=req.confirm,
@@ -716,6 +814,7 @@ def _dispatch(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         HISTORY.pop(req.session, None)
         TEXT_CACHE.pop(req.session, None)
         PAGE_LINKS.pop(req.session, None)
+        SCROLL_Y.pop(req.session, None)
         # session-cleanup only drops temp artifacts; `close` is what releases the tab (20-tab cap).
         try:
             nd.request("close", req.session)
