@@ -50,3 +50,32 @@ test('crawlGuards false exempts only crawl', async () => {
  assert.equal((await turn({user: '台北天氣如何', research: false})).crawl, false);
  assert.deepEqual(await turn({user: '台北天氣如何'}), {crawl: false, research: true});
 });
+
+test('after research, one browser_intent on an exact research URL is allowed; modified URLs and a second call are not', async () => {
+ const dir = mkdtempSync(join(tmpdir(), 'pi-guards-'));
+ process.env.PI_BROWSER_CONFIG = join(dir, 'browser-config.json');
+ writeFileSync(process.env.PI_BROWSER_CONFIG, JSON.stringify({crawlGuards: false}));
+ const { default: extension } = await jiti.import('../index.ts');
+ const hooks = new Map();
+ extension({on: (name, handler) => hooks.set(name, [...(hooks.get(name) ?? []), handler]), registerTool() {}});
+ const ctx = {sessionManager: {getSessionId: () => 's1', getBranch: () => [], getEntries: () => []}};
+ const fire = async (name, event) => { let out; for (const h of hooks.get(name) ?? []) out = (await h(event, ctx)) ?? out; return out; };
+ const intent = async (input) => (await fire('tool_call', {toolName: 'browser_intent', input}))?.block ? 'blocked' : 'allowed';
+ const turn = async () => {
+  await fire('input', {text: '鼎泰豐101分店即時叫號'});
+  await fire('tool_result', {toolName: 'research', isError: false, content: [{type: 'text', text: '[s1] 鼎泰豐 - 現場到號查詢 — https://www.dintaifung.tw/Queue/ 預計停止取號 -'}]});
+ };
+ // The real failure: live queue numbers are JavaScript-rendered, research only saw "-".
+ await turn();
+ const reason = (await fire('tool_call', {toolName: 'browser_intent', input: {url: 'https://www.dintaifung.tw/Queue/?type=3', goal: 'select 101店'}}))?.reason ?? '';
+ assert.match(reason, /^RESEARCH_DONE_GUARD: .*ONE browser_intent call whose url is copied exactly/, 'a modified URL is not a research URL, and the block says how to do it right');
+ assert.equal(await intent({url: 'https://www.dintaifung.tw/Queue/', goal: 'select 101店'}), 'allowed', 'the corrected retry in the same message still works');
+ await turn();
+ assert.equal(await intent({url: 'https://www.dintaifung.tw/Queue/', goal: 'select 101店 and read the live queue numbers'}), 'allowed');
+ assert.equal(await intent({url: 'https://www.dintaifung.tw/Queue/', goal: 'again'}), 'blocked', 'only one per message');
+ await turn();
+ assert.equal(await intent({goal: 'read live numbers at https://www.dintaifung.tw/Queue/'}), 'allowed', 'URL inside a goal-only call');
+ await turn();
+ assert.equal(await intent({goal: 'continue on the current page'}), 'blocked', 'no URL: nothing tied to research');
+ assert.equal((await fire('tool_call', {toolName: 'research', input: {}}))?.block, true, 'research itself stays blocked');
+});

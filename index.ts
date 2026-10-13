@@ -478,6 +478,13 @@ export default function (pi: ExtensionAPI) {
   const researchBlocks = new Map<string, number>();
   const researchTried = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
+  // research cannot read pages that render their data with JavaScript (live queue numbers,
+  // stock, seat maps). One browser_intent call on a URL this message's research returned is
+  // therefore not wandering; it is the only way to get that data.
+  const researchUrls = new Map<string, Set<string>>();
+  const researchIntentUsed = new Map<string, boolean>();
+  const intentTargets = (input: {url?: unknown; goal?: unknown} | undefined): string[] =>
+    typeof input?.url === "string" && input.url ? [input.url] : [...extractSearchResultUrls(String(input?.goal ?? ""))];
   const FOLLOW_UP_LOOKUPS = new Set(["crawl", "google_search", "fetch_image", "fetch_images", "research", "browser", "browser_intent"]);
   const USER_WANTS_MORE = /https?:\/\/|google|谷歌|crawl|爬|image|圖|照片|再查|再搜|多查|更多|再研究|深入|深度|deep|browser|瀏覽|打開|開啟|網站|網頁|點擊|點開|點進|點選/i;
   // The guard tells the agent to offer a deep crawl or more research; a bare yes to that
@@ -508,6 +515,8 @@ export default function (pi: ExtensionAPI) {
     researchBlocks.set(sessionId(ctx), 0);
     researchTried.set(sessionId(ctx), false);
     imageTask.set(sessionId(ctx), false);
+    researchUrls.set(sessionId(ctx), new Set());
+    researchIntentUsed.set(sessionId(ctx), false);
     const text = typeof event.text === "string" ? event.text : "";
     let accepted = false;
     try {
@@ -521,7 +530,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_result", (event, ctx) => {
     if (event.toolName === "research") researchTried.set(sessionId(ctx), true);
-    if (event.toolName === "research" && !event.isError) researchDone.set(sessionId(ctx), true);
+    if (event.toolName === "research" && !event.isError) {
+      researchDone.set(sessionId(ctx), true);
+      const urls = researchUrls.get(sessionId(ctx)) ?? new Set<string>();
+      for (const url of extractSearchResultUrls(event.content, event.details)) urls.add(url);
+      researchUrls.set(sessionId(ctx), urls);
+    }
     if (event.isError || !isSearchResultEvent(event)) return;
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.content, event.details)) allowed.add(url);
@@ -549,6 +563,12 @@ export default function (pi: ExtensionAPI) {
         && researchDone.get(sessionId(ctx))
         && !USER_WANTS_MORE.test(lastInput.get(sessionId(ctx)) ?? "")
         && !(imageTask.get(sessionId(ctx)) && IMAGE_TASK_LOOKUPS.has(event.toolName))) {
+      const targets = event.toolName === "browser_intent" ? intentTargets(event.input as {url?: unknown; goal?: unknown}) : [];
+      const fromResearch = researchUrls.get(sessionId(ctx)) ?? new Set<string>();
+      if (targets.length && !researchIntentUsed.get(sessionId(ctx)) && targets.every(url => fromResearch.has(url))) {
+        researchIntentUsed.set(sessionId(ctx), true);
+        return;
+      }
       const blocks = (researchBlocks.get(sessionId(ctx)) ?? 0) + 1;
       researchBlocks.set(sessionId(ctx), blocks);
       // Agents that keep retrying blocked lookups lose ~3.5 s per round; escalate.
@@ -558,7 +578,7 @@ export default function (pi: ExtensionAPI) {
       };
       return {
         block: true,
-        reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want a deep crawl of specific sources or more research. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " research already crawled its result pages, so do not crawl on your own either."}`,
+        reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want a deep crawl of specific sources or more research. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " research already crawled its result pages, so do not crawl on your own either."}${event.toolName === "browser_intent" && !researchIntentUsed.get(sessionId(ctx)) ? " Exception: if research could not read data the user asked for because the page renders it with JavaScript (live numbers, stock, seat maps), you may make ONE browser_intent call whose url is copied exactly from the research results, describing the rest (which branch, which item) in the goal." : ""}`,
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
