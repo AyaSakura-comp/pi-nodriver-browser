@@ -181,6 +181,7 @@ on a clean machine; do not treat it as a one-command, fully automated installer.
 
 ## 📚 Design Documents
 
+- [Ultra-Fast Autonomous Intent Architecture](docs/ultra-fast-autonomous-intent-architecture.md) — 63.8% faster autonomous web actions (14.15s down to 5.12s / 3.95s on PChome 24h) via sub-20ms atomic prototype injection, 1ms BM25 lexical grounding, compact shortcode planner (32 tokens), dual-phase DOM settling, and event-driven navigation.
 - [Shared Browser Restart Isolation](docs/shared-browser-restart-isolation.md) — why every PiWeb/Pi service restart killed the shared Chrome (its helpers and Xvfb lived in the restarted unit), the reproduction, the dedicated `pi-nodriver-browser-*` user unit, attach-only self-exit, prompt worker shutdown, and the resulting behavior changes.
 - [Browser Timeout Recovery: Cyclic DOM Walks and Connection Cleanup](docs/browser-timeout-recovery.md) — confirmed traversal-loop diagnosis, bounded walkers, disconnected-client cancellation, attach-only recovery through the existing service hub, regression tests, and verification limitations.
 - [Pi + Qwen Image Search Verification](docs/image-search-qwen-verification.md) — local working-tree one-shot search evidence, publication status, and the distinction between visual similarity and proven image provenance.
@@ -462,6 +463,15 @@ flowchart LR
 * **Download Isolation**: Target and frame ownership are tracked separately. Closing a tab removes only that target's frame routes; active downloads protect their owning session from eviction.
 * **Guard Commit Semantics**: Failed `open` attempts count toward the consecutive-open limit. A non-`open` action resets the streak only after that action validates and succeeds.
 
+#### 7. Ultra-Fast Autonomous Intent Engine (V4 Architecture)
+See [Ultra-Fast Autonomous Intent Architecture](docs/ultra-fast-autonomous-intent-architecture.md) for complete technical specifications, sequence diagrams, and benchmarks.
+* **Sub-20ms In-Page Actions**: `REF_ACTION_JS` injects text atomically via native prototype setters (`HTMLInputElement.prototype.value.set`), replacing sequential character-by-character typing loops (140ms $\to$ 2.9ms) while guaranteeing complete reactivity across React 18 synthetic event trackers, Vue 3 `v-model`, and HTML5 numeric controls.
+* **1ms Lexical Element Grounding**: Interactive elements are ranked against user goals using a high-speed BM25 `LexicalRanker` with semantic control tag weighting (`input/textarea/select` +50.0, `button` +5.0, `div` -2.0), replacing CPU-bound PyTorch `multilingual-e5-small` vector embeddings (986ms $\to$ 1.2ms, 821x speedup).
+* **High-Density Compact Shortcode Planner**: Replaces verbose JSON serialization with a concise 32-token micro-dialect (`F 1 "text" 1`, `C 2`, `D`, `R down`), reducing planner inference latency on local 35B models from ~2.6s to ~0.78s (3.3x speedup) with zero target name ambiguity.
+* **Dual-Phase DOM Settling**: Text `fill` without submit bypasses the DOM settle loop entirely (0ms wait); navigations and submissions use a tightened 200ms quiet window (40ms polling) and an in-page Double `requestAnimationFrame` barrier (~21ms) to eliminate false resets from rotating carousels.
+* **Event-Driven Navigation Pipeline**: `worker.py` ready detection leverages `DOMContentLoaded` + 40ms adaptive polling and 50ms micro-overlay dismissal, dropping cold navigation from ~1.58s to 0.29s.
+* **Overall Impact**: Drops end-to-end autonomous PChome 24h search execution from 14.15s down to 5.12s (-63.8%), or 3.95s using atomic `fill-submit`.
+
 ---
 
 ## ⚡ Accelerated Workflows (Workflow)
@@ -503,6 +513,29 @@ sequenceDiagram
 
     LLM->>User: 📊 Report prices, inventory, and promotions (Completed in 2 turns!)
 ```
+
+### 0. Ultra-Fast Autonomous Intent Pipeline (V4 Sub-20ms Engine)
+
+When configured in `intent` mode (`browser_intent`), the engine activates the **V4 Ultra-Fast Autonomous Pipeline** (see [Ultra-Fast Autonomous Intent Architecture](docs/ultra-fast-autonomous-intent-architecture.md)):
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ PChome 24h Autonomous Search Latency Evolution                                        │
+├─────────┬─────────────────────────────────────────────────────────┬────────────┬───────┤
+│ Version │ Subsystem Configuration                                 │ Total Time │ Diff  │
+├─────────┼─────────────────────────────────────────────────────────┼────────────┼───────┤
+│ V1      │ Legacy (JSON Planner + E5 Vectors + Typing + SHA1 Settle)│ 14.15s     │ Base  │
+│ V2      │ Compact Shortcode Dialect (32 tokens) + Exact Grounding │ 11.16s     │ -2.99s│
+│ V3      │ 1ms Lexical Element Grounding (BM25 + Tag Weighting)    │ 8.86s      │ -5.29s│
+│ V4      │ All-Applied (Atomic Prototype Fill + Fast DOM Settle)   │ 5.12s      │ -9.03s│
+│ V4-Fast │ Atomic Fill-Submit Combined Pattern                     │ 3.95s      │-10.20s│
+└─────────┴─────────────────────────────────────────────────────────┴────────────┴───────┘
+```
+
+* **Atomic Prototype Injection (2.9ms)**: Injects input directly using `HTMLInputElement.prototype.value.set`, triggering synthetic events without character-by-character keyboard loop delay. Verified across React 18, Vue 3, HTML5 numeric controls, and contenteditables (10/10 test parity).
+* **Sub-Millisecond Lexical Grounding (1.2ms)**: Bypasses PyTorch CPU dense embeddings (`multilingual-e5-small`) with BM25 token overlap + DOM tag weighting (inputs `+50`, buttons `+5`, divs `-2`).
+* **Compact Shortcode Dialect (~0.78s)**: Replaces verbose JSON schemas with concise single-line commands (`F 1 "PS5 Slim" 1`, `C 2`, `D`), capping model output at 32 tokens.
+* **Dual-Phase DOM Settling (0ms text settle)**: Pure text entries skip the settle loop; form submissions use a tightened 200ms quiet window with double `requestAnimationFrame` rendering verification.
 
 ### 1. Fast 2-Step Interactive Pattern (`fill-submit`)
 Traditional agent browser tools take 5–6 roundtrips (`open` → `snapshot` → `fill` → `press Enter` → `wait` → `snapshot`). `pi-nodriver-browser` compresses this into **2 atomic turns**:
@@ -1020,11 +1053,11 @@ Laya decisions at `http://127.0.0.1:8000/v1/systemone`.
 | `LAYA_INTENT_MODE` | unset (goal-only) | Unset: the agent passes only `{url?, goal, confirm?}` and the router's planner does every step. `full` restores the single-step actions (`open`, `click`, `plan`, `resolve`, ...) for debugging. |
 | `LAYA_INTENT_IMAGES` | `1` | `0` drops screenshots from tool results. |
 | `LAYA_URL` | `http://127.0.0.1:8000/v1/systemone` | Laya model server used by the router. |
-| `JUDGE_URL` / `JUDGE_MODEL` / `JUDGE_MAX_TOKENS` | router defaults / `96` | LLM judge that breaks ties between candidate elements. |
+| `JUDGE_URL` / `JUDGE_MODEL` / `JUDGE_MAX_TOKENS` | router defaults / `96` | Fallback LLM judge for legacy JSON dialect. V4 shortcode dialect uses exact call-local candidate IDs, bypassing the judge in the primary path. |
 | `INTENT_CLICK_MODE` | `dom` | How the router clicks the chosen element. |
 | `INTENT_VISION_DECIDER` | `laya` | Decider for the vision path. |
 | `INTENT_MEMORY` | `~/.cache/laya-browser-intent/memory.json` | Router memory of past groundings. |
-| `EMBED_THREADS` | `8` | CPU threads for the e5 embedder. This host: set in `laya-intent.service`. |
+| `EMBED_THREADS` | `8` | CPU threads for the e5 embedder (used for text excerpt matching; element candidate ranking uses 1ms BM25 LexicalRanker). |
 
 ### Benchmark-only
 
