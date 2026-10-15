@@ -1648,35 +1648,51 @@ REF_ACTION_JS = r'''JSON.stringify(((request) => {
       }
     }
 
-    for (let index = 0; index < requested.length; index += 1) {
+    if (!append) {
       if (!editable()) return rollback();
-      const character = requested[index];
-      const keyOptions = { key: character, bubbles: true, cancelable: true };
-      const keydownAllowed = target.dispatchEvent(new view.KeyboardEvent('keydown', keyOptions));
-      if (!keydownAllowed || !editable()) {
-        target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
-        if (!editable()) return rollback();
-        continue;
-      }
       const inputOptions = {
-        data: character,
+        data: requested,
         inputType: 'insertText',
         bubbles: true,
         cancelable: true
       };
-      const beforeInputAllowed = dispatchBeforeInput(inputOptions);
-      if (!beforeInputAllowed || !editable()) {
-        target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
-        if (!editable()) return rollback();
-        continue;
-      }
-      current += character;
-      setValue(current);
+      dispatchBeforeInput(inputOptions);
+      setValue(requested);
       mutated = true;
-      acceptedCount += 1;
+      acceptedCount = requested.length;
+      current = requested;
       dispatchInput(inputOptions);
-      target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
-      if (!editable() && index < requested.length - 1) return rollback();
+    } else {
+      for (let index = 0; index < requested.length; index += 1) {
+        if (!editable()) return rollback();
+        const character = requested[index];
+        const keyOptions = { key: character, bubbles: true, cancelable: true };
+        const keydownAllowed = target.dispatchEvent(new view.KeyboardEvent('keydown', keyOptions));
+        if (!keydownAllowed || !editable()) {
+          target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+          if (!editable()) return rollback();
+          continue;
+        }
+        const inputOptions = {
+          data: character,
+          inputType: 'insertText',
+          bubbles: true,
+          cancelable: true
+        };
+        const beforeInputAllowed = dispatchBeforeInput(inputOptions);
+        if (!beforeInputAllowed || !editable()) {
+          target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+          if (!editable()) return rollback();
+          continue;
+        }
+        current += character;
+        setValue(current);
+        mutated = true;
+        acceptedCount += 1;
+        dispatchInput(inputOptions);
+        target.dispatchEvent(new view.KeyboardEvent('keyup', keyOptions));
+        if (!editable() && index < requested.length - 1) return rollback();
+      }
     }
     if (mutated && liveValue() !== current) return rollback();
     if (mutated) {
@@ -5143,11 +5159,11 @@ class BrowserWorker:
             self.session_action_targets.clear()
             self.quarantined_target_ids.clear()
 
-    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.08):
+    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.04):
         """
         Adaptive fast-path DOM ready detector.
         Returns as soon as document.readyState is interactive/complete and body has content,
-        polling every 80ms up to timeout_sec (default 2.0s).
+        polling every 40ms up to timeout_sec (default 2.0s).
         """
         deadline = asyncio.get_running_loop().time() + timeout_sec
         try:
@@ -7959,7 +7975,7 @@ class BrowserWorker:
                 if not preserve_overlays:
                     try:
                         await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
-                        await page.sleep(0.3)
+                        await page.sleep(0.05)
                     except Exception:
                         pass
                 elements = await self.snapshot_elements(page, session_id)

@@ -142,7 +142,7 @@ def do_back(req: Act) -> dict:
             "note": "Reopened the previous URL; in-page state (search box, filters, SPA views) is not restored."}
 
 
-def _settled_state(session: str, before: dict, budget: float = 2.0, quiet: float = 0.6) -> dict:
+def _settled_state(session: str, before: dict, budget: float = 1.5, quiet: float = 0.2) -> dict:
     """Page state after an action. Waits for the first change (delayed transitions), then until the page
     has been stable for `quiet` seconds (multi-stage transitions), within `budget` seconds overall."""
     deadline = time.perf_counter() + budget
@@ -152,7 +152,7 @@ def _settled_state(session: str, before: dict, budget: float = 2.0, quiet: float
     while time.perf_counter() < deadline:
         if changed and time.perf_counter() - stable_since >= quiet:
             break
-        time.sleep(0.15)
+        time.sleep(0.04)
         nxt = _page_state(session)
         if nxt["fingerprint"] != after["fingerprint"] or nxt["url"] != after["url"]:
             stable_since = time.perf_counter()
@@ -416,7 +416,10 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
     PENDING.pop(session, None)
 
     p("settling", "⏳ 等待畫面變更與渲染穩定...")
-    after = _settled_state(session, before)
+    if action == "fill" and not req.submit:
+        after = _page_state(session)
+    else:
+        after = _settled_state(session, before, budget=1.5, quiet=0.2)
     changed = {"navigated": after["url"] != before["url"], "dom_changed": after["fingerprint"] != before["fingerprint"]}
     verified = changed["navigated"] or changed["dom_changed"]
     # Some client-rendered sites swallow the normal CDP activation on anchors. Retry the
