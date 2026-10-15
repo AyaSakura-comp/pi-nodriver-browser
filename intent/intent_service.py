@@ -577,8 +577,20 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30) -> li
         return []
     labels = [L._label(c, 160) for c in pool]
     if len(labels) > limit:
-        sc = ROUTER.E.scores(goal, labels)
-        keep = sorted(sorted(range(len(labels)), key=lambda i: -sc[i])[:limit])
+        # Fast 1ms lexical BM25/IDF scoring with control type weighting
+        sc = L.lexical_scores(goal, pool)
+        def score_fn(i):
+            c = pool[i]
+            val = sc[i] * 10.0
+            if c.tag in ("input", "textarea", "select"):
+                val += 50.0  # Always reserve slots for form/search inputs
+            elif c.tag == "button":
+                val += 5.0   # Buttons are high-value action triggers
+            elif c.tag == "div":
+                val -= 2.0   # Deprioritize generic container divs
+            return val
+        top_idx = sorted(range(len(labels)), key=score_fn, reverse=True)[:limit]
+        keep = sorted(top_idx)
         labels = [labels[i] for i in keep]
     return labels
 

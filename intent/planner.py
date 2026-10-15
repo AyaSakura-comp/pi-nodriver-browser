@@ -2,47 +2,125 @@
 import json, re, time
 from judge import resolve_endpoint, resolve_model, make_headers, chat_body, chat
 
-PROMPT = """You drive a web browser one step at a time toward the user's goal. Decide ONLY the next step.
-Goal: {goal}
-Steps done so far:
-{history}
-Current page: {title} | {url}
-Page text most related to the goal (in page order, " | " between lines): {excerpt}
-Elements on the page (visible names; "(no text)" = icon/switch/custom control):
-{elements}
-
-Rules:
-- click/fill/select: "target" = copy the element name from the list when possible, plus distinguishing words.
-- fill: put the text in "value"; set "submit": true to press Enter (e.g. a search box).
-- select: dropdown target + option text in "value".
-- scroll: "value" = down, up, top or bottom, when what the goal needs is not in the visible text yet.
-- done: the page text above already shows what the goal asks for (or the goal's action is complete).
-- fail: the goal cannot be reached from here (explain in reason).
-- Never click a different control as a substitute for the one the goal needs.
-- Never buy, checkout, pay, delete or log out unless the goal explicitly says so.
-Reply with JSON only: {{"action":"click|fill|select|scroll|done|fail","target":"","value":"","submit":false,"reason":"<=12 words"}}"""
-
-
 def next_step(goal, history, state, elements, timeout=30, url=None, model=None, headers=None):
     hist = "\n".join(f"{i+1}. {h}" for i, h in enumerate(history)) or "(none yet)"
-    els = "\n".join(f"- {e}" for e in elements) or "(none)"
+    candidates = _candidates(elements)
+    els = "\n".join(f"{i}: {name}" + (" OPTIONS " + "; ".join(f"{j}: {v}" for j, v in enumerate(options, 1)) if options else "") for i, (name, options) in enumerate(candidates, 1)) or "(none)"
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = chat_body(target_url, target_model, 120, [{"role": "user", "content": PROMPT.format(
+    body = chat_body(target_url, target_model, 32, [{"role": "user", "content": COMPACT_PROMPT.format(
         goal=goal, history=hist, title=state.get("title", ""), url=state.get("url", ""),
         excerpt=state.get("page_excerpt", "")[:900], elements=els)}])
     t = time.perf_counter()
     out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
-    m = re.search(r"\{.*\}", out, re.S)
+    return _compact_step(out, candidates), ms
+
+
+COMPACT_PROMPT = """Choose ONE next browser action toward the goal, using ONLY the current candidates.
+Goal: {goal}
+History: {history}
+Page: {title} | {url}
+Relevant page text: {excerpt}
+Candidates (call-local IDs):
+{elements}
+Reply ONLY one command, no JSON object, explanation, equals sign or extra lines.
+Syntax examples (replace numeric IDs with actual candidate IDs):
+C 2
+S 1 2
+S 1 "exact option text"
+F 3 "text" 0
+R down
+D
+X
+C clicks.
+F fills an input or search box (e.g. F 1 "query" 1); final 0 means no Enter and final 1 means press Enter.
+S selects a dropdown option; S is ONLY for dropdown menus, NEVER for searching or typing text.
+R scrolls down/up/top/bottom when goal content is not visible.
+D means done ONLY if current page text already shows goal achieved.
+X means cannot reach goal.
+Quoted text must be a JSON string. IDs start at 1. Never guess IDs or substitute controls.
+Never buy, checkout, pay, delete or log out unless the goal explicitly requests it.
+"""
+
+
+def _candidates(elements):
+    result = []
+    for element in elements:
+        name, sep, raw = str(element).partition(" | options: ")
+        # Only consume explicitly supplied metadata; never infer options from other text.
+        options = raw.split("; ") if sep else []
+        result.append((name, options))
+    return result
+
+
+def _compact_step(out, candidates):
+    fail = {"action": "fail", "reason": f"invalid compact planner command or unavailable candidate: {out[:80]!r}"}
+    text = out.strip()
+    if text == "D":
+        return {"action": "done"}
+    if text == "X":
+        return {"action": "fail", "reason": "planner cannot reach the goal from current candidates"}
+    m = re.fullmatch(r"R (down|up|top|bottom)", text)
+    if m:
+        return {"action": "scroll", "value": m[1]}
+    m = re.fullmatch(r"([CSF]) ([1-9][0-9]*)(?: (.+))?", text)
+    if not m or int(m[2]) > len(candidates):
+        # Fallback for backward compatibility with JSON dialect or legacy tests
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                step = json.loads(text)
+                if step.get("action") in ("click", "fill", "select", "scroll", "done", "fail"):
+                    return step
+            except Exception:
+                pass
+        return fail
+    action, index, tail = m[1], int(m[2]) - 1, m[3]
+    name, options = candidates[index]
+    if action == "C":
+        return {"action": "click", "target": name} if tail is None else fail
+    # Support fill action (or model mistaking S for search when followed by submit flag)
+    if (action == "F" or action == "S") and tail and (tail.endswith(" 0") or tail.endswith(" 1")):
+        try:
+            value, end = json.JSONDecoder().raw_decode(tail)
+            submit = tail[end:]
+            if isinstance(value, str) and submit in (" 0", " 1"):
+                return {"action": "fill", "target": name, "value": value, "submit": submit == " 1"}
+        except ValueError:
+            pass
+    if action == "S":
+        if options:
+            if tail and re.fullmatch(r"[1-9][0-9]*", tail):
+                if int(tail) > len(options):
+                    return fail
+                value = options[int(tail)-1]
+            else:
+                # Safe compatibility: quoted text must exactly identify ONE listed option.
+                try:
+                    value = json.loads(tail or "")
+                except (ValueError, TypeError):
+                    return fail
+                if not isinstance(value, str) or options.count(value) != 1:
+                    return fail
+        else:
+            try:
+                value = json.loads(tail or "")
+            except (ValueError, TypeError):
+                return fail
+            if not isinstance(value, str) or not value:
+                return fail
+        return {"action": "select", "target": name, "value": value}
+    if not tail:
+        return fail
     try:
-        step = json.loads(m.group(0)) if m else {}
-    except Exception:
-        step = {}
-    if step.get("action") not in ("click", "fill", "select", "scroll", "done", "fail"):
-        step = {"action": "fail", "reason": f"unparseable planner output: {out[:80]}"}
-    return step, ms
+        value, end = json.JSONDecoder().raw_decode(tail)
+    except ValueError:
+        return fail
+    submit = tail[end:]
+    if not isinstance(value, str) or submit not in (" 0", " 1"):
+        return fail
+    return {"action": "fill", "target": name, "value": value, "submit": submit == " 1"}
 
 
 FULL_PROMPT = """You drive a web browser toward the user's goal. The compact view was not enough, so you now see
