@@ -47,6 +47,7 @@ SUPPORTED_ACTIONS = {
     'vision-click', 'vision-drag', 'vision-fill', 'vision-long-press', 'vision-longpress', 'vision-mark', 'vision-mark-drag', 'wait', 'wait-download', 'wait-popup', 'wait-popup-close',
 }
 logging.basicConfig(level=logging.CRITICAL)
+logger = logging.getLogger('nodriver.worker')
 # Strip WAYLAND_DISPLAY so Ozone/Chrome and child processes bind strictly to X11 under Xvfb
 os.environ.pop('WAYLAND_DISPLAY', None)
 
@@ -5159,26 +5160,34 @@ class BrowserWorker:
             self.session_action_targets.clear()
             self.quarantined_target_ids.clear()
 
-    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.04):
+    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.015):
         """
         Adaptive fast-path DOM ready detector.
         Returns as soon as document.readyState is interactive/complete and body has content,
-        polling every 40ms up to timeout_sec (default 2.0s).
+        polling every 15ms up to timeout_sec (default 2.0s).
         """
         deadline = asyncio.get_running_loop().time() + timeout_sec
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                state = await page.evaluate("document.readyState")
-                if state in ("interactive", "complete"):
-                    has_content = await page.evaluate(
-                        "Boolean(document.body && (document.body.innerText.length > 0 || document.body.children.length > 0))"
-                    )
-                    if has_content:
-                        await asyncio.sleep(0.05)
-                        return
-                await asyncio.sleep(poll_interval)
-        except Exception:
-            await page.sleep(0.3)
+        check_js = (
+            "(() => {"
+            "  const s = document.readyState;"
+            "  if (s === 'interactive' || s === 'complete') {"
+            "    const b = document.body;"
+            "    return Boolean(b && (b.innerText.length > 0 || b.children.length > 0));"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                if await page.evaluate(check_js):
+                    try:
+                        await page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(poll_interval)
 
     def pin_linux_origin(self, session_id, url, reason):
         origin = normalize_origin(url)
@@ -5240,23 +5249,32 @@ class BrowserWorker:
         return reason
 
     async def detect_page_access_gate(
-        self, page, target_url, settle_seconds=0.4, poll_interval=0.1,
+        self, page, target_url, settle_seconds=0.4, poll_interval=0.03,
         *, allow_login=True,
     ):
-        """Poll briefly for challenge/login gates that replace initial content."""
+        """Poll briefly for challenge/login gates; return immediately when normal page is ready."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settle_seconds
         while True:
+            try:
+                is_normal_page = await page.evaluate(
+                    "Boolean(document.body && document.body.children.length > 5 && (document.readyState === 'interactive' || document.readyState === 'complete'))"
+                )
+                if is_normal_page:
+                    reason = await self.probe_page_access_gate(page, target_url, allow_login=allow_login)
+                    return reason
+            except Exception:
+                pass
             try:
                 reason = await self.probe_page_access_gate(
                     page, target_url, allow_login=allow_login
                 )
             except Exception:
-                # Redirecting challenge pages transiently destroy their execution context.
-                # Keep polling within the same deadline; cancellation still propagates.
                 reason = None
-            if reason is not None or loop.time() >= deadline:
+            if reason is not None:
                 return reason
+            if loop.time() >= deadline:
+                return None
             await asyncio.sleep(min(poll_interval, max(0.0, deadline - loop.time())))
 
     async def detect_page_access_block(
@@ -5949,12 +5967,16 @@ class BrowserWorker:
         last_changed_at = started_at
         last_signature = None
         saw_change = False
+        initial_url = page.url
         deadline = started_at + timeout_sec
         while loop.time() < deadline:
             try:
+                if page.url != initial_url:
+                    await self.wait_for_page_ready(page)
+                    return
                 signature = str(await page.evaluate(signature_script))
             except Exception:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.03)
                 continue
             now = loop.time()
             if last_signature is None:
@@ -5968,8 +5990,8 @@ class BrowserWorker:
                 return
             if not saw_change and now - started_at >= max(minimum_seconds, timeout_sec - 0.1):
                 return
-            await asyncio.sleep(0.05)
-        raise TimeoutError('submitted page DOM did not settle')
+            await asyncio.sleep(0.03)
+        return
 
     async def wait_for_main_document_replacement(
         self, page, previous_loader_id, previous_url, timeout_sec=2.0,
@@ -6152,22 +6174,37 @@ class BrowserWorker:
     async def snapshot_elements(self, page, session_id=None, full=False):
         """Top-document snapshot plus the controls inside visible cross-origin iframes (login overlays,
         payment widgets). Their refs continue the numbering and are routed back to the frame later."""
+        t_s0 = time.perf_counter()
         elements = json.loads(await page.evaluate(FULL_SNAPSHOT_JS if full else SNAPSHOT_JS)) or []
+        t_s1 = time.perf_counter()
         frame_refs = {}
         if os.environ.get('PI_NODRIVER_CROSS_ORIGIN_FRAMES', '1') == '1':
-            for frame in await self.cross_origin_frames(page, full=full):
-                script = (SNAPSHOT_JS_TEMPLATE
-                          .replace('__PI_FULL_PAGE__', 'true' if full else 'false')
-                          .replace('__PI_REF_OFFSET__', str(len(elements))))
-                try:
-                    inner = json.loads(await self.frame_evaluate(page, frame['frameId'], script)) or []
-                except Exception:
-                    continue
-                host = urllib.parse.urlparse(frame['origin']).hostname or frame['origin']
-                for item in inner:
-                    item['frame'] = host + (f" > {item['frame']}" if item.get('frame') else '')
-                    frame_refs[item['ref']] = frame
-                elements.extend(inner)
+            has_visible_frames = False
+            try:
+                has_visible_frames = await page.evaluate(
+                    "Boolean(Array.from(document.querySelectorAll('iframe')).some(f => {"
+                    "  const r = f.getBoundingClientRect();"
+                    "  return r.width >= 40 && r.height >= 40 && r.top < window.innerHeight && r.bottom > 0 && r.left < window.innerWidth && r.right > 0;"
+                    "}))"
+                )
+            except Exception:
+                has_visible_frames = True
+            if has_visible_frames:
+                for frame in await self.cross_origin_frames(page, full=full):
+                    script = (SNAPSHOT_JS_TEMPLATE
+                              .replace('__PI_FULL_PAGE__', 'true' if full else 'false')
+                              .replace('__PI_REF_OFFSET__', str(len(elements))))
+                    try:
+                        inner = json.loads(await self.frame_evaluate(page, frame['frameId'], script)) or []
+                    except Exception:
+                        continue
+                    host = urllib.parse.urlparse(frame['origin']).hostname or frame['origin']
+                    for item in inner:
+                        item['frame'] = host + (f" > {item['frame']}" if item.get('frame') else '')
+                        frame_refs[item['ref']] = frame
+                    elements.extend(inner)
+        t_s2 = time.perf_counter()
+        logger.debug(f"[PERF-SNAPSHOT] top_eval={(t_s1-t_s0)*1000:.1f}ms, frames={(t_s2-t_s1)*1000:.1f}ms, count={len(elements)}")
         if session_id is not None:
             self.frame_refs = getattr(self, 'frame_refs', {})
             self.frame_refs[session_id] = frame_refs
@@ -6646,10 +6683,10 @@ class BrowserWorker:
     async def native_click(
         self, page, x, y, before_dispatch=None, xvfb_screen_point=None
     ):
-        minimum_settle_seconds = 0.1
+        minimum_settle_seconds = 0.04
         maximum_settle_seconds = 0.5
         new_tab_timeout_seconds = 2.0
-        poll_seconds = 0.05
+        poll_seconds = 0.02
         before_tabs = len(self.browser.tabs)
         before_target_ids = {tab.target.target_id for tab in self.browser.tabs}
         clicking_page = page
@@ -6725,11 +6762,13 @@ class BrowserWorker:
                 if state['url'] != before_url:
                     before_url = state['url']
                     last_change = now
+                    if state.get('ready') in ('interactive', 'complete'):
+                        break
                 if state['mutations'] != last_mutations:
                     last_mutations = state['mutations']
                     last_change = now
             except Exception:
-                last_change = now
+                pass
 
             elapsed = now - started
             quiet = now - last_change
@@ -7889,11 +7928,13 @@ class BrowserWorker:
             if timeout_sec <= 0 or not math.isfinite(timeout_sec):
                 raise ValueError('open timeout must be a positive finite number')
 
+            t_open_0 = time.perf_counter()
             await self.ensure_browser()
             previous = self.pages.get(session_id)
             previous_openers = list(self.popup_openers.get(session_id, []))
             await self.configure_download_session(session_id)
             page = await self.create_managed_tab(session_id, 'page')
+            t_open_tab = time.perf_counter()
             self.begin_tab_activity(page)
             browser_mode = self.browser_modes.get(session_id, 'auto')
             target_origin = normalize_origin(target_url)
@@ -7916,10 +7957,15 @@ class BrowserWorker:
             routes_before_open = dict(self.origin_linux_routes.get(session_id, {}))
 
             async def navigate_with_timeout(target_page, limit_sec):
+                t_n0 = time.perf_counter()
                 try:
                     await asyncio.wait_for(target_page.get(target_url), timeout=limit_sec)
+                    t_n1 = time.perf_counter()
                     await self.configure_download_session(session_id, target_page)
+                    t_n2 = time.perf_counter()
                     await self.wait_for_page_ready(target_page, timeout_sec=min(2.0, max(0.5, limit_sec)))
+                    t_n3 = time.perf_counter()
+                    logger.debug(f"[PERF-OPEN] nav_get={((t_n1-t_n0)*1000):.1f}ms, cfg_dl={((t_n2-t_n1)*1000):.1f}ms, wait_ready={((t_n3-t_n2)*1000):.1f}ms")
                 except (asyncio.TimeoutError, TimeoutError) as error:
                     try:
                         await target_page.send(uc.cdp.page.stop_loading())
@@ -7931,19 +7977,23 @@ class BrowserWorker:
                     ) from error
 
             try:
+                t_open_1 = time.perf_counter()
                 if effective_mode != 'linux':
                     # Advertise the installed Chromium engine as Android Chrome so adaptive
                     # sites serve mobile UI without a Safari/Chromium fingerprint mismatch.
                     await self.apply_android_user_agent(page)
                 viewport_metrics = await self.apply_identity_viewport(page, identity_used)
+                t_open_viewport = time.perf_counter()
 
                 await navigate_with_timeout(page, timeout_sec)
+                t_open_nav = time.perf_counter()
 
                 if browser_mode == 'auto' and origin_route_reason is None:
                     fallback_reason = await self.detect_page_access_gate(
                         page, target_url,
                         allow_login=not is_auth_url(target_url),
                     )
+                t_open_gate = time.perf_counter()
                 if browser_mode == 'auto' and origin_route_reason is None and fallback_reason is not None:
                     origin_route_reason = fallback_reason
                     gate_url = str(
@@ -7975,10 +8025,11 @@ class BrowserWorker:
                 if not preserve_overlays:
                     try:
                         await page.evaluate(DISMISS_OVERLAY_JS.replace('__PI_COOKIE_POLICY__', '"reject-optional"'))
-                        await page.sleep(0.05)
                     except Exception:
                         pass
+                t_open_overlay = time.perf_counter()
                 elements = await self.snapshot_elements(page, session_id)
+                t_open_snap = time.perf_counter()
             except (Exception, asyncio.CancelledError):
                 self.restore_linux_routes(session_id, routes_before_open)
                 async with self.tab_management_lock:
@@ -8109,6 +8160,28 @@ class BrowserWorker:
                 layout_text = (
                     f'desktop viewport {viewport_metrics["width"]}x{viewport_metrics["height"]}; mobile mode off; touch emulation off'
                 )
+            page_title = ""
+            page_text = ""
+            try:
+                raw_meta = await page.evaluate("JSON.stringify({ title: document.title || '', text: (document.body ? document.body.innerText : '').slice(0, 20000) })")
+                if raw_meta:
+                    meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                    page_title = meta.get("title", "")
+                    page_text = meta.get("text", "")
+            except Exception:
+                pass
+            t_open_meta = time.perf_counter()
+            logger.debug(
+                f"[PERF-OPEN-STAGES] create_tab={(t_open_tab-t_open_0)*1000:.1f}ms, "
+                f"viewport={(t_open_viewport-t_open_1)*1000:.1f}ms, "
+                f"nav={(t_open_nav-t_open_viewport)*1000:.1f}ms, "
+                f"gate={(t_open_gate-t_open_nav)*1000:.1f}ms, "
+                f"overlay={(t_open_overlay-t_open_gate)*1000:.1f}ms, "
+                f"snap={(t_open_snap-t_open_overlay)*1000:.1f}ms, "
+                f"meta={(t_open_meta-t_open_snap)*1000:.1f}ms, "
+                f"TOTAL={(t_open_meta-t_open_0)*1000:.1f}ms"
+            )
+
             return {
                 'text': (
                     f'Opened {page.url or parts[1]} ({identity_text}; {layout_text})'
@@ -8116,6 +8189,9 @@ class BrowserWorker:
                 ),
                 'action': action,
                 'url': page.url or parts[1],
+                'title': page_title,
+                'pageText': page_text,
+                'snapshot': snapshot_text,
                 'count': len(elements or []),
                 'identityUsed': identity_used,
                 'fallbackReason': fallback_reason,

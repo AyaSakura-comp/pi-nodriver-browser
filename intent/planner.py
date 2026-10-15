@@ -65,7 +65,7 @@ def _compact_step(out, candidates):
     m = re.fullmatch(r"R (down|up|top|bottom)", text)
     if m:
         return {"action": "scroll", "value": m[1]}
-    m = re.fullmatch(r"([CSF]) ([1-9][0-9]*)(?: (.+))?", text)
+    m = re.fullmatch(r"([CSFLB]) ([1-9][0-9]*)(?: (.+))?", text)
     if not m or int(m[2]) > len(candidates):
         # Fallback for backward compatibility with JSON dialect or legacy tests
         if text.startswith("{") and text.endswith("}"):
@@ -78,7 +78,7 @@ def _compact_step(out, candidates):
         return fail
     action, index, tail = m[1], int(m[2]) - 1, m[3]
     name, options = candidates[index]
-    if action == "C":
+    if action in ("C", "L", "B"):
         return {"action": "click", "target": name} if tail is None else fail
     # Support fill action (or model mistaking S for search when followed by submit flag)
     if (action == "F" or action == "S") and tail and (tail.endswith(" 0") or tail.endswith(" 1")):

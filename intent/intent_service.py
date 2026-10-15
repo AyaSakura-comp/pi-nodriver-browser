@@ -91,9 +91,11 @@ def _q(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _page_state(session: str, snap_text: str | None = None) -> dict:
-    url = (_cmd(session, "get url").get("text") or "").strip()
-    title = (_cmd(session, "get title").get("text") or "").strip()
+def _page_state(session: str, snap_text: str | None = None, title: str | None = None, url: str | None = None, text: str | None = None) -> dict:
+    if url is None:
+        url = (_cmd(session, "get url").get("text") or "").strip()
+    if title is None:
+        title = (_cmd(session, "get title").get("text") or "").strip()
     if snap_text is None:
         snap_text = _cmd(session, "snapshot -i").get("text", "")
     els = L.parse_snapshot(snap_text)
@@ -113,8 +115,11 @@ def _page_state(session: str, snap_text: str | None = None) -> dict:
                     cand_links.append({"title": name[:80], "url": full_url})
     PAGE_LINKS[session] = cand_links
     # Visible text is part of the fingerprint: two states can expose identical controls (e.g. "− ＋").
-    gt = _cmd(session, "get text")
-    text = (gt.get("pageText") or gt.get("text") or "")[:20000]
+    if text is None:
+        gt = _cmd(session, "get text")
+        text = (gt.get("pageText") or gt.get("text") or "")[:20000]
+    else:
+        text = text[:20000]
     fp = L.fingerprint(snap_text + "\n@e-text " + hashlib.sha1(text.encode()).hexdigest())
     excerpt = re.sub(r"\s+", " ", text).strip()[:300]
     return {"url": url, "title": title, "headings": heads, "page_excerpt": excerpt, "fingerprint": fp,
@@ -147,17 +152,21 @@ def _settled_state(session: str, before: dict, budget: float = 1.5, quiet: float
     has been stable for `quiet` seconds (multi-stage transitions), within `budget` seconds overall."""
     deadline = time.perf_counter() + budget
     after = _page_state(session)
-    changed = after["url"] != before["url"] or after["fingerprint"] != before["fingerprint"]
+    if after["url"] != before["url"]:
+        return after
+    changed = after["fingerprint"] != before["fingerprint"]
     stable_since = time.perf_counter()
     while time.perf_counter() < deadline:
         if changed and time.perf_counter() - stable_since >= quiet:
             break
         time.sleep(0.04)
         nxt = _page_state(session)
-        if nxt["fingerprint"] != after["fingerprint"] or nxt["url"] != after["url"]:
+        if nxt["url"] != before["url"]:
+            return nxt
+        if nxt["fingerprint"] != after["fingerprint"]:
             stable_since = time.perf_counter()
+            changed = True
         after = nxt
-        changed = changed or after["url"] != before["url"] or after["fingerprint"] != before["fingerprint"]
     return after
 
 
@@ -208,7 +217,11 @@ def do_open(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         return {"status": "ERROR", "message": "open 需要指定 url 或是從當前頁面候選連結指定 pick 編號"}
     p("opening", f"🌐 正在導航至：{target_url}...")
     r = _cmd(req.session, f"open {target_url}")
-    st = _page_state(req.session)
+    snap = r.get("snapshot")
+    if snap is not None:
+        st = _page_state(req.session, snap_text=snap, title=r.get("title"), url=r.get("url"), text=r.get("pageText"))
+    else:
+        st = _page_state(req.session)
     _remember(req.session, st["url"])
     p("opened", f"✓ 頁面載入完成 (標題: 「{st.get('title')}」)")
     return {"status": "OPENED", **_public(st), "screenshot": r.get("screenshotPath")}
@@ -416,7 +429,7 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
     PENDING.pop(session, None)
 
     p("settling", "⏳ 等待畫面變更與渲染穩定...")
-    if action == "fill" and not req.submit:
+    if (action == "fill" and not req.submit) or (r and r.get("url") and r.get("url") != before["url"]):
         after = _page_state(session)
     else:
         after = _settled_state(session, before, budget=1.5, quiet=0.2)

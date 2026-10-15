@@ -40,6 +40,11 @@ _KIND = re.compile(r"^\s*(link|button|input(\s+type=\w+)?|textbox|dropdown|div|s
 
 
 def exact_name_match(intent: str, cands: list[L.Element]) -> L.Element | None:
+    # If looking for a search input and there is uniquely one search input on page, match it
+    if "type=search" in intent:
+        search_inputs = [c for c in cands if c.tag == "input" and c.attrs.get("type") == "search"]
+        if len(search_inputs) == 1:
+            return search_inputs[0]
     # The autopilot copies labels as "button: ×"; strip the kind prefix and trailing hint brackets.
     stripped = re.sub(r"\s*\[[^\]]*\]\s*$", "", _KIND.sub("", intent)).rstrip("…")
     whole = [c for c in cands if _compact(c.name() or L._label(c).split(": ", 1)[-1]) == _compact(stripped)]
