@@ -425,7 +425,14 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         r = _cmd(session, f"select @{ref} {_q(req.value or '')}")
     elif action == "fill":
         verb = "fill-submit" if req.submit else "fill"
-        r = _cmd(session, f"{verb} @{ref} {_q(req.value or '')}")
+        try:
+            r = _cmd(session, f"{verb} @{ref} {_q(req.value or '')}")
+        except RuntimeError as e:
+            if req.submit and "has no associated form" in str(e):
+                r = _cmd(session, f"fill @{ref} {_q(req.value or '')}")
+                _cmd(session, "press Enter")
+            else:
+                raise
     else:
         raise ValueError(action)
     PENDING.pop(session, None)
@@ -638,12 +645,17 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclu
         sc = L.lexical_scores(goal, pool)
         def score_fn(i):
             c = pool[i]
-            val = sc[i] * 10.0
-            if c.tag in ("input", "textarea", "select"):
-                val += 50.0  # Always reserve slots for form/search inputs
+            val = sc[i] * 50.0
+            is_fillable = c.tag == "textarea" or (c.tag == "input" and c.attrs.get("type", "") in L.FILLABLE_TYPES)
+            if is_fillable:
+                val += 5.0 if sc[i] > 0 else 1.5
             elif c.tag == "button":
-                val += 5.0   # Buttons are high-value action triggers
-            if c.attrs.get("scope") in ("nav", "footer"):
+                val += 2.0 if sc[i] > 0 else 0.5
+            elif c.tag in ("a", "summary"):
+                val += 2.0 if sc[i] > 0 else 0.0
+            elif c.tag == "div":
+                val -= 2.0
+            if not is_fillable and c.attrs.get("scope") in ("nav", "footer"):
                 val -= 15.0  # Deprioritize persistent global navigation
             elif c.attrs.get("scope") == "main":
                 val += 15.0  # Prioritize primary content area
@@ -651,7 +663,8 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclu
                 val -= 1000.0  # Deprioritize clicking already-active tabs or self-links
             return val
         top_idx = sorted(range(len(labels)), key=score_fn, reverse=True)[:limit]
-        labels = [labels[i] for i in top_idx]
+        keep = sorted(top_idx)
+        labels = [labels[i] for i in keep]
     return labels
 
 
@@ -756,7 +769,10 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         history.append(f"opened {r.get('url')}")
     last = {}
     for i in range(1, max(1, min(req.max_steps, 25)) + 1):
-        st = _page_state(session)
+        if i == 1 and req.url:
+            st = _settled_state(session, before={"url": "", "fingerprint": ""}, budget=1.5, quiet=0.2)
+        else:
+            st = _page_state(session)
         st = {**st, "page_excerpt": _goal_text(session, goal, st.get("page_excerpt", ""))}
         if escalate:
             # Fallback: the compact view failed; look at the full snapshot -i plus a screenshot.
@@ -825,7 +841,17 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             before = _page_state(session)
             x, y = box["center"]
             p("task_exec", f"⚡ 執行點擊視覺方塊 {box['id']} ({step.get('target', '')})...")
-            r = _cmd(session, f"vision-click {x} {y}")
+            try:
+                r = _cmd(session, f"vision-click {x} {y}")
+            except Exception as exc:
+                p("task_step", f"⚠️ 視覺點擊失敗（{str(exc)[:60]}）")
+                misses += 1
+                history.append(f"click box {box['id']} failed: {str(exc)[:80]}")
+                rec.update(status="CLICK_FAILED", element=f"box {box['id']}")
+                trace.append(rec)
+                if misses >= 2:
+                    break
+                continue
             after = _settled_state(session, before)
             moved = after["url"] != before["url"] or after["fingerprint"] != before["fingerprint"]
             last = {"status": "CLICKED" if moved else "CLICKED_UNCONFIRMED", "element": f"box {box['id']} ({step.get('target', '')})",
