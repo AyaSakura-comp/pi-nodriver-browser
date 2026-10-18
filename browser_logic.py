@@ -1383,6 +1383,7 @@ def format_snapshot(elements: list[dict]) -> str:
             ('frameSrc', 'src'),
             ('href', 'href'),
             ('download', 'download'),
+            ('scope', 'scope'),
         ):
             value = _compact(str(item.get(key) or ''), 160)
             if value:
@@ -1401,6 +1402,12 @@ def format_snapshot(elements: list[dict]) -> str:
         ):
             if item.get(state) is not None:
                 line += f' {label}="{str(bool(item[state])).lower()}"'
+        for state, label in (
+            ('activeTab', 'active-tab'),
+            ('currentUrl', 'current-url'),
+        ):
+            if item.get(state):
+                line += f' {label}="true"'
         if tag == 'select' and item.get('optionCount') is not None:
             option_summary = str(item['optionCount'])
             if item.get('optionType'):

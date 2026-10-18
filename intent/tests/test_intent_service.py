@@ -106,11 +106,28 @@ class AnchorClickFallbackTests(unittest.TestCase):
             '@e96 <a> "登入" frame="account.momoshop.com.tw"'
         )
         cands = service._planner_elements("s", "點擊登入按鈕", snap)
-        # Both top-nav and iframe login button are preserved
         login_cands = [c for c in cands if "登入" in c]
         self.assertEqual(len(login_cands), 2)
         self.assertTrue(any("frame: account.momoshop.com.tw" in c for c in login_cands))
 
+    def test_active_tab_and_current_url_annotation(self):
+        snap = (
+            '@e1 <a> "續約購機" scope="nav" active-tab="true" current-url="true"\n'
+            '@e2 <a> "iPhone 16 Pro" scope="main"'
+        )
+        cands = service._planner_elements("s", "續約購機", snap)
+        self.assertTrue(any("目前已在此分頁 active/current tab" in c and "導航選單 nav" in c for c in cands if "續約購機" in c))
+        self.assertTrue(any("iPhone 16 Pro" in c for c in cands))
+
+    def test_active_tab_deprioritized_when_ranking(self):
+        # Generate 35 candidates so limit (30) forces scoring
+        lines = ['@e1 <a> "續約購機" active-tab="true" current-url="true"']
+        for i in range(2, 36):
+            lines.append(f'@e{i} <button> "選購商品 {i}"')
+        snap = "\n".join(lines)
+        ranked = service._planner_elements("s", "續約購機", snap, limit=30)
+        # Verify active-tab item was deprioritized compared to other high scoring items
+        self.assertEqual(len(ranked), 30)
 
 if __name__ == "__main__":
     unittest.main()

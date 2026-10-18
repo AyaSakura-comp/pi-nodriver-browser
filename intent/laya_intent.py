@@ -221,6 +221,12 @@ def annotate(e: Element) -> str:
         tags.append("缺貨 out of stock")
     if BUNDLE.search(name):
         tags.append("多件組/組合 bundle")
+    if e.attrs.get("current-url") == "true" or e.attrs.get("active-tab") == "true":
+        tags.append("目前已在此分頁 active/current tab")
+    if e.attrs.get("scope") == "nav":
+        tags.append("導航選單 nav")
+    elif e.attrs.get("scope") == "dialog":
+        tags.append("彈出對話框 dialog")
     if e.attrs.get("frame"):
         tags.append(f"frame: {e.attrs['frame']}")
     return name + (f" [{'; '.join(tags)}]" if tags else "")

@@ -640,6 +640,36 @@ SNAPSHOT_JS_TEMPLATE = r'''JSON.stringify(((fullPage) => {
       ) ? 'numeric' : (el.tagName === 'SELECT' ? 'text' : ''),
       offscreen: isOffscreen ? true : null,
       frame,
+      scope: (el.closest?.('dialog, [role="dialog"], .modal') ? 'dialog'
+        : (el.closest?.('nav, header, [role="navigation"], #header, .nav-global-header') ? 'nav'
+        : (el.closest?.('footer, [role="contentinfo"], #footer') ? 'footer' : ''))),
+      currentUrl: el.tagName === 'A' && el.href && (() => {
+        try {
+          const docUrl = el.ownerDocument.location?.href || '';
+          if (!docUrl) return null;
+          const u1 = new URL(el.href, docUrl);
+          const u2 = new URL(docUrl);
+          if (u1.origin !== u2.origin) return null;
+          if (u1.pathname.replace(/\/+$/, '') !== u2.pathname.replace(/\/+$/, '')) return null;
+          if (u1.search && u1.search !== u2.search) return null;
+          if (u1.hash && u1.hash !== '#' && u1.hash !== u2.hash) return null;
+          return true;
+        } catch (_) { return null; }
+      })(),
+      activeTab: (() => {
+        try {
+          const isCurrent = el.matches?.('[aria-current], [aria-selected="true"], .active, .is-active, .selected, .current');
+          if (isCurrent) return true;
+          if (el.parentElement?.tagName === 'LI' && el.parentElement.matches?.('.active, .is-active, .selected, .current, [aria-current], [aria-selected="true"]')) {
+            return true;
+          }
+          const tabParent = el.closest?.('[role="tab"], .tab, .tab-item');
+          if (tabParent && tabParent !== el && (tabParent.matches?.('.active, .is-active, .selected, .current, [aria-selected="true"], [aria-current]'))) {
+            return true;
+          }
+          return null;
+        } catch (_) { return null; }
+      })(),
       // Cross-origin iframes (e.g. login overlays on another subdomain) cannot be traversed from here:
       // expose their origin so the agent knows the controls exist and must be reached visually.
       frameSrc: el.tagName === 'IFRAME'
@@ -9565,7 +9595,12 @@ class BrowserWorker:
                     response['pageText'] = pdf_result['text']
                 return response
             if kind == 'url':
-                text = page.url
+                try:
+                    text = page.url or getattr(getattr(page, 'target', None), 'url', None) or ''
+                    if not text or text == 'about:blank':
+                        text = await page.evaluate('window.location.href') or text
+                except Exception:
+                    text = page.url or ''
             elif kind == 'title':
                 text = await page.evaluate('document.title')
             elif kind == 'text' and len(parts) > 2:

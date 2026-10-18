@@ -38,6 +38,7 @@ D means done ONLY if current page text already shows goal achieved.
 X means cannot reach goal.
 Quoted text must be a JSON string. IDs start at 1. Never guess IDs or substitute controls.
 Never buy, checkout, pay, delete or log out unless the goal explicitly requests it.
+Never click controls tagged [目前已在此分頁 active/current tab] because that page/section is already active.
 
 Goal: {goal}
 History: {history}
@@ -132,6 +133,7 @@ Goal: {goal}
 Steps done so far:
 {history}
 Current page: {title} | {url}
+Relevant page text: {excerpt}
 Full element list (snapshot -i):
 {snapshot}
 The image is the current screen with NUMBERED BOXES around interactive regions: {boxes}
@@ -141,12 +143,12 @@ Rules:
   (listed as a bare "<div>" or "<button>" without text), refs cannot be told apart: look at the image and
   give the number of its box in "box" instead. Always describe the element in "target".
 - fill/select: put the text/option in "value"; "submit": true presses Enter after fill.
-- done: the page already shows what the goal needs; fail: impossible from here.
+- done: the visible page text or screenshot already shows what the goal needs (e.g. price/content displayed); fail: impossible from here.
 - If no element performs the goal, answer fail. Never click a different control as a substitute
   (a bell is not a cart, a product card is not an add-to-cart button).
 - Only use refs that appear in the list above.
 - Never buy, checkout, pay, delete or log out unless the goal explicitly says so.
-Reply with JSON only: {{"action":"click|fill|select|done|fail","ref":"@eN or empty","box":null,"target":"","value":"","submit":false,"reason":"<=12 words"}}"""
+Reply with JSON only: {{"action":"click|fill|select|scroll|done|fail","ref":"@eN or empty","box":null,"target":"","value":"","submit":false,"reason":"<=12 words"}}"""
 
 
 def next_step_full(goal, history, state, snapshot, screenshot_path=None, boxes=None, timeout=60, url=None, model=None, headers=None):
@@ -163,12 +165,13 @@ def next_step_full(goal, history, state, snapshot, screenshot_path=None, boxes=N
         except OSError:
             pass
     content.append({"type": "text", "text": FULL_PROMPT.format(goal=goal, history=hist, title=state.get("title", ""),
-                                                              url=state.get("url", ""), snapshot=snap or "(no interactive elements)",
+                                                              url=state.get("url", ""), excerpt=state.get("page_excerpt", "")[:800],
+                                                              snapshot=snap or "(no interactive elements)",
                                                               boxes="; ".join(f"{b['id']}: center {b['center'][0]:.0f},{b['center'][1]:.0f}" for b in (boxes or [])) or "(none)")})
     target_model = resolve_model(model)
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
-    body = chat_body(target_url, target_model, 150, [{"role": "user", "content": content}])
+    body = chat_body(target_url, target_model, 300, [{"role": "user", "content": content}])
     t = time.perf_counter()
     out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
@@ -177,7 +180,7 @@ def next_step_full(goal, history, state, snapshot, screenshot_path=None, boxes=N
         step = json.loads(m.group(0)) if m else {}
     except Exception:
         step = {}
-    if step.get("action") not in ("click", "fill", "select", "done", "fail"):
+    if step.get("action") not in ("click", "fill", "select", "scroll", "done", "fail"):
         step = {"action": "fail", "reason": f"unparseable planner output: {out[:80]}"}
     return step, ms
 

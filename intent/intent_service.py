@@ -97,7 +97,7 @@ def _page_state(session: str, snap_text: str | None = None, title: str | None = 
     if title is None:
         title = (_cmd(session, "get title").get("text") or "").strip()
     if snap_text is None:
-        snap_text = _cmd(session, "snapshot -i").get("text", "")
+        snap_text = _cmd(session, "snapshot -i --full").get("text", "")
     els = L.parse_snapshot(snap_text)
     heads = [e.name()[:60] for e in els if e.tag in ("h1", "h2", "h3") and e.name()][:4]
     # Extract visible/interactive links with valid absolute URLs
@@ -643,12 +643,15 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclu
                 val += 50.0  # Always reserve slots for form/search inputs
             elif c.tag == "button":
                 val += 5.0   # Buttons are high-value action triggers
-            elif c.tag == "div":
-                val -= 2.0   # Deprioritize generic container divs
+            if c.attrs.get("scope") in ("nav", "footer"):
+                val -= 15.0  # Deprioritize persistent global navigation
+            elif c.attrs.get("scope") == "main":
+                val += 15.0  # Prioritize primary content area
+            if c.attrs.get("current-url") == "true" or c.attrs.get("active-tab") == "true":
+                val -= 1000.0  # Deprioritize clicking already-active tabs or self-links
             return val
         top_idx = sorted(range(len(labels)), key=score_fn, reverse=True)[:limit]
-        keep = sorted(top_idx)
-        labels = [labels[i] for i in keep]
+        labels = [labels[i] for i in top_idx]
     return labels
 
 
@@ -656,36 +659,51 @@ GOAL_STOPWORDS = set("the a an and or of to for in on at by with from is are be 
                      "what which find show get page per up".split())
 
 
-def goal_excerpt(text: str, goal: str, anchors: int = 4, after: int = 11, limit: int = 1200) -> str:
+def goal_excerpt(text: str, goal: str, anchors: int = 6, after: int = 12, limit: int = 1500) -> str:
     """Windows of page lines around the lines that best match the goal's words (rarer words weigh
-    more), in page order. Table cells arrive as one line each, so a window keeps a row together:
-    'Opus 5.5 | ... | Input | $4 / MTok | Output | $20 / MTok'. Lexical on purpose: e5 ranked one-word
-    lines ('API', 'Opt-out') highest on the Claude pricing page and took ~2 s per step."""
+    more), prioritizing highest-scoring match windows so content targets aren't cut off by header boilerplate."""
     paras = [p.strip() for p in text.split("\n") if p.strip()]
-    terms = set()
-    for w in re.findall(r"[a-z0-9$][a-z0-9.$-]*|[\u4e00-\u9fff]+", goal.lower()):
-        if "\u4e00" <= w[0] <= "\u9fff":
-            terms.update(w[i:i + 2] for i in range(len(w) - 1))   # Chinese has no spaces: match bigrams
-        elif len(w.strip(".")) > 1 and w.strip(".") not in GOAL_STOPWORDS:
-            terms.add(w.strip("."))
+    if not paras:
+        return ""
     low = [p.lower() for p in paras]
+    query_stops = set(L._STOP) | GOAL_STOPWORDS | {"網站", "網頁", "首頁", "在", "並", "到", "看", "我要", "幫我", "一下", "進入", "開啟", "中華", "電信"}
+    raw_tokens = L._tokens(goal)
+    terms = [t for t in raw_tokens if t not in query_stops and len(t) > 1]
+    if not terms:
+        terms = [t for t in raw_tokens if len(t) > 1]
+    terms = sorted(set(terms), key=lambda t: -len(t))
+
     idf = {}
     for w in terms:
         df = sum(w in line for line in low)
         if df:
             idf[w] = math.log((len(paras) + 1) / (df + 0.5))
-    scores = [sum(v for w, v in idf.items() if w in line) / (1 + len(line) / 400) for line in low]
+
+    def line_score(line):
+        matched_spans = []
+        sc = 0.0
+        for w in terms:
+            idx = line.find(w)
+            if idx != -1:
+                span = (idx, idx + len(w))
+                if not any(s[0] <= span[0] and span[1] <= s[1] for s in matched_spans):
+                    matched_spans.append(span)
+                    sc += idf.get(w, 1.0) * (1.5 if re.search(r"[a-z0-9]", w) else 1.0)
+        return sc / (1.0 + len(line) / 400.0)
+
+    scores = [line_score(line) for line in low]
     top = [i for i in sorted(range(len(paras)), key=lambda i: -scores[i])[:anchors] if scores[i] > 0]
-    keep = set()
+    if not top:
+        return ""
+
+    windows = []
+    seen_indices = set()
     for i in top:
-        keep.update(range(max(0, i - 1), min(len(paras), i + after + 1)))
-    out, prev = [], None
-    for i in sorted(keep):
-        if prev is not None and i != prev + 1:
-            out.append("…")
-        out.append(paras[i][:200])
-        prev = i
-    return " | ".join(out)[:limit]
+        idx_range = [k for k in range(max(0, i - 1), min(len(paras), i + after + 1)) if k not in seen_indices]
+        if idx_range:
+            seen_indices.update(idx_range)
+            windows.append(" | ".join(paras[k][:200] for k in idx_range))
+    return " \n…\n ".join(windows)[:limit]
 
 
 def _goal_text(session: str, goal: str, fallback: str) -> str:
@@ -718,6 +736,8 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     session, goal = req.session, (req.goal or req.target or "")
     trace, history, misses, escalate, boxes = [], [], 0, False, []
     no_effect_targets: set[str] = set()
+    last_click_target = ""
+    last_click_navigated = False
     p("task_start", f"🎯 開始自主瀏覽任務：「{goal}」...")
     if not req.url:
         # The agent often leaves the user's URL inside the goal text; use it only if no page is open yet.
@@ -757,6 +777,17 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         rec = {"step": i, "view": view, "plan": {k: step.get(k) for k in ("action", "ref", "target", "value", "reason") if step.get(k)},
                "planner_ms": round(pms)}
         p("task_step", f"📋 [步驟 {i}/{req.max_steps}] 規劃動作: {step.get('action')} \"{step.get('target', '')}\"")
+        cur_target = (step.get("target") or step.get("ref") or "").strip()
+        if step["action"] == "click" and cur_target:
+            if cur_target == last_click_target:
+                no_effect_targets.add(cur_target)
+                rec.update(status="BLOCKED_REPEAT", element=cur_target)
+                trace.append(rec)
+                misses += 1
+                history.append(f"click '{cur_target}' -> BLOCKED_REPEAT [連續重複點擊相同目標，已自動排除此候選]")
+                if misses >= 2:
+                    escalate = True
+                continue
         if step["action"] == "fail" and view == "compact":
             # The compact view hides icon-only controls; never give up before looking at the full page + screenshot.
             trace.append(rec)
@@ -812,6 +843,8 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                 history.append(f"click box {box['id']} '{step.get('target')}' -> no visible change")
                 if misses >= 2:
                     break
+            last_click_target = cur_target
+            last_click_navigated = after["url"] != before["url"]
             continue
         if step["action"] == "scroll":
             p("task_exec", f"⚡ 執行步驟 {i}: scroll \"{step.get('value') or step.get('target') or 'down'}\"...")
@@ -830,6 +863,8 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             rec.update(status=last["status"], element=last.get("element"))
             trace.append(rec)
             misses, escalate = 0, False
+            last_click_target = ""
+            last_click_navigated = False
             history.append(f"scroll {last.get('element')} -> now: {(last.get('page_excerpt') or '')[:80]}")
             continue
         ref = step.get("ref") if view == "full" and str(step.get("ref") or "").startswith("@e") else None
@@ -877,6 +912,12 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             escalate = True      # next decision uses the full snapshot + screenshot
             continue
         misses, escalate = 0, False
+        if step["action"] == "click":
+            last_click_target = cur_target
+            last_click_navigated = bool(last.get("navigated"))
+        else:
+            last_click_target = ""
+            last_click_navigated = False
         history.append(f"{step['action']} '{step.get('target')}'"
                        + (f" = '{step.get('value')}'" if step.get("value") else "")
                        + f" -> {status}, now: {(last.get('page_excerpt') or last.get('title') or '')[:80]}")
