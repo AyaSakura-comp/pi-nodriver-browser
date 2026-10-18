@@ -15,7 +15,7 @@ import json
 import math
 import queue
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import threading
 import time
 from typing import Optional, Callable, Any
@@ -64,7 +64,7 @@ class Act(BaseModel):
     pick: Optional[int] = None
     url: Optional[str] = None
     ref: Optional[str] = None
-    max_steps: int = 8
+    max_steps: int = 15
     model: Optional[str] = None
     base_url: Optional[str] = None
     headers: Optional[dict[str, str]] = None
@@ -367,6 +367,7 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
     if CLICK_MODE == "vision" and action == "click" and not req.ref and req.pick is None:
         return _vision_only_click(req, session, before, t0)
 
+    selected = None
     selected_tag = None
     if req.ref:
         # Escalated planner saw the full snapshot and named a ref: act on it directly (still risk-gated).
@@ -374,6 +375,7 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         if el is None:
             return {"status": "NO_MATCH", "target": req.ref, "hint": "ref not on the current page"}
         ref, label, tier, g = el.ref, L._label(el), "full-view", None
+        selected = el
         selected_tag = el.tag
         p("grounded", f"🎯 目標鎖定：{label} (@{ref})")
     elif req.pick is not None:
@@ -446,6 +448,30 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         if verified:
             tier += "+click-js-fallback"
             r = fallback
+        else:
+            # Anchor 智慧直達: When both CDP click and DOM click fail to navigate/mutate (e.g. collapsed hover menu),
+            # extract href and navigate directly.
+            target_href = (
+                (selected.attrs.get("href") if selected else None)
+                or (r.get("targetHref") if isinstance(r, dict) else None)
+                or (fallback.get("targetHref") if isinstance(fallback, dict) else None)
+            )
+            if target_href:
+                target_href = str(target_href).strip()
+            if target_href and not target_href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                dest_url = urljoin(before["url"], target_href)
+                if dest_url != before["url"] and (dest_url.startswith("http://") or dest_url.startswith("https://")):
+                    p("executing", f"⚡ 錨點點擊未觸發跳轉，改以 href 智慧直達導航至：{dest_url}...")
+                    try:
+                        nav_res = _cmd(session, f"open {dest_url}")
+                        after = _settled_state(session, before, budget=2.0, quiet=0.3)
+                        changed = {"navigated": after["url"] != before["url"], "dom_changed": after["fingerprint"] != before["fingerprint"]}
+                        verified = changed["navigated"] or changed["dom_changed"]
+                        if verified:
+                            tier += "+href-direct-nav"
+                            r = nav_res
+                    except Exception as nav_err:
+                        p("executing", f"⚠️ href 直達導航例外: {nav_err}")
     _remember(session, before["url"])
     _remember(session, after["url"])
     p("settled", f"✓ 完成 {action}，當前標題: 「{after.get('title')}」")
@@ -582,7 +608,7 @@ def do_plan(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             "screenshot": last.get("screenshot"), "total_ms": round((time.perf_counter() - t0) * 1000)}
 
 
-def _planner_elements(session: str, goal: str, snap: str, limit: int = 30) -> list[str]:
+def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclude: Optional[set[str]] = None) -> list[str]:
     """Compact, goal-ranked element names for the planner (never shown to the main agent)."""
     els = L.parse_snapshot(snap)
     pool = []
@@ -592,6 +618,21 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30) -> li
     if not pool:
         return []
     labels = [L._label(c, 160) for c in pool]
+    if exclude:
+        # Negative feedback: filter out or mark elements that previously yielded NO_EFFECT
+        ex_clean = {e.lower().strip() for e in exclude if e and e.strip()}
+        filtered_pool = []
+        filtered_labels = []
+        for c, lbl in zip(pool, labels):
+            lbl_low = lbl.lower()
+            if any(ex in lbl_low or lbl_low in ex for ex in ex_clean):
+                continue
+            filtered_pool.append(c)
+            filtered_labels.append(lbl)
+        if filtered_labels:
+            pool, labels = filtered_pool, filtered_labels
+        else:
+            labels = [f"{lbl} (⚠️點擊無反應，請勿重複選擇)" if any(ex in lbl.lower() for ex in ex_clean) else lbl for lbl in labels]
     if len(labels) > limit:
         # Fast 1ms lexical BM25/IDF scoring with control type weighting
         sc = L.lexical_scores(goal, pool)
@@ -676,6 +717,7 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     t0 = time.perf_counter()
     session, goal = req.session, (req.goal or req.target or "")
     trace, history, misses, escalate, boxes = [], [], 0, False, []
+    no_effect_targets: set[str] = set()
     p("task_start", f"🎯 開始自主瀏覽任務：「{goal}」...")
     if not req.url:
         # The agent often leaves the user's URL inside the goal text; use it only if no page is open yet.
@@ -693,7 +735,7 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         trace.append({"step": 0, "action": "open", "status": r["status"], "url": r.get("url")})
         history.append(f"opened {r.get('url')}")
     last = {}
-    for i in range(1, max(1, min(req.max_steps, 12)) + 1):
+    for i in range(1, max(1, min(req.max_steps, 25)) + 1):
         st = _page_state(session)
         st = {**st, "page_excerpt": _goal_text(session, goal, st.get("page_excerpt", ""))}
         if escalate:
@@ -709,7 +751,7 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                                        url=req.base_url, model=req.model, headers=req.headers)
             view = "full"
         else:
-            step, pms = next_step(goal, history, st, _planner_elements(session, goal, st["_snap"]),
+            step, pms = next_step(goal, history, st, _planner_elements(session, goal, st["_snap"], exclude=no_effect_targets),
                                   url=req.base_url, model=req.model, headers=req.headers)
             view = "compact"
         rec = {"step": i, "view": view, "plan": {k: step.get(k) for k in ("action", "ref", "target", "value", "reason") if step.get(k)},
@@ -795,7 +837,19 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                   value=step.get("value"), submit=bool(step.get("submit")), goal=goal, ref=ref, confirm=req.confirm,
                   model=req.model, base_url=req.base_url, headers=req.headers)
         p("task_exec", f"⚡ 執行步驟 {i}: {step['action']} \"{step.get('target', '')}\"...")
-        last = do_act(sub, step["action"], p)
+        try:
+            last = do_act(sub, step["action"], p)
+        except Exception as exc:
+            rec.update(status="ERROR", error=str(exc)[:160])
+            trace.append(rec)
+            misses += 1
+            if step.get("target"):
+                no_effect_targets.add(step["target"].strip())
+            history.append(f"{step['action']} '{step.get('target')}' -> ERROR: {str(exc)[:80]} [FAIL: 操作報錯或受保護攔截，嚴禁重複選擇此元素！請嘗試其他元素、捲動、或改以直達網址訪問]")
+            if misses >= 2:
+                break
+            escalate = True
+            continue
         if ref and last.get("status") == "NO_MATCH" and step["action"] == "click":
             # Hallucinated/invalid ref from the full view: fall back to picking on the screenshot itself.
             before = _page_state(session)
@@ -814,7 +868,10 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         # "_UNCONFIRMED" = the click changed nothing visible: treat as no progress, like a miss.
         if status in ("NO_MATCH", "AMBIGUOUS", "ERROR", "PICK_EXPIRED") or status.endswith("_UNCONFIRMED"):
             misses += 1
-            history.append(f"{step['action']} '{step.get('target')}' -> {status} (nothing done; choose differently)")
+            failed_target = step.get('target', '')
+            if failed_target:
+                no_effect_targets.add(failed_target.strip())
+            history.append(f"{step['action']} '{failed_target}' -> {status} [NO_EFFECT: 該元素點擊無反應或未產生狀態變化，可能處於折疊/隱藏狀態，嚴禁重複選擇此元素！請嘗試其他不同元素、捲動、或改以直達網址訪問]")
             if misses >= 2:
                 break
             escalate = True      # next decision uses the full snapshot + screenshot

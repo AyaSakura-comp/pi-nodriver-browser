@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>五重嵌套 Iframe 闖關基準測試 (5-Layer Nested Iframe Benchmark)</title>
+  <style>
+    :root {
+      --bg: #07090e;
+      --card-bg: rgba(15, 23, 42, 0.85);
+      --border: #334155;
+      --text: #f8fafc;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 960px;
+    }
+    header {
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: 800;
+      background: linear-gradient(135deg, #38bdf8, #818cf8, #c084fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      color: #94a3b8;
+      font-size: 14px;
+    }
+    .hud {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    .hud-title-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .hud-title {
+      font-weight: 700;
+      font-size: 15px;
+      color: #cbd5e1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .reset-btn {
+      background: #334155;
+      color: #cbd5e1;
+      border: 1px solid #475569;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .reset-btn:hover {
+      background: #475569;
+      color: white;
+    }
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+    }
+    .step-card {
+      background: rgba(30, 41, 59, 0.6);
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 10px;
+      text-align: center;
+      transition: all 0.3s ease;
+    }
+    .step-card.active {
+      border-color: #38bdf8;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+    }
+    .step-card.cleared {
+      border-color: #10b981;
+      background: rgba(16, 185, 129, 0.15);
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.3);
+    }
+    .step-num {
+      font-size: 11px;
+      font-weight: 700;
+      color: #94a3b8;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+    }
+    .step-name {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .step-status {
+      font-size: 11px;
+      color: #64748b;
+    }
+    .step-card.cleared .step-status {
+      color: #34d399;
+      font-weight: 600;
+    }
+    .step-card.cleared .step-name {
+      color: #a7f3d0;
+    }
+    .victory-banner {
+      display: none;
+      margin-top: 14px;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(56, 189, 248, 0.2));
+      border: 2px solid #34d399;
+      border-radius: 8px;
+      text-align: center;
+      animation: glow 1.5s infinite alternate;
+    }
+    @keyframes glow {
+      from { box-shadow: 0 0 10px rgba(52, 211, 153, 0.3); }
+      to { box-shadow: 0 0 25px rgba(52, 211, 153, 0.7); }
+    }
+    .victory-banner .title {
+      font-size: 16px;
+      font-weight: 800;
+      color: #34d399;
+      margin-bottom: 4px;
+    }
+    .victory-banner .flag {
+      font-family: monospace;
+      font-size: 18px;
+      font-weight: 700;
+      color: #fef08a;
+      letter-spacing: 1px;
+    }
+    .iframe-container {
+      background: var(--card-bg);
+      border: 2px solid #3b82f6;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    iframe {
+      width: 100%;
+      height: 960px;
+      border: none;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🏰 五重嵌套 Iframe 闖關基準測試</h1>
+      <div class="subtitle">5-Layer Nested Iframe Benchmark (Nodriver + Intent Grounding Benchmark)</div>
+    </header>
+
+    <div class="hud">
+      <div class="hud-title-row">
+        <div class="hud-title">
+          <span>📊 結界突破進度 (Progress Tracker)</span>
+          <span id="progress-percent" style="color: #38bdf8; font-weight: bold;">0%</span>
+        </div>
+        <button class="reset-btn" id="btn-reset">重置關卡 (Reset)</button>
+      </div>
+
+      <div class="steps-grid">
+        <div class="step-card active" id="card-l1">
+          <div class="step-num">Level 1</div>
+          <div class="step-name">蒼藍印記</div>
+          <div class="step-status" id="stat-l1">封印中</div>
+        </div>
+        <div class="step-card" id="card-l2">
+          <div class="step-num">Level 2</div>
+          <div class="step-name">紫晶通行</div>
+          <div class="step-status" id="stat-l2">未解鎖</div>
+        </div>
+        <div class="step-card" id="card-l3">
+          <div class="step-num">Level 3</div>
+          <div class="step-name">翡翠共鳴</div>
+          <div class="step-status" id="stat-l3">未解鎖</div>
+        </div>
+        <div class="step-card" id="card-l4">
+          <div class="step-num">Level 4</div>
+          <div class="step-name">黃金超載</div>
+          <div class="step-status" id="stat-l4">未解鎖</div>
+        </div>
+        <div class="step-card" id="card-l5">
+          <div class="step-num">Level 5</div>
+          <div class="step-name">緋紅核心</div>
+          <div class="step-status" id="stat-l5">未解鎖</div>
+        </div>
+      </div>
+
+      <div class="victory-banner" id="victory-banner">
+        <div class="title">🎉 恭喜通關！五重嵌套結界已全部攻破！</div>
+        <div>終極密語：<span class="flag" id="flag-text">FLAG{DEEP_IFRAME_5X_SUCCESS_2026}</span></div>
+      </div>
+    </div>
+
+    <!-- 內嵌第一重結界 -->
+    <div class="iframe-container">
+      <iframe id="barrier-1" name="結界一" title="第一重結界" src="level1.html"></iframe>
+    </div>
+  </div>
+
+  <script>
+    const levels = [1, 2, 3, 4, 5];
+    const cards = {};
+    const stats = {};
+    levels.forEach(lvl => {
+      cards[lvl] = document.getElementById(`card-l${lvl}`);
+      stats[lvl] = document.getElementById(`stat-l${lvl}`);
+    });
+    const percentEl = document.getElementById('progress-percent');
+    const banner = document.getElementById('victory-banner');
+    const resetBtn = document.getElementById('btn-reset');
+    const iframe1 = document.getElementById('barrier-1');
+
+    function updateProgress() {
+      let clearedCount = 0;
+      levels.forEach(lvl => {
+        if (sessionStorage.getItem(`level${lvl}_cleared`) === 'true') {
+          clearedCount++;
+          cards[lvl].classList.add('cleared');
+          cards[lvl].classList.remove('active');
+          stats[lvl].innerText = '已通關 ✓';
+        } else if (clearedCount === lvl - 1) {
+          cards[lvl].classList.add('active');
+          stats[lvl].innerText = '進行中...';
+        } else {
+          cards[lvl].classList.remove('active', 'cleared');
+          stats[lvl].innerText = '未解鎖';
+        }
+      });
+      const pct = Math.round((clearedCount / 5) * 100);
+      percentEl.innerText = `${pct}%`;
+      if (clearedCount === 5) {
+        banner.style.display = 'block';
+      }
+    }
+
+    window.addEventListener('message', (e) => {
+      if (!e.data) return;
+      if (e.data.level) {
+        sessionStorage.setItem(`level${e.data.level}_cleared`, 'true');
+        updateProgress();
+      }
+      if (e.data.type === 'BENCHMARK_CONQUERED') {
+        sessionStorage.setItem('level5_cleared', 'true');
+        updateProgress();
+      }
+    });
+
+    resetBtn.addEventListener('click', () => {
+      sessionStorage.clear();
+      banner.style.display = 'none';
+      updateProgress();
+      iframe1.src = 'level1.html?' + Date.now();
+    });
+
+    updateProgress();
+  </script>
+</body>
+</html>

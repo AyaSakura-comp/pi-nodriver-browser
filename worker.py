@@ -3538,7 +3538,7 @@ class BrowserWorker:
             else:
                 self.browser_modes[session_id] = mode
         else:
-            mode = self.browser_modes.get(session_id, 'auto')
+            mode = self.browser_modes.get(session_id, 'linux')
         behavior = {
             'auto': 'Android first; strong CAPTCHA/login gates pin only that origin to Linux desktop-fit for this session.',
             'android': 'Force Android identity with no automatic Linux retry.',
@@ -7936,7 +7936,7 @@ class BrowserWorker:
             page = await self.create_managed_tab(session_id, 'page')
             t_open_tab = time.perf_counter()
             self.begin_tab_activity(page)
-            browser_mode = self.browser_modes.get(session_id, 'auto')
+            browser_mode = self.browser_modes.get(session_id, 'linux')
             target_origin = normalize_origin(target_url)
             origin_route_reason = (
                 self.linux_origin_reason(session_id, target_url)

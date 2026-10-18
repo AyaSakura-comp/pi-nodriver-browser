@@ -50,6 +50,10 @@ def exact_name_match(intent: str, cands: list[L.Element]) -> L.Element | None:
     whole = [c for c in cands if _compact(c.name() or L._label(c).split(": ", 1)[-1]) == _compact(stripped)]
     if len(whole) == 1:
         return whole[0]
+    if len(whole) > 1:
+        frame_match = [c for c in whole if c.attrs.get("frame") and c.attrs["frame"] in intent]
+        if len(frame_match) == 1:
+            return frame_match[0]
     q = _compact(_VERBS.sub("", stripped))
     # A hit must cover a real share of the intent: "系統" inside "加不斷電系統的組合" is not a target name.
     hits = [c for c in cands if len(_compact(c.name())) >= 2 and _compact(c.name()) in q

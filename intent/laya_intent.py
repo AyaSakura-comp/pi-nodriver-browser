@@ -129,7 +129,8 @@ def build_candidates(elements: list[Element], action: str) -> tuple[list[Element
     by_name: dict[str, Element] = {}
     order = []
     for e in pool:
-        key = _norm(e.name()) or f"#{e.ref}"   # text-less controls are never duplicates of each other
+        frame = e.attrs.get("frame", "")
+        key = f"{frame}::{_norm(e.name())}" if _norm(e.name()) else f"#{e.ref}"
         cur = by_name.get(key)
         if cur is None:
             by_name[key] = e
@@ -220,6 +221,8 @@ def annotate(e: Element) -> str:
         tags.append("缺貨 out of stock")
     if BUNDLE.search(name):
         tags.append("多件組/組合 bundle")
+    if e.attrs.get("frame"):
+        tags.append(f"frame: {e.attrs['frame']}")
     return name + (f" [{'; '.join(tags)}]" if tags else "")
 
 

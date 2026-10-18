@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>第五重結界：緋紅核心</title>
+  <style>
+    :root {
+      --primary: #f43f5e;
+      --bg: #1e1122;
+      --card-bg: rgba(36, 17, 34, 0.95);
+      --border: #f43f5e;
+      --text: #f8fafc;
+      --muted: #fda4af;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 14px;
+      font-size: 14px;
+    }
+    .level-card {
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      background: var(--card-bg);
+      box-shadow: 0 0 20px rgba(244, 63, 94, 0.25);
+    }
+    .level-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(244, 63, 94, 0.3);
+      padding-bottom: 6px;
+    }
+    .level-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #fb7185;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge {
+      background: rgba(244, 63, 94, 0.2);
+      color: #fda4af;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      border: 1px solid rgba(244, 63, 94, 0.4);
+    }
+    .instructions {
+      color: #e2e8f0;
+      margin-bottom: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    button {
+      background: linear-gradient(135deg, #f43f5e, #e11d48);
+      color: white;
+      border: none;
+      padding: 10px 22px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(244, 63, 94, 0.4);
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(244, 63, 94, 0.6);
+      background: linear-gradient(135deg, #fb7185, #f43f5e);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: #475569;
+      box-shadow: none;
+      transform: none;
+    }
+    .status-box {
+      font-size: 13px;
+      color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.3);
+      margin-bottom: 10px;
+    }
+    .victory-box {
+      margin-top: 10px;
+      padding: 12px;
+      background: linear-gradient(135deg, rgba(244, 63, 94, 0.2), rgba(251, 191, 36, 0.2));
+      border: 2px dashed #fbbf24;
+      border-radius: 8px;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 10px rgba(251, 191, 36, 0.3); }
+      50% { box-shadow: 0 0 25px rgba(251, 191, 36, 0.6); }
+    }
+    .flag-text {
+      font-family: monospace;
+      font-size: 16px;
+      font-weight: 700;
+      color: #fef08a;
+      margin-top: 6px;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <div class="level-card">
+    <div class="level-header">
+      <div class="level-title">🔥 第五重結界：緋紅核心 (Crimson Core)</div>
+      <div class="badge">最深層 Depth 5</div>
+    </div>
+    <div class="instructions">
+      終極考驗：你已成功穿透五重空間結界！請點擊下方【終極核銷核心】按鈕以完成闖關並解鎖 FLAG。
+    </div>
+    <div id="status-5" class="status-box">
+      🔒 核心待命中：等待第四重結界授權...
+    </div>
+    <div class="action-row">
+      <button id="btn-final-nuclear" disabled>終極核銷核心</button>
+    </div>
+    <div id="victory-box-5" class="victory-box" style="display:none;">
+      <div>🏆 恭喜成功突破五重嵌套 Iframe 基準測試！</div>
+      <div class="flag-text" id="flag-display">FLAG{DEEP_IFRAME_5X_SUCCESS_2026}</div>
+    </div>
+  </div>
+
+  <script>
+    const FLAG = "FLAG{DEEP_IFRAME_5X_SUCCESS_2026}";
+    const btn = document.getElementById('btn-final-nuclear');
+    const statusBox = document.getElementById('status-5');
+    const victoryBox = document.getElementById('victory-box-5');
+
+    function notifyParent(data) {
+      window.parent.postMessage(data, '*');
+      try {
+        if (window.top && window.top !== window.parent) {
+          window.top.postMessage(data, '*');
+        }
+      } catch (e) {}
+    }
+
+    // Check if level 4 was already completed
+    if (sessionStorage.getItem('level4_cleared') === 'true') {
+      btn.disabled = false;
+      statusBox.innerHTML = '⚡ 核心防護已解除：請點擊【終極核銷核心】按鈕！';
+      statusBox.style.color = '#a7f3d0';
+    }
+
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'LEVEL4_CLEARED') {
+        sessionStorage.setItem('level4_cleared', 'true');
+        btn.disabled = false;
+        statusBox.innerHTML = '⚡ 核心防護已解除：請點擊【終極核銷核心】按鈕！';
+        statusBox.style.color = '#a7f3d0';
+      }
+    });
+
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      btn.innerText = '核心核銷已完成';
+      statusBox.innerHTML = '✅ 核心已完成核銷！五重嵌套結界已全部攻破！';
+      statusBox.style.color = '#38bdf8';
+      victoryBox.style.display = 'block';
+
+      notifyParent({
+        type: 'BENCHMARK_CONQUERED',
+        level: 5,
+        flag: FLAG,
+        message: '五重結界已全數突破'
+      });
+    });
+  </script>
+</body>
+</html>

@@ -18,30 +18,33 @@ def next_step(goal, history, state, elements, timeout=30, url=None, model=None, 
     return _compact_step(out, candidates), ms
 
 
+
+
 COMPACT_PROMPT = """Choose ONE next browser action toward the goal, using ONLY the current candidates.
-Goal: {goal}
-History: {history}
-Page: {title} | {url}
-Relevant page text: {excerpt}
-Candidates (call-local IDs):
-{elements}
 Reply ONLY one command, no JSON object, explanation, equals sign or extra lines.
 Syntax examples (replace numeric IDs with actual candidate IDs):
 C 2
 S 1 2
 S 1 "exact option text"
-F 3 "text" 0
+F 3 "text" 1
 R down
 D
 X
 C clicks.
-F fills an input or search box (e.g. F 1 "query" 1); final 0 means no Enter and final 1 means press Enter.
+F fills an input or search box (e.g. F 1 "query" 1); final 1 means press Enter to submit, final 0 means no Enter.
 S selects a dropdown option; S is ONLY for dropdown menus, NEVER for searching or typing text.
 R scrolls down/up/top/bottom when goal content is not visible.
 D means done ONLY if current page text already shows goal achieved.
 X means cannot reach goal.
 Quoted text must be a JSON string. IDs start at 1. Never guess IDs or substitute controls.
 Never buy, checkout, pay, delete or log out unless the goal explicitly requests it.
+
+Goal: {goal}
+History: {history}
+Page: {title} | {url}
+Relevant page text: {excerpt}
+Candidates (call-local IDs):
+{elements}
 """
 
 

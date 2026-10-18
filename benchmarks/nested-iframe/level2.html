@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>第二重結界：紫晶之廊</title>
+  <style>
+    :root {
+      --primary: #8b5cf6;
+      --bg: #151024;
+      --card-bg: rgba(26, 19, 48, 0.95);
+      --border: #8b5cf6;
+      --text: #f8fafc;
+      --muted: #c4b5fd;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 14px;
+      font-size: 14px;
+    }
+    .level-card {
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      background: var(--card-bg);
+      box-shadow: 0 0 18px rgba(139, 92, 246, 0.2);
+    }
+    .level-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(139, 92, 246, 0.3);
+      padding-bottom: 6px;
+    }
+    .level-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #a78bfa;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge {
+      background: rgba(139, 92, 246, 0.2);
+      color: #ddd6fe;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      border: 1px solid rgba(139, 92, 246, 0.4);
+    }
+    .instructions {
+      color: #e2e8f0;
+      margin-bottom: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    input[type="text"] {
+      background: #0f172a;
+      border: 1px solid #475569;
+      color: #f8fafc;
+      padding: 9px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      width: 260px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus {
+      border-color: #8b5cf6;
+      box-shadow: 0 0 8px rgba(139, 92, 246, 0.4);
+    }
+    button {
+      background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+      color: white;
+      border: none;
+      padding: 9px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(139, 92, 246, 0.35);
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(139, 92, 246, 0.5);
+      background: linear-gradient(135deg, #a78bfa, #8b5cf6);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: #475569;
+      box-shadow: none;
+      transform: none;
+    }
+    .status-box {
+      font-size: 13px;
+      color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.3);
+      margin-bottom: 12px;
+    }
+    .iframe-wrapper {
+      margin-top: 10px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px dashed rgba(16, 185, 129, 0.6);
+    }
+    iframe {
+      width: 100%;
+      height: 590px;
+      border: none;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="level-card">
+    <div class="level-header">
+      <div class="level-title">🔮 第二重結界：紫晶之廊 (Amethyst Corridor)</div>
+      <div class="badge">深度 Depth 2</div>
+    </div>
+    <div class="instructions">
+      第二重考驗：請輸入上一層獲得的通行碼（SAPPHIRE-8899），並點擊【驗證紫晶結界】按鈕以啟動第三重傳送門。
+    </div>
+    <div id="status-2" class="status-box">
+      🔒 紫晶廊道待命中：等待第一重結界授權...
+    </div>
+    <div class="action-row">
+      <input type="text" id="input-pass-2" placeholder="請輸入第一重通行碼" disabled>
+      <button id="btn-verify-2" disabled>驗證紫晶結界</button>
+    </div>
+
+    <!-- 內嵌第三重結界 -->
+    <div class="iframe-wrapper">
+      <iframe id="barrier-3" name="結界三" title="第三重結界" src="level3.html"></iframe>
+    </div>
+  </div>
+
+  <script>
+    const inputPass = document.getElementById('input-pass-2');
+    const btnVerify = document.getElementById('btn-verify-2');
+    const statusBox = document.getElementById('status-2');
+    const iframe3 = document.getElementById('barrier-3');
+
+    function notifyParent(data) {
+      window.parent.postMessage(data, '*');
+      try {
+        if (window.top && window.top !== window.parent) {
+          window.top.postMessage(data, '*');
+        }
+      } catch (e) {}
+    }
+
+    function unlockLevel2() {
+      inputPass.disabled = false;
+      btnVerify.disabled = false;
+      statusBox.innerHTML = '✨ 第一重已解開！請輸入通行碼（SAPPHIRE-8899）並點擊【驗證紫晶結界】！';
+      statusBox.style.color = '#ddd6fe';
+    }
+
+    if (sessionStorage.getItem('level1_cleared') === 'true') {
+      unlockLevel2();
+    }
+
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'LEVEL1_CLEARED') {
+        sessionStorage.setItem('level1_cleared', 'true');
+        unlockLevel2();
+      }
+    });
+
+    btnVerify.addEventListener('click', () => {
+      const val = inputPass.value.trim().toUpperCase();
+      if (val === 'SAPPHIRE-8899') {
+        inputPass.disabled = true;
+        btnVerify.disabled = true;
+        btnVerify.innerText = '驗證通過';
+        statusBox.innerHTML = '✅ 紫晶結界驗證通過！第三重指示：請點選【翡翠之心】水晶按鈕！';
+        statusBox.style.color = '#38bdf8';
+
+        sessionStorage.setItem('level2_cleared', 'true');
+        iframe3.contentWindow.postMessage({ type: 'LEVEL2_CLEARED' }, '*');
+        notifyParent({ type: 'LEVEL2_CLEARED', level: 2, message: '第二重結界已通關' });
+      } else {
+        statusBox.innerHTML = '❌ 通行碼錯誤！提示：上一層蒼藍結界之通行碼為 SAPPHIRE-8899';
+        statusBox.style.color = '#f87171';
+      }
+    });
+  </script>
+</body>
+</html>

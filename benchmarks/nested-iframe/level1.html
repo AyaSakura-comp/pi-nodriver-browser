@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>第一重結界：蒼藍之殿</title>
+  <style>
+    :root {
+      --primary: #3b82f6;
+      --bg: #0c1527;
+      --card-bg: rgba(15, 23, 42, 0.95);
+      --border: #3b82f6;
+      --text: #f8fafc;
+      --muted: #93c5fd;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 14px;
+      font-size: 14px;
+    }
+    .level-card {
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      background: var(--card-bg);
+      box-shadow: 0 0 18px rgba(59, 130, 246, 0.2);
+    }
+    .level-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(59, 130, 246, 0.3);
+      padding-bottom: 6px;
+    }
+    .level-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #60a5fa;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge {
+      background: rgba(59, 130, 246, 0.2);
+      color: #bfdbfe;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    .instructions {
+      color: #e2e8f0;
+      margin-bottom: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    button {
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      color: white;
+      border: none;
+      padding: 9px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.35);
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(59, 130, 246, 0.5);
+      background: linear-gradient(135deg, #60a5fa, #3b82f6);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: #475569;
+      box-shadow: none;
+      transform: none;
+    }
+    .status-box {
+      font-size: 13px;
+      color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.3);
+      margin-bottom: 12px;
+    }
+    .code-badge {
+      display: inline-block;
+      background: rgba(59, 130, 246, 0.3);
+      color: #93c5fd;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-weight: bold;
+    }
+    .iframe-wrapper {
+      margin-top: 10px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px dashed rgba(139, 92, 246, 0.6);
+    }
+    iframe {
+      width: 100%;
+      height: 770px;
+      border: none;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="level-card">
+    <div class="level-header">
+      <div class="level-title">🌀 第一重結界：蒼藍之殿 (Sapphire Sanctuary)</div>
+      <div class="badge">深度 Depth 1</div>
+    </div>
+    <div class="instructions">
+      第一重考驗：點擊下方【解開蒼藍印記】按鈕，獲取第二重通行碼並啟動內部第二重結界。
+    </div>
+    <div id="status-1" class="status-box">
+      🔒 蒼藍印記封印中：等待冒險者點擊解鎖...
+    </div>
+    <div class="action-row">
+      <button id="btn-unlock-1">解開蒼藍印記</button>
+    </div>
+
+    <!-- 內嵌第二重結界 -->
+    <div class="iframe-wrapper">
+      <iframe id="barrier-2" name="結界二" title="第二重結界" src="level2.html"></iframe>
+    </div>
+  </div>
+
+  <script>
+    const btnUnlock = document.getElementById('btn-unlock-1');
+    const statusBox = document.getElementById('status-1');
+    const iframe2 = document.getElementById('barrier-2');
+
+    function notifyParent(data) {
+      window.parent.postMessage(data, '*');
+      try {
+        if (window.top && window.top !== window.parent) {
+          window.top.postMessage(data, '*');
+        }
+      } catch (e) {}
+    }
+
+    if (sessionStorage.getItem('level1_cleared') === 'true') {
+      btnUnlock.disabled = true;
+      btnUnlock.innerText = '蒼藍印記已解開';
+      statusBox.innerHTML = '✅ 蒼藍印記已解開！第二重通行碼為：<span class="code-badge">SAPPHIRE-8899</span>';
+      statusBox.style.color = '#38bdf8';
+    }
+
+    btnUnlock.addEventListener('click', () => {
+      btnUnlock.disabled = true;
+      btnUnlock.innerText = '蒼藍印記已解開';
+      statusBox.innerHTML = '✅ 蒼藍印記已解開！第二重通行碼為：<span class="code-badge">SAPPHIRE-8899</span>';
+      statusBox.style.color = '#38bdf8';
+
+      sessionStorage.setItem('level1_cleared', 'true');
+      iframe2.contentWindow.postMessage({ type: 'LEVEL1_CLEARED' }, '*');
+      notifyParent({ type: 'LEVEL1_CLEARED', level: 1, message: '第一重結界已通關' });
+    });
+  </script>
+</body>
+</html>

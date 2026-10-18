@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>第三重結界：翡翠秘境</title>
+  <style>
+    :root {
+      --primary: #10b981;
+      --bg: #0f1e18;
+      --card-bg: rgba(16, 36, 28, 0.95);
+      --border: #10b981;
+      --text: #f8fafc;
+      --muted: #6ee7b7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 14px;
+      font-size: 14px;
+    }
+    .level-card {
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      background: var(--card-bg);
+      box-shadow: 0 0 18px rgba(16, 185, 129, 0.2);
+    }
+    .level-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(16, 185, 129, 0.3);
+      padding-bottom: 6px;
+    }
+    .level-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #34d399;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge {
+      background: rgba(16, 185, 129, 0.2);
+      color: #a7f3d0;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .instructions {
+      color: #e2e8f0;
+      margin-bottom: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    button.stone-btn {
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 9px 18px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .btn-obsidian {
+      background: #334155;
+    }
+    .btn-emerald {
+      background: linear-gradient(135deg, #10b981, #059669);
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.35);
+      border-color: #34d399;
+    }
+    .btn-amber {
+      background: #78350f;
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      filter: brightness(1.15);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: #475569 !important;
+      box-shadow: none;
+      transform: none;
+    }
+    .status-box {
+      font-size: 13px;
+      color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.3);
+      margin-bottom: 12px;
+    }
+    .iframe-wrapper {
+      margin-top: 10px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px dashed rgba(245, 158, 11, 0.6);
+    }
+    iframe {
+      width: 100%;
+      height: 420px;
+      border: none;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="level-card">
+    <div class="level-header">
+      <div class="level-title">🌿 第三重結界：翡翠秘境 (Emerald Glade)</div>
+      <div class="badge">深度 Depth 3</div>
+    </div>
+    <div class="instructions">
+      第三重考驗：依據上一層提示，請在下方三顆寶石中精確點選【翡翠之心】按鈕以啟動共鳴。
+    </div>
+    <div id="status-3" class="status-box">
+      🔒 水晶陣列待命中：等待第二重結界授權...
+    </div>
+    <div class="action-row">
+      <button id="btn-stone-obsidian" class="stone-btn btn-obsidian" disabled>黑曜之影</button>
+      <button id="btn-stone-emerald" class="stone-btn btn-emerald" disabled>翡翠之心</button>
+      <button id="btn-stone-amber" class="stone-btn btn-amber" disabled>琥珀之淚</button>
+    </div>
+
+    <!-- 內嵌第四重結界 -->
+    <div class="iframe-wrapper">
+      <iframe id="barrier-4" name="結界四" title="第四重結界" src="level4.html"></iframe>
+    </div>
+  </div>
+
+  <script>
+    const btnObsidian = document.getElementById('btn-stone-obsidian');
+    const btnEmerald = document.getElementById('btn-stone-emerald');
+    const btnAmber = document.getElementById('btn-stone-amber');
+    const statusBox = document.getElementById('status-3');
+    const iframe4 = document.getElementById('barrier-4');
+
+    function notifyParent(data) {
+      window.parent.postMessage(data, '*');
+      try {
+        if (window.top && window.top !== window.parent) {
+          window.top.postMessage(data, '*');
+        }
+      } catch (e) {}
+    }
+
+    function unlockLevel3() {
+      btnObsidian.disabled = false;
+      btnEmerald.disabled = false;
+      btnAmber.disabled = false;
+      statusBox.innerHTML = '✨ 第二重已驗證通過：請點選【翡翠之心】按鈕！';
+      statusBox.style.color = '#a7f3d0';
+    }
+
+    if (sessionStorage.getItem('level2_cleared') === 'true') {
+      unlockLevel3();
+    }
+
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'LEVEL2_CLEARED') {
+        sessionStorage.setItem('level2_cleared', 'true');
+        unlockLevel3();
+      }
+    });
+
+    [btnObsidian, btnAmber].forEach(btn => {
+      btn.addEventListener('click', () => {
+        statusBox.innerHTML = '❌ 錯誤的水晶！陣列未產生共鳴，請點選【翡翠之心】！';
+        statusBox.style.color = '#f87171';
+      });
+    });
+
+    btnEmerald.addEventListener('click', () => {
+      btnObsidian.disabled = true;
+      btnEmerald.disabled = true;
+      btnAmber.disabled = true;
+      btnEmerald.innerText = '翡翠之心 (已共鳴)';
+      statusBox.innerHTML = '✅ 翡翠之心共鳴成功！第四重指示：請勾選【解除安全防護】核取方塊並點擊【啟動超載傳送】按鈕！';
+      statusBox.style.color = '#38bdf8';
+
+      sessionStorage.setItem('level3_cleared', 'true');
+      iframe4.contentWindow.postMessage({ type: 'LEVEL3_CLEARED' }, '*');
+      notifyParent({ type: 'LEVEL3_CLEARED', level: 3, message: '第三重結界已通關' });
+    });
+  </script>
+</body>
+</html>
