@@ -618,10 +618,12 @@ def do_plan(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
 def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclude: Optional[set[str]] = None) -> list[str]:
     """Compact, goal-ranked element names for the planner (never shown to the main agent)."""
     els = L.parse_snapshot(snap)
-    pool = []
-    for kind in ("fill", "select", "click"):
-        cands, _ = L.build_candidates(els, kind)
-        pool += [c for c in cands if c not in pool]
+    click_cands, _ = L.build_candidates(els, "click")
+    fill_cands = [e for e in els if (e.tag == "input" and e.attrs.get("type", "") in L.FILLABLE_TYPES)
+                  or e.tag == "textarea" or e.attrs.get("contenteditable") == "true"]
+    fill_cands = [e for e in fill_cands if not e.disabled]
+    select_cands = [e for e in els if e.tag == "select"]
+    pool = fill_cands + select_cands + [c for c in click_cands if c not in fill_cands and c not in select_cands]
     if not pool:
         return []
     labels = [L._label(c, 160) for c in pool]
@@ -655,7 +657,7 @@ def _planner_elements(session: str, goal: str, snap: str, limit: int = 30, exclu
                 val += 2.0 if sc[i] > 0 else 0.0
             elif c.tag == "div":
                 val -= 2.0
-            if not is_fillable and c.attrs.get("scope") in ("nav", "footer"):
+            if not is_fillable and sc[i] == 0.0 and c.attrs.get("scope") in ("nav", "footer"):
                 val -= 15.0  # Deprioritize persistent global navigation
             elif c.attrs.get("scope") == "main":
                 val += 15.0  # Prioritize primary content area
@@ -710,8 +712,12 @@ def goal_excerpt(text: str, goal: str, anchors: int = 6, after: int = 12, limit:
         return ""
 
     windows = []
-    seen_indices = set()
-    for i in top:
+    # Always include top header lines (page status, cart badge, login/account state)
+    header_indices = list(range(min(8, len(paras))))
+    seen_indices = set(header_indices)
+    windows.append(" | ".join(paras[k][:200] for k in header_indices))
+
+    for i in sorted(top):
         idx_range = [k for k in range(max(0, i - 1), min(len(paras), i + after + 1)) if k not in seen_indices]
         if idx_range:
             seen_indices.update(idx_range)
@@ -751,6 +757,7 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     no_effect_targets: set[str] = set()
     last_click_target = ""
     last_click_navigated = False
+    recent_clicks: list[str] = []
     p("task_start", f"🎯 開始自主瀏覽任務：「{goal}」...")
     if not req.url:
         # The agent often leaves the user's URL inside the goal text; use it only if no page is open yet.
@@ -795,12 +802,13 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         p("task_step", f"📋 [步驟 {i}/{req.max_steps}] 規劃動作: {step.get('action')} \"{step.get('target', '')}\"")
         cur_target = (step.get("target") or step.get("ref") or "").strip()
         if step["action"] == "click" and cur_target:
-            if cur_target == last_click_target:
+            is_repeat = cur_target == last_click_target or (len(recent_clicks) >= 2 and recent_clicks.count(cur_target) >= 2 and not last_click_navigated)
+            if is_repeat:
                 no_effect_targets.add(cur_target)
                 rec.update(status="BLOCKED_REPEAT", element=cur_target)
                 trace.append(rec)
                 misses += 1
-                history.append(f"click '{cur_target}' -> BLOCKED_REPEAT [連續重複點擊相同目標，已自動排除此候選]")
+                history.append(f"click '{cur_target}' -> BLOCKED_REPEAT [重複點擊相同或來回震盪目標，已自動排除此候選]")
                 if misses >= 2:
                     escalate = True
                 continue
@@ -941,6 +949,11 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         if step["action"] == "click":
             last_click_target = cur_target
             last_click_navigated = bool(last.get("navigated"))
+            if last_click_navigated:
+                recent_clicks.clear()
+            else:
+                recent_clicks.append(cur_target)
+                del recent_clicks[:-6]
         else:
             last_click_target = ""
             last_click_navigated = False

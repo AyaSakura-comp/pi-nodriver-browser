@@ -34,11 +34,12 @@ C clicks.
 F fills an input or search box (e.g. F 1 "query" 1); final 1 means press Enter to submit, final 0 means no Enter.
 S selects a dropdown option; S is ONLY for dropdown menus, NEVER for searching or typing text.
 R scrolls down/up/top/bottom when goal content is not visible.
-D means done ONLY if current page text already shows goal achieved.
+D means done when the requested action (e.g. clicking a button, adding item to cart, navigating, or searching) has succeeded in history and the page reflects the result (e.g. cart updated, confirmation shown, item added, or target content displayed).
 X means cannot reach goal.
 Quoted text must be a JSON string. IDs start at 1. Never guess IDs or substitute controls.
 Never buy, checkout, pay, delete or log out unless the goal explicitly requests it.
 Never click controls tagged [目前已在此分頁 active/current tab] because that page/section is already active.
+Do not repeat clicking the same action button (such as add-to-cart or submit) if that action has already been performed in history and succeeded; reply D instead.
 
 Goal: {goal}
 History: {history}
