@@ -129,5 +129,38 @@ class AnchorClickFallbackTests(unittest.TestCase):
         # Verify active-tab item was deprioritized compared to other high scoring items
         self.assertEqual(len(ranked), 30)
 
+    def test_planner_elements_excludes_container_divs_from_fill_candidates(self):
+        snap = (
+            '@e1 <div> "商品編號:DEBV7O-A900IOY01 商品描述很長... 加入購物車"\n'
+            '@e2 <button> "加入購物車"\n'
+            '@e3 <input> "數量" type="text"'
+        )
+        cands = service._planner_elements("s", "加入購物車", snap)
+        self.assertFalse(any("商品編號" in c for c in cands))
+        self.assertTrue(any("加入購物車" in c for c in cands))
+        self.assertTrue(any("input" in c for c in cands))
+
+    def test_nav_scope_not_penalized_when_matching_goal(self):
+        snap = (
+            '@e1 <button> "加入購物車" scope="nav"\n'
+            '@e2 <a> "網站地圖" scope="nav"'
+        )
+        cands = service._planner_elements("s", "加入購物車", snap)
+        self.assertTrue(any("加入購物車" in c for c in cands))
+
+    def test_goal_excerpt_anchors_header_and_merges_spans(self):
+        text = "\n".join([
+            "PChome 24h購物",
+            "購物車 1",
+            "我的訂單",
+            "商品編號:DEBV7O",
+            "Royal Canin 皇家貓飼料",
+            "商品已加入購物車！",
+        ] + [f"無關商品介紹說明第 {i} 行" for i in range(30)])
+        excerpt = service.goal_excerpt(text, "加入購物車")
+        self.assertIn("購物車 1", excerpt)
+        self.assertIn("商品已加入購物車！", excerpt)
+
+
 if __name__ == "__main__":
     unittest.main()
