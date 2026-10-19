@@ -711,17 +711,26 @@ def goal_excerpt(text: str, goal: str, anchors: int = 6, after: int = 12, limit:
     if not top:
         return ""
 
-    windows = []
+    spans = []
     # Always include top header lines (page status, cart badge, login/account state)
-    header_indices = list(range(min(8, len(paras))))
-    seen_indices = set(header_indices)
-    windows.append(" | ".join(paras[k][:200] for k in header_indices))
+    if len(paras) > 0:
+        spans.append((0, min(8, len(paras))))
+    for i in top:
+        spans.append((max(0, i - 1), min(len(paras), i + after + 1)))
 
-    for i in sorted(top):
-        idx_range = [k for k in range(max(0, i - 1), min(len(paras), i + after + 1)) if k not in seen_indices]
-        if idx_range:
-            seen_indices.update(idx_range)
-            windows.append(" | ".join(paras[k][:200] for k in idx_range))
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if not merged:
+            merged.append([s, e])
+        elif s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    windows = []
+    for s, e in merged:
+        windows.append(" | ".join(paras[k][:200] for k in range(s, e)))
     return " \n…\n ".join(windows)[:limit]
 
 
