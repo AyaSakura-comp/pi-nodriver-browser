@@ -104,6 +104,24 @@ class BrowserResearchOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['text'], content)
 
+    async def test_crawl_waits_for_text_not_just_an_spa_shell(self):
+        # YouTube's body has children well before it renders any text.
+        engine, tab = self.engine()
+        del engine.wait_for_page_ready
+        rendered = {'text': ''}
+        async def evaluate(js):
+            if js == 'document.title': return 'MJ English - YouTube'
+            if js == 'document.body.innerText': return rendered['text']
+            if 'readyState' in js:
+                if 'trim().length >= 21' not in js: return True
+                if tab.evaluate.await_count > 4: rendered['text'] = 'MJ English @mjenglish 81.2K subscribers'
+                return len(rendered['text']) >= 21
+            return None
+        tab.evaluate.side_effect = evaluate
+        result = await engine.crawl_one('https://youtube.com/@mjenglish', 0, 'job', asyncio.Semaphore(1))
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertIn('81.2K subscribers', result['text'])
+
     async def test_background_limit_is_shared_across_independent_calls(self):
         engine, tab = self.engine()
         self.assertTrue(hasattr(engine, 'background_slots'))

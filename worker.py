@@ -5271,19 +5271,25 @@ class BrowserWorker:
             self.session_action_targets.clear()
             self.quarantined_target_ids.clear()
 
-    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.015):
+    async def wait_for_page_ready(self, page, timeout_sec=2.0, poll_interval=0.015, min_text_chars=0):
         """
         Adaptive fast-path DOM ready detector.
         Returns as soon as document.readyState is interactive/complete and body has content,
         polling every 15ms up to timeout_sec (default 2.0s).
+        min_text_chars > 0 also waits for that much visible text: SPA shells
+        (YouTube, ...) have body children long before they render any text.
         """
         deadline = asyncio.get_running_loop().time() + timeout_sec
+        has_content = (
+            f"(b.innerText || '').trim().length >= {int(min_text_chars)}" if min_text_chars > 0
+            else "(b.innerText.length > 0 || b.children.length > 0)"
+        )
         check_js = (
             "(() => {"
             "  const s = document.readyState;"
             "  if (s === 'interactive' || s === 'complete') {"
             "    const b = document.body;"
-            "    return Boolean(b && (b.innerText.length > 0 || b.children.length > 0));"
+            f"    return Boolean(b && {has_content});"
             "  }"
             "  return false;"
             "})()"
@@ -7532,7 +7538,9 @@ class BrowserWorker:
                 except Exception:
                     pass
                 await tab.get(target_url)
-                await self.wait_for_page_ready(tab, timeout_sec=2.5)
+                # Same threshold as the crawl's "readable text" check below.
+                await self.wait_for_page_ready(tab, timeout_sec=max(1.0, fetch_timeout - 0.5),
+                                               min_text_chars=21)
                 title = await tab.evaluate("document.title") or "No Title"
                 if await self.page_is_pdf(tab):
                     return str(title).strip(), '', True
