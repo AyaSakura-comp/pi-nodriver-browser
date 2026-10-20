@@ -87,6 +87,38 @@ class AnchorClickFallbackTests(unittest.TestCase):
         self.assertEqual(result["status"], "CLICKED")
         self.assertEqual(result["decided_by"], "full-view+href-direct-nav")
 
+    def test_full_view_does_not_reclick_a_no_effect_target(self):
+        # HayAegis 2026-10-20: the full view showed @e4 again after its click changed nothing,
+        # and the planner clicked it a second time instead of being blocked.
+        state = {"url": "https://hayaegis.test/login", "title": "HayAegis", "headings": [],
+                 "page_excerpt": "", "fingerprint": "same", "elements": 1,
+                 "_snap": '@e4 <button> "進入投資組合儀表板"'}
+        click = {"action": "click", "ref": "@e4", "target": "進入投資組合儀表板"}
+        acted = []
+
+        def fake_act(sub, action, _p=None):
+            acted.append(sub.target)
+            return {"status": "CLICKED_UNCONFIRMED", "title": "HayAegis"}
+
+        def fake_cmd(_session, command):
+            if command == "vision-mark omni":
+                raise ConnectionRefusedError(111, "Connection refused")
+            return {"text": state["url"]}
+
+        req = service.Act(session="s", action="task", goal="登入後進入投資組合儀表板", max_steps=15)
+        with patch.object(service, "_page_state", return_value=state), \
+             patch.object(service, "_goal_text", return_value=""), \
+             patch.object(service, "_cmd", side_effect=fake_cmd), \
+             patch.object(service, "next_step", return_value=({"action": "fail"}, 1.0)), \
+             patch.object(service, "next_step_full", return_value=(click, 1.0)), \
+             patch.object(service, "do_act", side_effect=fake_act):
+            result = service._run_task(req)
+
+        self.assertEqual(acted, ["進入投資組合儀表板"])
+        self.assertIn("BLOCKED_REPEAT", [s.get("status") for s in result["steps"]])
+        self.assertEqual(result["status"], "TASK_STOPPED")
+        self.assertLess(len(result["steps"]), 6)
+
     def test_planner_elements_exclude_negative_feedback(self):
         snap = '@e1 <a> "Apple專區" href="/apple"\n@e2 <button> "搜尋"'
         # Without exclude: both are present

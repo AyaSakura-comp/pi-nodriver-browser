@@ -811,13 +811,17 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         p("task_step", f"📋 [步驟 {i}/{req.max_steps}] 規劃動作: {step.get('action')} \"{step.get('target', '')}\"")
         cur_target = (step.get("target") or step.get("ref") or "").strip()
         if step["action"] == "click" and cur_target:
-            is_repeat = cur_target == last_click_target or (len(recent_clicks) >= 2 and recent_clicks.count(cur_target) >= 2 and not last_click_navigated)
+            # The full view lists every @ref again, so a target that already had no effect must be blocked here too.
+            is_repeat = (cur_target == last_click_target or cur_target in no_effect_targets
+                         or (len(recent_clicks) >= 2 and recent_clicks.count(cur_target) >= 2 and not last_click_navigated))
             if is_repeat:
                 no_effect_targets.add(cur_target)
                 rec.update(status="BLOCKED_REPEAT", element=cur_target)
                 trace.append(rec)
                 misses += 1
                 history.append(f"click '{cur_target}' -> BLOCKED_REPEAT [重複點擊相同或來回震盪目標，已自動排除此候選]")
+                if misses >= 3:
+                    break
                 if misses >= 2:
                     escalate = True
                 continue
