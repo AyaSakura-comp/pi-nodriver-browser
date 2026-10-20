@@ -1,0 +1,7 @@
+[Unit]
+Description=Browser-agent watchdog: health-check, revive and log outages of browser_intent's services
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.pi/agent/extensions/nodriver-browser/ops/browser-agent-watchdog.py check
+TimeoutStartSec=5min
