@@ -598,6 +598,9 @@ export default function (pi: ExtensionAPI) {
             for (const url of extractSearchResultUrls((entry as any).message.content)) {
               allowed.add(url);
             }
+          } else if ((entry as any)?.message?.isError || (entry as any)?.isError) {
+            // A blocked call's result quotes the rejected URL; harvesting it let the 2nd retry through.
+            continue;
           } else if (entry?.type === "tool_result" || (entry?.type === "message" && ((entry as any)?.message?.role === "toolResult" || (entry as any)?.message?.role === "tool"))) {
             for (const url of extractSearchResultUrls(
               (entry as any)?.message?.content ?? (entry as any)?.content,

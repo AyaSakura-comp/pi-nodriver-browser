@@ -15,7 +15,7 @@ import json
 import math
 import queue
 import re
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urldefrag
 import threading
 import time
 from typing import Optional, Callable, Any
@@ -359,6 +359,35 @@ def _vision_only_click(req: Act, session: str, before: dict, t0: float) -> dict:
             **_public(before), "hint": "No box on the screen performs this."}
 
 
+def _editable(e) -> bool:
+    return (e.tag == "input" and e.attrs.get("type", "") in L.FILLABLE_TYPES) or e.tag == "textarea" \
+        or e.attrs.get("contenteditable") == "true"
+
+
+_GENERIC = set("按鈕連結卡片選單分頁導航圖示第一個頁面") | {"link", "button", "tab", "icon", "card", "product", "item",
+                                                     "page", "menu", "nav", "the", "first", "second", "third", "in", "of", "to", "on"}
+
+
+def _words(text: str) -> set:
+    text = re.sub(r"^\w+(?: type=\w+)?: ", "", text.strip().lower())   # drop the "link: " role prefix
+    latin = {w for w in re.findall(r"[a-z0-9]{2,}", text) if w not in _GENERIC}
+    cjk = re.findall(r"[\u4e00-\u9fff]", text)
+    pairs = {a + b for a, b in zip(cjk, cjk[1:]) if not (a in _GENERIC and b in _GENERIC)}
+    return latin | pairs
+
+
+def _ref_fits(snap: str, ref: str, target: str) -> bool:
+    """Does the full view's @ref plausibly be the element it described? Text-less controls can't be judged."""
+    el = next((e for e in L.parse_snapshot(snap) if "@" + e.ref == ref.strip()), None)
+    if el is None:
+        return True          # unknown ref: do_act reports NO_MATCH and the vision fallback handles it
+    label = L._label(el)
+    if "no visible text" in label:
+        return True
+    want = _words(target)
+    return not want or bool(want & _words(label))
+
+
 def _has_password_field(snap: str) -> bool:
     return any(e.tag == "input" and e.attrs.get("type") == "password" for e in L.parse_snapshot(snap))
 
@@ -373,6 +402,11 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
 
     selected = None
     selected_tag = None
+    if req.ref and action == "fill":
+        # The full view sometimes names a search icon/link for a fill; find the input by its description instead.
+        el = next((e for e in L.parse_snapshot(before["_snap"]) if "@" + e.ref == req.ref.strip()), None)
+        if el is not None and not _editable(el) and req.target and req.target != req.ref:
+            req.ref = None
     if req.ref:
         # Escalated planner saw the full snapshot and named a ref: act on it directly (still risk-gated).
         el = next((e for e in L.parse_snapshot(before["_snap"]) if "@" + e.ref == req.ref.strip()), None)
@@ -439,9 +473,20 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         try:
             r = _cmd(session, f"{verb} @{ref} {_q(req.value or '')}")
         except RuntimeError as e:
-            if req.submit and "has no associated form" in str(e):
+            msg = str(e)
+            if req.submit and "has no associated form" in msg:
                 r = _cmd(session, f"fill @{ref} {_q(req.value or '')}")
                 _cmd(session, "press Enter")
+            elif req.submit and ("Enter input was canceled" in msg or "constraint validation prevented" in msg):
+                # Search boxes often handle Enter in their own script (preventDefault, then route via JS),
+                # so the worker's synthetic submit reports failure although the site may have searched.
+                # Only a URL change proves the search ran: typing alone changes the DOM (autocomplete).
+                mid = _settled_state(session, before, budget=1.5, quiet=0.2)
+                if mid["url"] != before["url"]:
+                    r = {"url": mid["url"]}
+                else:
+                    r = _cmd(session, f"fill @{ref} {_q(req.value or '')}")
+                    _cmd(session, "press Enter")
             else:
                 raise
     else:
@@ -453,8 +498,17 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         after = _page_state(session)
     else:
         after = _settled_state(session, before, budget=1.5, quiet=0.2)
+    # A link to another page has done its job only when the URL changed: books.com.tw product links
+    # stayed on the results page with a hover-style DOM change, which used to count as success.
+    href = ((selected.attrs.get("href") if selected else "") or "").strip()
+    dest = urljoin(before["url"], href) if href and not href.startswith(("javascript:", "mailto:", "tel:")) else ""
+    leaves_page = dest.startswith(("http://", "https://")) and urldefrag(dest)[0] != urldefrag(before["url"])[0]
+
+    def _did_work(changed: dict) -> bool:
+        return changed["navigated"] or (changed["dom_changed"] and not (action == "click" and leaves_page))
+
     changed = {"navigated": after["url"] != before["url"], "dom_changed": after["fingerprint"] != before["fingerprint"]}
-    verified = changed["navigated"] or changed["dom_changed"]
+    verified = _did_work(changed)
     # Some client-rendered sites swallow the normal CDP activation on anchors. Retry the
     # same grounded anchor once through the worker's deferred DOM click; never broaden or
     # repeat the target, and let NO_PROGRESS_GUARD stop the second no-op.
@@ -462,7 +516,7 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
         fallback = _cmd(session, f"click-js @{ref}")
         after = _settled_state(session, before)
         changed = {"navigated": after["url"] != before["url"], "dom_changed": after["fingerprint"] != before["fingerprint"]}
-        verified = changed["navigated"] or changed["dom_changed"]
+        verified = _did_work(changed)
         if verified:
             tier += "+click-js-fallback"
             r = fallback
@@ -484,7 +538,7 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
                         nav_res = _cmd(session, f"open {dest_url}")
                         after = _settled_state(session, before, budget=2.0, quiet=0.3)
                         changed = {"navigated": after["url"] != before["url"], "dom_changed": after["fingerprint"] != before["fingerprint"]}
-                        verified = changed["navigated"] or changed["dom_changed"]
+                        verified = _did_work(changed)
                         if verified:
                             tier += "+href-direct-nav"
                             r = nav_res
@@ -934,7 +988,16 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                   model=req.model, base_url=req.base_url, headers=req.headers)
         p("task_exec", f"⚡ 執行步驟 {i}: {step['action']} \"{step.get('target', '')}\"...")
         try:
-            last = do_act(sub, step["action"], p)
+            if ref and step.get("target") and not _ref_fits(st["_snap"], ref, step["target"]):
+                # The full list is cut at 12k chars, so the model sometimes pairs its description with a
+                # wrong @ref (momo "Philips 氣炸鍋" -> "3coins", asus "ASUS logo" -> "支援"). Ground the
+                # description first; keep the ref only when the description matches nothing.
+                rec["ref_mismatch"] = ref
+                last = do_act(sub.model_copy(update={"ref": None}), step["action"], p)
+                if last.get("status") in ("NO_MATCH", "AMBIGUOUS"):
+                    last = do_act(sub, step["action"], p)
+            else:
+                last = do_act(sub, step["action"], p)
         except Exception as exc:
             rec.update(status="ERROR", error=str(exc)[:160])
             trace.append(rec)
@@ -1017,8 +1080,13 @@ def _dispatch(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         PAGE_LINKS.pop(req.session, None)
         SCROLL_Y.pop(req.session, None)
         # session-cleanup only drops temp artifacts; `close` is what releases the tab (20-tab cap).
+        # A click that opened a new tab moved the session into it, and `close` then returns to the
+        # opener tab, so close until no page is left (one call leaked 5 opener tabs on 2026-10-20).
         try:
-            nd.request("close", req.session)
+            for _ in range(10):
+                nd.request("close", req.session)
+                if not nd.request("get url", req.session).get("ok"):
+                    break
         finally:
             nd.request("session-cleanup", req.session)
         return {"status": "CLEANED"}

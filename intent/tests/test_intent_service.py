@@ -159,7 +159,7 @@ class AnchorClickFallbackTests(unittest.TestCase):
             commands.append(c)
             return {"elements": [{"id": 0, "center": [10, 20]}], "screenshotPath": "/tmp/x.jpg"} if c == "vision-mark omni" else {"text": page["url"]}
 
-        steps = iter([({"action": "click", "ref": "@e4", "box": 0, "target": "登入"}, 1.0),
+        steps = iter([({"action": "click", "ref": "@e4", "box": 0, "target": "進入投資組合儀表板 按鈕"}, 1.0),
                       ({"action": "click", "ref": "", "box": 0, "target": "icon"}, 1.0),
                       ({"action": "done"}, 1.0)])
         with patch.object(service, "_page_state", return_value=page), \
@@ -175,6 +175,96 @@ class AnchorClickFallbackTests(unittest.TestCase):
         self.assertEqual(acted, ["@e4"])
         i = commands.index("vision-click 10 20")
         self.assertEqual(commands[i - 1], "vision-mark omni")
+
+    SEARCH = {"url": "https://shop.test/", "title": "Shop", "headings": [], "page_excerpt": "", "fingerprint": "f",
+              "elements": 2, "_snap": '@e1 <a> "搜尋" href="#"\n@e2 <input> "搜尋商品" type="search"'}
+
+    def _search(self, after_cancel_url):
+        commands = []
+
+        def fake_cmd(_s, c):
+            commands.append(c)
+            if c.startswith("fill-submit"):
+                raise RuntimeError("ValueError: Enter input was canceled; form was not submitted")
+            return {"ok": True}
+        landed = {**self.SEARCH, "url": after_cancel_url, "fingerprint": "g"}
+        req = service.Act(session="s", action="fill", ref="@e2", target="搜尋商品", value="洗面乳", submit=True)
+        with patch.object(service, "_page_state", side_effect=[self.SEARCH, landed]), \
+             patch.object(service, "_settled_state", return_value=landed), \
+             patch.object(service, "_cmd", side_effect=fake_cmd):
+            return service.do_act(req, "fill"), commands
+
+    def test_site_handled_enter_that_navigated_counts_as_filled(self):
+        # cosmed/friday/poyabuy 2026-10-20: the site cancels Enter and routes the search itself.
+        result, commands = self._search("https://shop.test/search?q=洗面乳")
+        self.assertEqual(result["status"], "FILLED")
+        self.assertEqual(commands, ['fill-submit @e2 "洗面乳"'])
+
+    def test_canceled_enter_without_navigation_presses_a_real_enter(self):
+        result, commands = self._search("https://shop.test/")
+        self.assertEqual(commands, ['fill-submit @e2 "洗面乳"', 'fill @e2 "洗面乳"', "press Enter"])
+
+    def test_fill_ref_on_a_non_editable_element_is_grounded_by_description(self):
+        # momo: the full view gave a search *icon link* for the fill.
+        with patch.object(service, "_page_state", return_value=self.SEARCH), \
+             patch.object(service, "_ground", side_effect=lambda req, *a: (_ for _ in ()).throw(AssertionError(req.ref))) as g:
+            with self.assertRaises(AssertionError) as ctx:
+                service.do_act(service.Act(session="s", action="fill", ref="@e1", target="搜尋商品", value="x"), "fill")
+        self.assertEqual(str(ctx.exception), "None")   # grounded by text, ref dropped
+
+    def test_link_to_another_page_that_only_changed_the_dom_falls_back_to_its_href(self):
+        # books.com.tw: product links stayed on the results page with a hover-style DOM change.
+        page = {**self.SEARCH, "url": "https://books.test/search?q=x",
+                "_snap": '@e3 <a> "原子習慣" href="https://books.test/products/1"'}
+        hover = {**page, "fingerprint": "hover"}
+        product = {**page, "url": "https://books.test/products/1", "fingerprint": "p"}
+        commands = []
+        with patch.object(service, "_page_state", return_value=page), \
+             patch.object(service, "_settled_state", side_effect=[hover, hover, product]), \
+             patch.object(service, "_cmd", side_effect=lambda _s, c: commands.append(c) or {"ok": True}):
+            result = service.do_act(service.Act(session="s", action="click", ref="@e3", target="原子習慣"), "click")
+        self.assertEqual(commands, ["activate @e3", "click-js @e3", "open https://books.test/products/1"])
+        self.assertEqual(result["status"], "CLICKED")
+
+    def test_full_view_ref_that_contradicts_its_description_is_grounded_first(self):
+        page = {**self.LOGIN, "_snap": '@e5 <a> "3coins"\n@e9 <a> "Philips 星樂視氣炸鍋 4.2L"'}
+        calls = []
+        steps = iter([({"action": "click", "ref": "@e5", "target": "Philips 星樂視氣炸鍋"}, 1.0), ({"action": "done"}, 1.0)])
+
+        def fake_act(sub, a, p=None):
+            calls.append(sub.ref)
+            return {"status": "CLICKED", "navigated": True}
+        with patch.object(service, "_page_state", return_value=page), \
+             patch.object(service, "_goal_text", return_value=""), \
+             patch.object(service, "_cmd", return_value={"text": page["url"]}), \
+             patch.object(service, "next_step", return_value=({"action": "fail"}, 1.0)), \
+             patch.object(service, "next_step_full", side_effect=lambda *a, **k: next(steps)), \
+             patch.object(service, "do_act", side_effect=fake_act), \
+             patch.object(service, "do_read", return_value={"text": ""}), \
+             patch.object(service, "verify_done", return_value=(True, "ok", 1.0)):
+            result = service._run_task(service.Act(session="s", action="task", goal="g"))
+        self.assertEqual(calls, [None])
+        self.assertEqual(result["steps"][1]["ref_mismatch"], "@e5")
+
+    def test_ref_fits_keeps_matching_and_text_less_refs(self):
+        snap = '@e1 <a> "BILLY"\n@e2 <button> "(no visible text: icon, switch/toggle or custom control)"\n@e3 <a> "支援"'
+        self.assertTrue(service._ref_fits(snap, "@e1", "BILLY bookcase link"))
+        self.assertTrue(service._ref_fits(snap, "@e2", "cart icon"))
+        self.assertFalse(service._ref_fits(snap, "@e3", "ASUS logo (Homepage)"))
+
+    def test_cleanup_closes_the_opener_tab_too(self):
+        # A click that opened a new tab moved the session into it; one close only returned to the opener.
+        pages = ["popup", "opener"]
+
+        def fake_request(command, session):
+            if command == "close" and pages:
+                pages.pop()
+            if command == "get url":
+                return {"ok": bool(pages)}
+            return {"ok": True}
+        with patch.object(service.nd, "request", side_effect=fake_request):
+            service._dispatch(service.Act(session="s", action="cleanup"))
+        self.assertEqual(pages, [])
 
     def test_planner_elements_exclude_negative_feedback(self):
         snap = '@e1 <a> "Apple專區" href="/apple"\n@e2 <button> "搜尋"'

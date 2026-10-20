@@ -79,3 +79,24 @@ test('after research, one browser_intent on an exact research URL is allowed; mo
  assert.equal(await intent({goal: 'continue on the current page'}), 'blocked', 'no URL: nothing tied to research');
  assert.equal((await fire('tool_call', {toolName: 'research', input: {}}))?.block, true, 'research itself stays blocked');
 });
+
+test('a URL blocked by URL_PROVENANCE_GUARD stays blocked on retry', async () => {
+ const dir = mkdtempSync(join(tmpdir(), 'pi-guards-'));
+ process.env.PI_BROWSER_CONFIG = join(dir, 'browser-config.json');
+ writeFileSync(process.env.PI_BROWSER_CONFIG, JSON.stringify({crawlGuards: false}));
+ const { default: extension } = await jiti.import('../index.ts');
+ const hooks = new Map();
+ extension({on: (name, handler) => hooks.set(name, [...(hooks.get(name) ?? []), handler]), registerTool() {}});
+ const entries = [];
+ const ctx = {sessionManager: {getSessionId: () => 's1', getBranch: () => entries, getEntries: () => entries}};
+ const fire = async (name, event) => { let out; for (const h of hooks.get(name) ?? []) out = (await h(event, ctx)) ?? out; return out; };
+ entries.push({type: 'message', message: {role: 'user', content: [{type: 'text', text: '用瀏覽器打開 https://www.etmall.com.tw/ 搜尋保溫瓶'}]}});
+ await fire('input', {text: '用瀏覽器打開 https://www.etmall.com.tw/ 搜尋保溫瓶'});
+ // etmall 2026-10-20: the agent built the search URL itself; the rejection quoted it, and the retry passed.
+ const input = {url: 'https://www.etmall.com.tw/Search?keyword=保溫瓶', goal: '點進第一個商品'};
+ const first = await fire('tool_call', {toolName: 'browser_intent', input});
+ assert.equal(first?.block, true);
+ entries.push({type: 'message', message: {role: 'toolResult', toolName: 'browser_intent', isError: true, content: [{type: 'text', text: first.reason}]}});
+ assert.equal((await fire('tool_call', {toolName: 'browser_intent', input}))?.block, true);
+ assert.equal((await fire('tool_call', {toolName: 'browser_intent', input: {url: 'https://www.etmall.com.tw/', goal: 'x'}}))?.block, undefined);
+});
