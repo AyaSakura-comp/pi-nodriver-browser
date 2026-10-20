@@ -62,7 +62,10 @@ def _candidates(elements):
 
 def _compact_step(out, candidates):
     fail = {"action": "fail", "reason": f"invalid compact planner command or unavailable candidate: {out[:80]!r}"}
+    # Qwen sometimes writes the whole form as several commands; the first one is the next step.
     text = out.strip()
+    if not text.startswith("{"):
+        text = text.split("\n", 1)[0].strip()
     if text == "D":
         return {"action": "done"}
     if text == "X":

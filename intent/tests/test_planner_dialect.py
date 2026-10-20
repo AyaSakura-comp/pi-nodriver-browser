@@ -183,3 +183,15 @@ class GoalExcerptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompactMultiLineTests(unittest.TestCase):
+    def test_first_command_of_a_multi_line_reply_is_the_next_step(self):
+        # HayAegis 2026-10-20: Qwen wrote the whole login form as three commands.
+        cands = [("input type=text: 帳號", []), ("input type=password: 密碼", []), ("button: 登入", [])]
+        step = planner._compact_step('C 3\nF 1 "x" 0', cands)
+        self.assertEqual(step, {"action": "click", "target": "button: 登入"})
+
+    def test_multi_line_json_is_still_parsed(self):
+        step = planner._compact_step('{"action": "done",\n "reason": "shown"}', [])
+        self.assertEqual(step["action"], "done")

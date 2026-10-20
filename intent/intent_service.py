@@ -359,6 +359,10 @@ def _vision_only_click(req: Act, session: str, before: dict, t0: float) -> dict:
             **_public(before), "hint": "No box on the screen performs this."}
 
 
+def _has_password_field(snap: str) -> bool:
+    return any(e.tag == "input" and e.attrs.get("type") == "password" for e in L.parse_snapshot(snap))
+
+
 def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -> dict:
     p = progress or (lambda s, m, **e: None)
     t0 = time.perf_counter()
@@ -417,6 +421,13 @@ def do_act(req: Act, action: str, progress: Optional[ProgressCallback] = None) -
     if action == "click" and L.is_risky(label) and not req.confirm:
         return {"status": "NEEDS_CONFIRM", "would_click": label,
                 "hint": "This looks irreversible (purchase/checkout/delete/logout). Repeat with confirm=true only if the user asked for it."}
+
+    if action == "fill" and req.goal and (req.value or "") not in req.goal and _has_password_field(before["_snap"]):
+        # A login/sign-up form: any value the goal does not spell out is invented (planners typed
+        # admin/admin, test, password123 into a production login on 2026-10-20).
+        return {"status": "NEEDS_INPUT", "would_fill": label, **_public(before),
+                "hint": "This page asks for credentials the goal does not give. Never guess them: ask the user "
+                        "to log in in the browser (or to provide the values), then retry."}
 
     p("executing", f"⚡ 執行 {action}：{label}{f' -> \"{req.value}\"' if req.value else ''}...")
     if action == "click":
@@ -851,7 +862,9 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             reason = step.get("reason") if step["action"] == "fail" else None
             return {"status": status, **({"reason": reason} if reason else {}), **extra, "steps": trace, "url": st["url"],
                     "title": st["title"], "text": rd["text"], "total_ms": round((time.perf_counter() - t0) * 1000)}
-        box = next((b for b in (boxes if view == "full" else []) if str(b["id"]) == str(step.get("box"))), None)
+        # The model often fills both "ref" and "box"; a DOM ref is the sturdier click, boxes are for text-less controls.
+        has_ref = view == "full" and str(step.get("ref") or "").startswith("@e")
+        box = None if has_ref else next((b for b in (boxes if view == "full" else []) if str(b["id"]) == str(step.get("box"))), None)
         if box is not None and step["action"] == "click":
             if L.is_risky(f"{step.get('target', '')} {step.get('reason', '')}") and not req.confirm:
                 rec.update(status="NEEDS_CONFIRM")
@@ -859,7 +872,8 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
                 return {"status": "TASK_NEEDS_CONFIRM", "would_click": f"box {box['id']}: {step.get('target')}", "steps": trace,
                         "hint": "Irreversible step reached. Only continue if the user explicitly asked (task with confirm=true).",
                         "total_ms": round((time.perf_counter() - t0) * 1000)}
-            before = _page_state(session)
+            # Not _page_state(): its `snapshot -i --full` drops the worker's omni preview (OMNI_PREVIEW_REQUIRED).
+            before = st
             x, y = box["center"]
             p("task_exec", f"⚡ 執行點擊視覺方塊 {box['id']} ({step.get('target', '')})...")
             try:
@@ -946,6 +960,10 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
         if status == "NEEDS_CONFIRM":
             return {"status": "TASK_NEEDS_CONFIRM", "would_click": last.get("would_click"), "steps": trace,
                     "hint": "Irreversible step reached. Only continue (click with confirm=true) if the user asked.",
+                    "total_ms": round((time.perf_counter() - t0) * 1000)}
+        if status == "NEEDS_INPUT":
+            return {"status": "TASK_NEEDS_INPUT", "would_fill": last.get("would_fill"), "steps": trace,
+                    "url": last.get("url"), "title": last.get("title"), "hint": last.get("hint"),
                     "total_ms": round((time.perf_counter() - t0) * 1000)}
         # "_UNCONFIRMED" = the click changed nothing visible: treat as no progress, like a miss.
         if status in ("NO_MATCH", "AMBIGUOUS", "ERROR", "PICK_EXPIRED") or status.endswith("_UNCONFIRMED"):

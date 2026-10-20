@@ -27,7 +27,7 @@ export function plannerEndpoint(api: string | undefined, baseUrl: string | undef
 const RESOLVE_HELP = 'Recovery: action "resolve" {target?: last error/status} checks the router, starts a missing local router through the restart-service hub, reconnects the worker and observes the page. Returns RESOLVED/RESOLVE_BLOCKED and common failure guidance. Never replays the original action, resets shared Chrome, or bypasses URL/auth/confirmation guards.';
 
 const DESCRIPTION = `Intent-level live browser (shares the nodriver Chrome session). You never see DOM or @refs: describe the element in words and the tool finds, clicks/fills, and verifies it.
-BEST DEFAULT: use action "task" {url, goal} with an exact user-supplied URL or an exact search-result URL. The browser service drives the site itself step by step (small fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with the goal-relevant page text), TASK_UNVERIFIED (check it), TASK_FAILED, TASK_STOPPED or TASK_NEEDS_CONFIRM. Put every constraint in the goal (e.g. "single unit, not a bundle; do not add to cart"). If an unindexed deep link is not returned and not provided by the user, start from the closest official parent URL that search did return and navigate through visible links to the requested item. You then only check the result and answer.
+BEST DEFAULT: use action "task" {url, goal} with an exact user-supplied URL or an exact search-result URL. The browser service drives the site itself step by step (small fast planner + grounding + safety gate + verification) and returns TASK_DONE (verified, with the goal-relevant page text), TASK_UNVERIFIED (check it), TASK_FAILED, TASK_STOPPED, TASK_NEEDS_CONFIRM or TASK_NEEDS_INPUT. Put every constraint in the goal (e.g. "single unit, not a bundle; do not add to cart"). If an unindexed deep link is not returned and not provided by the user, start from the closest official parent URL that search did return and navigate through visible links to the requested item. You then only check the result and answer.
 ALTERNATIVE: use action "plan" with steps [...] to run a whole predictable sequence (open → fill → click → read) in ONE call. Targets are semantic, so you do not need to see a page before describing what to click on it. The plan stops early and reports the step that needs you (NO_MATCH / AMBIGUOUS / NEEDS_CONFIRM). You do NOT need to read search results before clicking: put the selection criteria in the click target and the tool picks the matching item (or stops with NO_MATCH).
 Example (one call for a whole shopping lookup):
 {"action":"plan","steps":[{"action":"open","url":"<exact url>"},{"action":"fill","target":"search box","value":"DGX Spark","submit":true},{"action":"click","target":"in-stock single-unit DGX Spark, not a 2-pack or bundle"},{"action":"read","target":"price and shipping"}]}
@@ -49,6 +49,7 @@ const GOAL_DESCRIPTION = `Live browser autopilot (shares the logged-in nodriver 
 - TASK_UNVERIFIED: the planner thinks it is done but the page text does not show it; check text before answering.
 - TASK_STOPPED / TASK_FAILED: not reached; steps and events say how far it got and why.
 - TASK_NEEDS_CONFIRM: an irreversible step (buy, pay, submit order, delete, log out) was reached and NOT taken.
+- TASK_NEEDS_INPUT: a login/sign-up form needs values the goal does not give. Never invent credentials: ask the user to log in or to supply them.
 Every result has events (what the planner did, step by step, with timings) and a screenshot of where it ended.
 url must be an exact URL from the user or from search results; a Google search URL (https://www.google.com/search?q=...) also works as a start. Omit url to continue from the page this conversation's last task ended on (e.g. a follow-up question about the same page, or "take a screenshot").`;
 const GOAL_GUIDELINES = [
@@ -361,7 +362,7 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         if (signal?.aborted) throw error;
         data = streamFailure(error);
       }
-      if (["ERROR", "NO_MATCH", "AMBIGUOUS", "PICK_EXPIRED", "TASK_FAILED", "TASK_STOPPED", "NEEDS_CONFIRM", "TASK_NEEDS_CONFIRM"].includes(String(data.status))) {
+      if (["ERROR", "NO_MATCH", "AMBIGUOUS", "PICK_EXPIRED", "TASK_FAILED", "TASK_STOPPED", "NEEDS_CONFIRM", "TASK_NEEDS_CONFIRM", "NEEDS_INPUT", "TASK_NEEDS_INPUT"].includes(String(data.status))) {
         const advice = failureAdvice(`${data.status} ${data.message || data.hint || ""}`);
         data.resolver = FULL ? { action: "resolve", advice } : { advice };
       }
@@ -386,13 +387,14 @@ export default function (pi: ExtensionAPI, ensureBrowser?: () => Promise<void>) 
         humanSummary = `⌨️ **[填寫操作完成]**${unconfirmed}\n- **目標描述**: ${params.target || ""}\n- **鎖定元素**: ${data.element || params.target}\n- **輸入內容**: "${params.value || ""}" ${params.submit ? "(已按 Enter 提交)" : ""}\n- **當前頁面**: ${data.title ? `「${data.title}」` : ""}\n- **網址**: ${data.url || ""}`;
       } else if (data.status === "OPENED") {
         humanSummary = `🌐 **[已開啟網頁]**\n- **網址**: ${data.url}\n- **標題**: ${data.title || ""}`;
-      } else if (data.status === "TASK_DONE" || data.status === "TASK_UNVERIFIED" || data.status === "TASK_STOPPED" || data.status === "TASK_FAILED") {
+      } else if (data.status === "TASK_DONE" || data.status === "TASK_UNVERIFIED" || data.status === "TASK_STOPPED" || data.status === "TASK_FAILED" || data.status === "TASK_NEEDS_INPUT") {
         const icon = data.status === "TASK_DONE" ? "✅" : (data.status === "TASK_UNVERIFIED" ? "🔍" : "🛑");
         const statusMap: Record<string, string> = {
           TASK_DONE: "任務已完成 (經獨立驗證)",
           TASK_UNVERIFIED: "任務已執行 (待人工確認)",
           TASK_STOPPED: "任務已停止 (重試或步數上限)",
           TASK_FAILED: "任務失敗",
+          TASK_NEEDS_INPUT: "需要使用者登入或提供資料",
         };
         const title = `${icon} **[${statusMap[data.status as string] || data.status}]** ${params.goal || ""}`;
         let stepsBlock = "";

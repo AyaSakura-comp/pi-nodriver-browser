@@ -119,6 +119,63 @@ class AnchorClickFallbackTests(unittest.TestCase):
         self.assertEqual(result["status"], "TASK_STOPPED")
         self.assertLess(len(result["steps"]), 6)
 
+    LOGIN = {"url": "https://hayaegis.test/", "title": "HayAegis", "headings": [], "page_excerpt": "帳號 密碼",
+             "fingerprint": "f", "elements": 3,
+             "_snap": '@e2 <input> "輸入你的帳號" type="text"\n@e3 <input> "密碼" type="password"\n@e4 <button> "進入投資組合儀表板"'}
+
+    def _fill(self, ref, value, goal):
+        commands = []
+        req = service.Act(session="s", action="fill", ref=ref, value=value, goal=goal)
+        with patch.object(service, "_page_state", return_value=self.LOGIN), \
+             patch.object(service, "_cmd", side_effect=lambda _s, c: commands.append(c) or {"ok": True}):
+            return service.do_act(req, "fill"), commands
+
+    def test_login_form_fill_with_invented_value_needs_input(self):
+        for ref, value in (("@e2", "admin"), ("@e3", "password123")):
+            result, commands = self._fill(ref, value, "在已登入的 HayAegis 進入交易帳本")
+            self.assertEqual(result["status"], "NEEDS_INPUT")
+            self.assertEqual(commands, [])
+
+    def test_login_form_fill_with_value_from_goal_runs(self):
+        result, commands = self._fill("@e2", "aya", "用帳號 aya 登入 HayAegis")
+        self.assertTrue(result["status"].startswith("FILLED"))
+        self.assertEqual(commands, ['fill @e2 "aya"'])
+
+    def test_task_stops_with_needs_input_instead_of_guessing(self):
+        fill = ({"action": "fill", "target": "input type=text: 輸入你的帳號", "value": "admin"}, 1.0)
+        with patch.object(service, "_page_state", return_value=self.LOGIN), \
+             patch.object(service, "_goal_text", return_value=""), \
+             patch.object(service, "_cmd", return_value={"text": "https://hayaegis.test/"}), \
+             patch.object(service, "next_step", return_value=fill):
+            result = service._run_task(service.Act(session="s", action="task", goal="在已登入的 HayAegis 進入交易帳本"))
+        self.assertEqual(result["status"], "TASK_NEEDS_INPUT")
+
+    def test_full_view_prefers_ref_and_box_click_keeps_omni_preview(self):
+        page = {**self.LOGIN, "_snap": '@e4 <button> "進入投資組合儀表板"\n@e5 <div>'}
+        moved = {**page, "url": "https://hayaegis.test/dashboard", "fingerprint": "g"}
+        commands, acted = [], []
+
+        def fake_cmd(_s, c):
+            commands.append(c)
+            return {"elements": [{"id": 0, "center": [10, 20]}], "screenshotPath": "/tmp/x.jpg"} if c == "vision-mark omni" else {"text": page["url"]}
+
+        steps = iter([({"action": "click", "ref": "@e4", "box": 0, "target": "登入"}, 1.0),
+                      ({"action": "click", "ref": "", "box": 0, "target": "icon"}, 1.0),
+                      ({"action": "done"}, 1.0)])
+        with patch.object(service, "_page_state", return_value=page), \
+             patch.object(service, "_settled_state", return_value=moved), \
+             patch.object(service, "_goal_text", return_value=""), \
+             patch.object(service, "_cmd", side_effect=fake_cmd), \
+             patch.object(service, "next_step", return_value=({"action": "fail"}, 1.0)), \
+             patch.object(service, "next_step_full", side_effect=lambda *a, **k: next(steps)), \
+             patch.object(service, "do_act", side_effect=lambda sub, a, p=None: acted.append(sub.ref) or {"status": "FILLED"}), \
+             patch.object(service, "do_read", return_value={"text": ""}), \
+             patch.object(service, "verify_done", return_value=(True, "ok", 1.0)):
+            service._run_task(service.Act(session="s", action="task", goal="g", url=None))
+        self.assertEqual(acted, ["@e4"])
+        i = commands.index("vision-click 10 20")
+        self.assertEqual(commands[i - 1], "vision-mark omni")
+
     def test_planner_elements_exclude_negative_feedback(self):
         snap = '@e1 <a> "Apple專區" href="/apple"\n@e2 <button> "搜尋"'
         # Without exclude: both are present

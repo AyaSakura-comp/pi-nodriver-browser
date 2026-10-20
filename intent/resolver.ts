@@ -16,6 +16,7 @@ export function failureAdvice(message: string): { code: string; hint: string } {
   const rules: [RegExp, string, string][] = [
     [/URL_PROVENANCE/i, 'URL_PROVENANCE', 'Use the exact user/search URL or a visible candidate link. Never guess or bypass the guard.'],
     [/NEEDS_CONFIRM/i, 'USER_CONFIRMATION', 'Stop. Only confirm when the user explicitly authorized the irreversible action.'],
+    [/NEEDS_INPUT/i, 'ACCESS_GATE', 'Stop. Ask the user to log in in the browser or to give the values; never invent credentials.'],
     [/captcha|access.denied|sign.in|login.required/i, 'ACCESS_GATE', 'Ask the user to complete the access gate. Do not bypass authentication or CAPTCHA.'],
     [/LOOP_GUARD/i, 'LOOP_GUARD', 'Inspect with observe/read. Do not reset the guard or repeatedly reopen the same origin.'],
     [/no open page/i, 'NO_PAGE', 'This session has no page yet. Open an exact authorized user/search URL; do not guess a URL or reuse another session tab.'],
