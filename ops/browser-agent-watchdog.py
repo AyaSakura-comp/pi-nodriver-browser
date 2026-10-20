@@ -101,6 +101,38 @@ def socket_ok(path: str, timeout: float = 2) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
+def browser_ok(path: str, timeout: float = 60) -> tuple[bool, str]:
+    """The socket accepting is not enough: on 2026-10-20 the worker answered while every command failed
+    with "Failed to connect to browser". browser-health probes Chrome (relaunching a dead one) without
+    opening a tab, and reports "not started" instead of launching Chrome for an idle worker."""
+    marker, rid = "__PI_NODRIVER__", int.from_bytes(os.urandom(3), "big")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(path)
+            s.sendall((json.dumps({"id": rid, "command": "browser-health", "sessionId": "__watchdog__"}) + "\n").encode())
+            buf = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    return False, "worker closed the connection"
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", "replace")
+                    if text.startswith(marker):
+                        resp = json.loads(text[len(marker):])
+                        if resp.get("id") == rid:
+                            if resp.get("ok"):
+                                return True, f"browser {resp.get('browser')}" + (
+                                    f" ({resp.get('probeMs')} ms, {resp.get('tabs')} tabs)" if resp.get("probeMs") is not None else "")
+                            if "unsupported browser command" in str(resp.get("error")):
+                                return True, "socket accepts (worker predates browser-health)"
+                            return False, f"browser-health: {str(resp.get('error'))[:160]}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
 def worker_units() -> list[str]:
     out = systemctl("user", "list-units", f"{WORKER_PREFIX}*", "--all", "--plain", "--no-legend").stdout
     return [line.split()[0] for line in out.splitlines() if line.strip()]
@@ -201,6 +233,8 @@ def check(svc: dict) -> tuple[bool, str, dict | None, str | None]:
     if svc["unit"] is None:
         units = worker_units()
         ok, detail = socket_ok(svc["socket"])
+        if ok:
+            ok, detail = browser_ok(svc["socket"])
         return ok, detail, None, (units[0] if units else None)
     props = unit_props(svc["scope"], svc["unit"])
     if props.get("ActiveState") != "active":
@@ -211,6 +245,10 @@ def check(svc: dict) -> tuple[bool, str, dict | None, str | None]:
 
 def revive(svc: dict, props: dict | None) -> tuple[bool, str]:
     if svc["unit"] is None:
+        # A running worker with a broken browser must go first: two workers would share the socket path
+        # and the profile, and the new Chrome cannot take a profile the old one still holds.
+        for unit in worker_units():
+            systemctl("user", "stop", unit)
         return start_worker()
     sudo = svc["scope"] == "system"
     if props and props.get("ActiveState") == "failed":
@@ -245,6 +283,9 @@ def pass_once(states: dict) -> None:
             log_event(name, "restarted_outside_watchdog", previous_pid=st.get("pid"), cause=cause, died_at=iso(died),
                       came_back_at=iso(back), downtime_s=round(back - died) if died and back else None, evidence=evidence)
 
+        if ok and detail.startswith("browser relaunched"):
+            # The worker survived but its Chrome did not answer and was replaced: every tab was lost.
+            log_event(name, "browser_relaunched", unit=unit, detail=detail, **memory())
         if ok:
             if st.get("down_since"):
                 log_event(name, "recovered", died_at=iso(st["down_since"]), detected_at=iso(st["detected_at"]),
@@ -255,7 +296,8 @@ def pass_once(states: dict) -> None:
 
         st["last_check"] = t
         st["fails"] = st.get("fails", 0) + 1
-        dead = svc["unit"] is None or (props or {}).get("ActiveState") != "active"
+        # The worker's process is gone only when its socket refuses; a failed browser probe is a hang.
+        dead = (not socket_ok(svc["socket"])[0]) if svc["unit"] is None else (props or {}).get("ActiveState") != "active"
         if not st.get("down_since"):
             since = st.get("last_ok", t - 3600)
             died = death_time(props, svc["unit"] or st.get("unit"), svc["scope"], since) if dead else None
@@ -315,16 +357,16 @@ def report(days: float) -> None:
     for name in [s["name"] for s in SERVICES]:
         ev = by.get(name, [])
         downs = [e for e in ev if e["event"] == "down"]
-        outside = [e for e in ev if e["event"] == "restarted_outside_watchdog"]
+        outside = [e for e in ev if e["event"] in ("restarted_outside_watchdog", "browser_relaunched")]
         rec = [e for e in ev if e["event"] == "recovered"]
         causes = collections.Counter(e.get("cause", "?").split(" (")[0] for e in downs + outside)
         total = sum(e.get("downtime_s") or 0 for e in rec + outside)
-        print(f"\n{name}: {len(downs)} outage(s), {len(outside)} restart(s) by systemd, downtime {total}s"
+        print(f"\n{name}: {len(downs)} outage(s), {len(outside)} restart(s) outside the watchdog, downtime {total}s"
               + (f"; causes: {dict(causes)}" if causes else ""))
         for e in (downs + outside)[-10:]:
             print(f"  {e.get('died_at') or e.get('came_back_at') or e['ts']}  {e['event']:27} {e.get('cause', '')}")
     hours = collections.Counter(dt.datetime.fromisoformat(r.get("died_at") or r["ts"]).hour
-                                for r in rows if r["event"] in ("down", "restarted_outside_watchdog"))
+                                for r in rows if r["event"] in ("down", "restarted_outside_watchdog", "browser_relaunched"))
     if hours:
         print("\nby hour of day: " + "  ".join(f"{h:02d}h:{n}" for h, n in sorted(hours.items())))
 

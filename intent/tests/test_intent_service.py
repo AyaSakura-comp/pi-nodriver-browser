@@ -1,7 +1,9 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import intent_service as service
+import planner
 
 
 class AnchorClickFallbackTests(unittest.TestCase):
@@ -143,7 +145,11 @@ class AnchorClickFallbackTests(unittest.TestCase):
 
     def test_task_stops_with_needs_input_instead_of_guessing(self):
         fill = ({"action": "fill", "target": "input type=text: 輸入你的帳號", "value": "admin"}, 1.0)
+        grounded = SimpleNamespace(status="match", ref="e2", label="input type=text: 輸入你的帳號", tier="exact",
+                                   timings={}, trace={}, shortlist=[])
         with patch.object(service, "_page_state", return_value=self.LOGIN), \
+             patch.object(service, "_ground", return_value=(grounded, self.LOGIN["_snap"])), \
+             patch.object(service, "next_step_full", side_effect=AssertionError("must stop before escalating")), \
              patch.object(service, "_goal_text", return_value=""), \
              patch.object(service, "_cmd", return_value={"text": "https://hayaegis.test/"}), \
              patch.object(service, "next_step", return_value=fill):
@@ -343,3 +349,65 @@ class AnchorClickFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccessGateTests(unittest.TestCase):
+    """shopee.tw 2026-10-20: search for an anonymous visitor ends on a captcha, an app-only or a login wall."""
+
+    PAGE = {"title": "蝦皮購物", "headings": [], "page_excerpt": "", "fingerprint": "f", "elements": 3, "_snap": ""}
+
+    def gate(self, url, text, goal="搜尋手機殼並回報第一個商品的價格"):
+        return service._access_gate({**self.PAGE, "url": url, "_text": text}, goal)
+
+    def test_captcha_url_and_short_challenge_page(self):
+        self.assertEqual(self.gate("https://shopee.tw/verify/captcha?anti_bot_tracking_id=x", "安全性驗證"), "CAPTCHA / 人機驗證")
+        self.assertEqual(self.gate("https://shopee.tw/verify/traffic?next=x", "返回首頁"), "CAPTCHA / 人機驗證")
+        self.assertEqual(self.gate("https://example.test/", "跳到主要內容 需要幫助嗎？ 安全性驗證 請滑動以完成拼圖 ID:226f"),
+                         "CAPTCHA / 人機驗證")
+
+    def test_security_words_on_a_long_ordinary_page_are_not_a_gate(self):
+        self.assertIsNone(self.gate("https://bank.test/help", "帳戶安全性驗證說明 " + "內容 " * 1500))
+
+    def test_app_only_wall(self):
+        self.assertEqual(self.gate("https://shopee.tw/welcome-package", "註冊 登入 你只能透過蝦皮APP領取新用戶專屬禮物。 趕快下載蝦皮APP！"),
+                         "網站要求改用 App")
+
+    def test_login_wall_unless_the_goal_is_to_log_in(self):
+        self.assertEqual(self.gate("https://shopee.tw/buyer/login?next=x", "登入 手機號碼"), "需要登入")
+        self.assertIsNone(self.gate("https://shopee.tw/buyer/login?next=x", "登入", goal="用我的帳號登入蝦皮"))
+        self.assertIsNone(self.gate("https://blog.test/logins-explained", "an article"))
+
+    def test_task_stops_at_the_wall_without_planning(self):
+        page = {**self.PAGE, "url": "https://shopee.tw/verify/captcha?x=1", "_text": "安全性驗證 請滑動以完成拼圖"}
+        with patch.object(service, "_page_state", return_value=page), \
+             patch.object(service, "_cmd", return_value={"text": page["url"]}), \
+             patch.object(service, "next_step") as planner:
+            result = service._run_task(service.Act(session="s", action="task", goal="搜尋手機殼"))
+        self.assertEqual(result["status"], "TASK_BLOCKED")
+        self.assertEqual(result["reason"], "CAPTCHA / 人機驗證")
+        planner.assert_not_called()
+
+
+class VerifierTextTests(unittest.TestCase):
+    """2026-10-20 rerun: books, poyabuy and apple answered with a price but came back TASK_UNVERIFIED."""
+
+    def test_price_lines_reach_the_excerpt_when_the_page_never_says_the_goals_word(self):
+        page = "\n".join(["博客來", "會員登入", "購物車"] + ["推薦書 " + str(i) for i in range(60)] + [
+            "原子習慣：細微改變帶來巨大成就的實證法則", "作者： 詹姆斯‧克利爾"] + ["簡介段落 " + str(i) for i in range(40)] + [
+            "定價：330元", "優惠價：79折260元"] + ["頁尾 " + str(i) for i in range(40)])
+        text = service.goal_excerpt(page, "點進第一個商品，記錄該商品的完整商品名稱和價格", anchors=8, limit=4000)
+        self.assertIn("優惠價：79折260元", text)
+
+    def test_empty_body_is_not_replaced_by_the_image_list(self):
+        replies = iter([{"text": "Images found: 6 candidates (metadata only; not downloaded).\n\nPage text:", "pageText": ""},
+                        {"text": "Images found: ...\n\nPage text:\nemplir水光澄果洗髮精 NT$299", "pageText": "emplir水光澄果洗髮精 NT$299"}])
+        with patch.object(service, "_cmd", side_effect=lambda _s, _c: next(replies)), patch.object(service.time, "sleep"):
+            text = service.do_read(service.Act(session="s", action="read"))["text"]
+        self.assertEqual(text, "emplir水光澄果洗髮精 NT$299")
+
+    def test_verifier_sees_the_whole_read_excerpt(self):
+        sent = []
+        text = "x" * 3000 + " 優惠價 260元"
+        with patch.object(planner, "chat", side_effect=lambda _u, _h, body, _t: sent.append(body) or '{"achieved": true}'):
+            planner.verify_done("價格", [], {"title": "t"}, text, url="http://127.0.0.1:8001/v1/chat/completions", model="m")
+        self.assertIn("優惠價 260元", sent[0]["messages"][0]["content"])

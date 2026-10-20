@@ -41,3 +41,8 @@ test('busy planner gets a safe-retry hint, not the may-have-executed timeout hin
   const advice = failureAdvice('ERROR RuntimeError: planner model at 127.0.0.1:8001 did not answer within 30s (server busy or down); no page action was taken for this step');
   assert.equal(advice.code, 'PLANNER_BUSY');
 });
+test('a site wall stops the agent from reopening the site', () => {
+  const advice = failureAdvice('TASK_BLOCKED The site put up a wall the browser must not pass by itself.');
+  assert.equal(advice.code, 'ACCESS_GATE');
+  assert.match(advice.hint, /Do not reopen/);
+});

@@ -1066,6 +1066,41 @@ def parse_devtools_active_port(content: str) -> int:
     return port
 
 
+def pid_alive(pid) -> bool:
+    try:
+        stat_line = Path(f'/proc/{int(pid)}/stat').read_text()
+    except (OSError, TypeError, ValueError):
+        return False
+    # The state letter follows the parenthesised command name; a zombie has already exited.
+    return stat_line.rsplit(')', 1)[-1].split()[:1] != ['Z']
+
+
+def profile_lock_pid(profile: Path, hostname: str | None = None) -> int | None:
+    """PID of the Chrome holding this profile (SingletonLock -> '<host>-<pid>'), if on this host."""
+    try:
+        target = os.readlink(Path(profile) / 'SingletonLock')
+    except OSError:
+        return None
+    host, _, pid = target.rpartition('-')
+    if not pid.isdigit() or host != (hostname if hostname is not None else os.uname().nodename):
+        return None
+    return int(pid)
+
+
+def chrome_debug_port(pid) -> int | None:
+    """--remote-debugging-port of a running Chrome. Chrome writes no DevToolsActivePort file when the
+    port is given explicitly (nodriver always does), so the command line is the only record."""
+    try:
+        args = Path(f'/proc/{int(pid)}/cmdline').read_bytes().split(b'\0')
+    except (OSError, TypeError, ValueError):
+        return None
+    for arg in args:
+        if arg.startswith(b'--remote-debugging-port='):
+            value = arg.split(b'=', 1)[1]
+            return int(value) if value.isdigit() and 0 < int(value) < 65536 else None
+    return None
+
+
 def should_disable_sandbox() -> bool:
     return os.environ.get('PI_NODRIVER_NO_SANDBOX', '').lower() in {'1', 'true', 'yes'}
 

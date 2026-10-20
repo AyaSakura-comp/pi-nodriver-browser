@@ -123,7 +123,7 @@ def _page_state(session: str, snap_text: str | None = None, title: str | None = 
     fp = L.fingerprint(snap_text + "\n@e-text " + hashlib.sha1(text.encode()).hexdigest())
     excerpt = re.sub(r"\s+", " ", text).strip()[:300]
     return {"url": url, "title": title, "headings": heads, "page_excerpt": excerpt, "fingerprint": fp,
-            "elements": len(els), "links": cand_links[:12], "_snap": snap_text}
+            "elements": len(els), "links": cand_links[:12], "_snap": snap_text, "_text": text}
 
 
 def _remember(session: str, url: str) -> None:
@@ -227,9 +227,20 @@ def do_open(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
     return {"status": "OPENED", **_public(st), "screenshot": r.get("screenshotPath")}
 
 
+def _page_text(session: str) -> str:
+    # `text` puts the image-candidate list first; it stood in for the page whenever the body was still
+    # empty (poyabuy SPA), so the verifier read image URLs. A just-navigated page gets a moment to render.
+    for _ in range(5):
+        gt = _cmd(session, "get text")
+        text = gt["pageText"] if "pageText" in gt else gt.get("text", "")
+        if text.strip():
+            return text
+        time.sleep(0.5)
+    return text
+
+
 def do_read(req: Act) -> dict:
-    gt = _cmd(req.session, "get text")
-    text = gt.get("pageText") or gt.get("text", "")
+    text = _page_text(req.session)
     text = re.sub(r"\n{3,}", "\n\n", text)
     if req.target and len(text) > 1500:
         # Windows around the best-matching lines keep table rows together (cells are one line each);
@@ -386,6 +397,28 @@ def _ref_fits(snap: str, ref: str, target: str) -> bool:
         return True
     want = _words(target)
     return not want or bool(want & _words(label))
+
+
+_CAPTCHA_PATH = re.compile(r"/(?:captcha|challenge)(?:[-_/.]|$)|/verify/(?:captcha|traffic)", re.I)
+_CAPTCHA_TEXT = ("安全性驗證", "請滑動以完成拼圖", "您是人還是機器人", "請驗證您是人類", "verify you are human",
+                 "are you a robot", "unusual traffic", "just a moment...")
+_APP_ONLY = re.compile(r"只能(?:透過|在|使用|於)[^。\n]{0,12}app", re.I)
+_LOGIN_PATH = re.compile(r"/(?:login|signin|sign-in|log-in)(?:[/.]|$)", re.I)
+_LOGIN_GOAL = re.compile(r"登入|登录|log ?in|sign ?in", re.I)
+
+
+def _access_gate(st: dict, goal: str) -> str | None:
+    """A wall the planner cannot pass on its own. Clicking around on it wastes the step budget and the
+    agent then reopens the site (shopee.tw 2026-10-20: captcha, app-only and login walls for search)."""
+    path = urlparse(st.get("url") or "").path
+    text = (st.get("_text") or "").lower()
+    if _CAPTCHA_PATH.search(path) or (len(text) < 2000 and any(m in text for m in _CAPTCHA_TEXT)):
+        return "CAPTCHA / 人機驗證"
+    if _APP_ONLY.search(text[:5000]):
+        return "網站要求改用 App"
+    if _LOGIN_PATH.search(path) and not _LOGIN_GOAL.search(goal):
+        return "需要登入"
+    return None
 
 
 def _has_password_field(snap: str) -> bool:
@@ -739,6 +772,10 @@ GOAL_STOPWORDS = set("the a an and or of to for in on at by with from is are be 
                      "what which find show get page per up".split())
 
 
+_PRICE_GOAL = re.compile(r"價格|價錢|售價|定價|多少錢|費用|price|cost", re.I)
+_PRICE_LINE = re.compile(r"(?:nt\$|＄|\$)\s?\d|\d[\d,]*\s?元|售價|定價|優惠價|特價", re.I)
+
+
 def goal_excerpt(text: str, goal: str, anchors: int = 6, after: int = 12, limit: int = 1500) -> str:
     """Windows of page lines around the lines that best match the goal's words (rarer words weigh
     more), prioritizing highest-scoring match windows so content targets aren't cut off by header boilerplate."""
@@ -770,6 +807,13 @@ def goal_excerpt(text: str, goal: str, anchors: int = 6, after: int = 12, limit:
                     matched_spans.append(span)
                     sc += idf.get(w, 1.0) * (1.5 if re.search(r"[a-z0-9]", w) else 1.0)
         return sc / (1.0 + len(line) / 400.0)
+
+    if _PRICE_GOAL.search(goal):
+        # Pages say 定價/優惠價/NT$, rarely the goal's own word 價格, so price lines matched nothing and
+        # the verifier never saw the price (books.com.tw, apple.com/tw 2026-10-20).
+        boost = max(idf.values(), default=1.0)
+        base = line_score
+        line_score = lambda line: base(line) + (boost / (1.0 + len(line) / 400.0) if _PRICE_LINE.search(line) else 0.0)
 
     scores = [line_score(line) for line in low]
     top = [i for i in sorted(range(len(paras)), key=lambda i: -scores[i])[:anchors] if scores[i] > 0]
@@ -804,7 +848,7 @@ def _goal_text(session: str, goal: str, fallback: str) -> str:
     so it never recognized that it was done."""
     try:
         gt = _cmd(session, "get text")
-        return goal_excerpt(gt.get("pageText") or gt.get("text") or "", goal) or fallback
+        return goal_excerpt(gt["pageText"] if "pageText" in gt else gt.get("text") or "", goal) or fallback
     except Exception:
         return fallback
 
@@ -854,6 +898,15 @@ def _run_task(req: Act, progress: Optional[ProgressCallback] = None) -> dict:
             st = _settled_state(session, before={"url": "", "fingerprint": ""}, budget=1.5, quiet=0.2)
         else:
             st = _page_state(session)
+        gate = _access_gate(st, goal)
+        if gate:
+            p("task_blocked", f"⛔ 網站擋下自動瀏覽：{gate}")
+            return {"status": "TASK_BLOCKED", "reason": gate, "steps": trace, "url": st["url"], "title": st["title"],
+                    "page_excerpt": st["page_excerpt"],
+                    "hint": "The site put up a wall the browser must not pass by itself. Do not reopen this site or "
+                            "retry: tell the user (they can clear it in the browser and ask again), or answer from "
+                            "research results and say the site itself could not be checked.",
+                    "total_ms": round((time.perf_counter() - t0) * 1000)}
         st = {**st, "page_excerpt": _goal_text(session, goal, st.get("page_excerpt", ""))}
         if escalate:
             # Fallback: the compact view failed; look at the full snapshot -i plus a screenshot.

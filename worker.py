@@ -34,11 +34,11 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, chrome_debug_port, pid_alive, profile_lock_pid, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
-    'activate', 'browser-mode-switch', 'click-css', 'click-js', 'click-text', 'close',
+    'activate', 'browser-health', 'browser-mode-switch', 'click-css', 'click-js', 'click-text', 'close',
     'crawl', 'dismiss', 'image-search', 'image-search-batch', 'image-search-results', 'image-search-select', 'google-lens', 'google-lens-results', 'google-lens-select',
     'download', 'download-info', 'download-latest', 'downloads', 'fetch-image', 'fill',
     'pdf-query', 'session-cleanup',
@@ -281,7 +281,7 @@ def action_requires_session_lock(action):
 
 
 def action_requires_page_setup(action):
-    return action not in {'browser-mode-switch', 'fetch-image', 'pdf-query', 'session-cleanup'}
+    return action not in {'browser-health', 'browser-mode-switch', 'fetch-image', 'pdf-query', 'session-cleanup'}
 
 
 def validate_benchmark_action_policy(parts, policy):
@@ -3590,7 +3590,9 @@ class BrowserWorker:
     @staticmethod
     def preflight_timeout_seconds():
         try:
-            timeout = float(os.environ.get('PI_NODRIVER_PREFLIGHT_TIMEOUT', '2'))
+            # Loading a heavy page keeps the renderer busy for seconds; a 2 s bound quarantined a
+            # merely busy shopee.tw tab and took the session's page away for good (2026-10-20).
+            timeout = float(os.environ.get('PI_NODRIVER_PREFLIGHT_TIMEOUT', '10'))
         except (TypeError, ValueError):
             raise ValueError(
                 'PI_NODRIVER_PREFLIGHT_TIMEOUT must be a positive finite number'
@@ -4047,17 +4049,100 @@ class BrowserWorker:
     def _browser_fresh(self, max_age):
         return self.browser is not None and time.monotonic() - self.browser_verified_at < max_age
 
+    async def _browser_responds(self):
+        # A busy Chrome (heavy page, memory pressure) can miss a 1 s probe. Tearing it down closes
+        # every session's tabs, so keep asking while its process lives; only a closed connection,
+        # an exited process or a long silence counts as dead.
+        deadline = time.monotonic() + float(os.environ.get('PI_NODRIVER_BROWSER_PROBE_SECONDS', '15'))
+        while True:
+            try:
+                await asyncio.wait_for(self.browser.send(uc.cdp.browser.get_version()), timeout=1.0)
+                return True
+            except asyncio.TimeoutError:
+                pid = getattr(self.launched_browser, '_process_pid', None)
+                if time.monotonic() >= deadline or (pid is not None and not pid_alive(pid)):
+                    return False
+            except Exception:
+                return False
+
+    @staticmethod
+    async def _reap_browser_processes(pids, grace=5.0):
+        # Chrome handles SIGTERM on its UI thread, so a hung browser ignores it and keeps the
+        # profile lock; a relaunch on that profile then hands off to it and exits, and every later
+        # command failed with "Failed to connect to browser" (2026-10-20, shopee.tw).
+        pids = {pid for pid in pids if pid and pid != os.getpid() and pid_alive(pid)}
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + grace
+        while pids and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            pids = {pid for pid in pids if pid_alive(pid)}
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 2.0
+        while any(pid_alive(pid) for pid in pids) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+
+    def _live_profile_ports(self, profile):
+        # Ports of Chrome processes that may own this profile, newest first. Launches that lost the
+        # profile lock stay registered with nodriver after their process exits; never pick those.
+        registry = uc.util.get_registered_instances()
+        ports = []
+        for browser in sorted(registry, key=lambda b: getattr(b, '_process_pid', None) or 0, reverse=True):
+            port = getattr(browser.config, 'port', None)
+            if not port or Path(browser.config.user_data_dir) != profile:
+                continue
+            pid = getattr(browser, '_process_pid', None)
+            if pid is not None and not pid_alive(pid):
+                registry.discard(browser)
+                continue
+            ports.append((port, browser if pid is not None else None))
+        owner_port = chrome_debug_port(profile_lock_pid(profile))
+        if owner_port:
+            ports.append((owner_port, None))
+        try:
+            ports.append((parse_devtools_active_port((profile / 'DevToolsActivePort').read_text()), None))
+        except (OSError, ValueError, IndexError):
+            pass
+        return ports
+
+    async def browser_health(self):
+        # For the watchdog: a worker whose socket accepts can still hold a dead Chrome (2026-10-20).
+        # Probes (and if needed relaunches) the browser like any command would, without opening a
+        # tab or touching a session, and never starts Chrome just to probe it.
+        if self.browser is None:
+            return {'action': 'browser-health', 'text': 'browser not started', 'browser': 'not-started'}
+        started = time.monotonic()
+        before = self.browser
+        await self.ensure_browser()
+        return {
+            'action': 'browser-health',
+            'text': 'browser relaunched' if self.browser is not before else 'browser ok',
+            'browser': 'relaunched' if self.browser is not before else 'ok',
+            'probeMs': round((time.monotonic() - started) * 1000),
+            'tabs': len(getattr(self.browser, 'tabs', []) or []),
+        }
+
     async def _ensure_browser_locked(self):
         if self.browser is not None:
-            try:
-                await asyncio.wait_for(
-                    self.browser.send(uc.cdp.browser.get_version()), timeout=1.0
-                )
+            if await self._browser_responds():
                 self.browser_verified_at = time.monotonic()
-            except Exception:
+            else:
                 self.browser_verified_at = float('-inf')
                 stale_browser = self.browser
                 stale_launched_browser = self.launched_browser
+                stale_pids = {
+                    getattr(candidate, '_process_pid', None)
+                    for candidate in (stale_browser, stale_launched_browser)
+                }
+                if not self.shared_browser_attached and shared_browser_attach_port() is None:
+                    stale_pids.add(profile_lock_pid(resolve_profile_dir()))
                 stopped = set()
                 for candidate in (stale_browser, stale_launched_browser):
                     if candidate is None or id(candidate) in stopped:
@@ -4067,6 +4152,8 @@ class BrowserWorker:
                         candidate.stop()
                     except Exception:
                         pass
+                if not self.shared_browser_attached:
+                    await self._reap_browser_processes(stale_pids)
                 self.browser = None
                 self.launched_browser = None
                 self.pages.clear()
@@ -4144,35 +4231,29 @@ class BrowserWorker:
                 # Nodriver 0.50.x waits less than three seconds for DevTools.
                 # On cold CI machines Chrome can become ready just after that
                 # deadline, so reconnect to the process Nodriver already started.
-                active_port_file = profile / 'DevToolsActivePort'
-                candidates = [
-                    browser for browser in uc.util.get_registered_instances()
-                    if getattr(browser.config, 'port', None)
-                    and Path(browser.config.user_data_dir) == profile
-                ]
-                if candidates:
-                    self.launched_browser = max(candidates, key=lambda browser: browser._process_pid or 0)
+                # A launch that found the profile held by another live Chrome exits at once; that
+                # Chrome (the SingletonLock owner) is then the one to attach to.
                 for _ in range(150):
                     await asyncio.sleep(0.1)
-                    try:
-                        if self.launched_browser is not None:
-                            port = self.launched_browser.config.port
-                        else:
-                            port = parse_devtools_active_port(active_port_file.read_text())
-                        connection = http.client.HTTPConnection(
-                            '127.0.0.1', port, timeout=0.2
-                        )
+                    for port, owner in self._live_profile_ports(profile):
                         try:
-                            connection.request('GET', '/json/version')
-                            response = connection.getresponse()
-                            if not json.load(response).get('webSocketDebuggerUrl'):
-                                continue
-                        finally:
-                            connection.close()
-                        self.browser = await uc.start(host='127.0.0.1', port=port)
+                            connection = http.client.HTTPConnection(
+                                '127.0.0.1', port, timeout=0.2
+                            )
+                            try:
+                                connection.request('GET', '/json/version')
+                                response = connection.getresponse()
+                                if not json.load(response).get('webSocketDebuggerUrl'):
+                                    continue
+                            finally:
+                                connection.close()
+                            self.browser = await uc.start(host='127.0.0.1', port=port)
+                            self.launched_browser = owner
+                            break
+                        except Exception:
+                            continue
+                    if self.browser is not None:
                         break
-                    except Exception:
-                        continue
                 if self.browser is None:
                     raise startup_error
             await self.configure_browser_connection()
@@ -7661,6 +7742,8 @@ class BrowserWorker:
         )
         if action == 'browser-mode-switch':
             return self.browser_mode_switch(parts, session_id)
+        if action == 'browser-health':
+            return await self.browser_health()
         if action in {'fetch-image', 'pdf-query', 'session-cleanup'}:
             result = await self._execute(command, session_id)
             self.open_action_guard.clear(session_id)
@@ -9606,7 +9689,10 @@ class BrowserWorker:
             elif kind == 'text' and len(parts) > 2:
                 text = (await self.element(session_id, parts[2])).text_all or ''
             elif kind == 'text':
-                page_text = str(await page.evaluate('document.body.innerText') or '').strip()
+                page_text = await page.evaluate('document.body.innerText')
+                # With no body yet nodriver returns ExceptionDetails instead of raising; its repr became
+                # the page text (apple.com/tw 2026-10-20).
+                page_text = page_text.strip() if isinstance(page_text, str) else ''
                 image_discovery = await self.extract_image_candidate_result(page)
                 image_candidates = image_discovery['candidates']
                 image_candidate_text = self.format_image_candidates(

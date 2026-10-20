@@ -1136,6 +1136,19 @@ class ImageCandidateSidecarUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['imageCount'], 2)
         self.assertEqual(result['imageCandidates'][0]['id'], 'img-1')
 
+    async def test_get_text_without_a_body_is_empty_not_the_exception_repr(self):
+        exception = SimpleNamespace(text='Uncaught', description="TypeError: Cannot read properties of null (reading 'innerText')")
+        original = self.page.evaluate
+
+        async def no_body(script):
+            return exception if script == 'document.body.innerText' else await original(script)
+
+        self.page.evaluate = no_body
+        result = await self.worker.execute('get text', 'session-a')
+
+        self.assertEqual(result['pageText'], '')
+        self.assertNotIn('Uncaught', result['text'])
+
     async def test_get_images_returns_candidates_without_repeating_page_text(self):
         result = await self.worker.execute('get images', 'session-a')
 

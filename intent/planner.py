@@ -204,7 +204,7 @@ def verify_done(goal, history, state, text, timeout=30, url=None, model=None, he
     target_url = resolve_endpoint(url)
     hdrs = make_headers(headers)
     body = chat_body(target_url, target_model, 80, [{"role": "user", "content": VERIFY_PROMPT.format(
-        goal=goal, history="; ".join(history) or "(none)", title=state.get("title", ""), text=text[:1500])}])
+        goal=goal, history="; ".join(history) or "(none)", title=state.get("title", ""), text=text[:4000])}])
     t = time.perf_counter()
     out = chat(target_url, hdrs, body, timeout)
     ms = (time.perf_counter() - t) * 1000
