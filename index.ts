@@ -48,9 +48,9 @@ function parseGettimeValue(value: string): number | undefined {
 const SEARCH_FIRST_URL_RULE = `MANDATORY URL PROVENANCE RULE:
 - Only exact URLs supplied verbatim by the user or returned by successful google_search or web_search results may be opened. This is enforced by URL_PROVENANCE_GUARD.
 - If the user supplied an exact HTTP(S) URL in their message, you may open that exact URL directly. Do not guess, modify, repair, or synthesize variations of it.
-- If no exact URL was provided by the user, you MUST search first (via research, google_search, or browser google-search). Never guess, infer, synthesize, or construct a URL from memory.
+- If no exact URL was provided by the user, you MUST search first with research. google_search and browser google-search are only for a user who explicitly asked for a Google search. Never guess, infer, synthesize, or construct a URL from memory.
 - Copy one exact URL from search results without changing its domain, path, query, casing, or percent-encoding. If a requested deep link is not indexed and was not provided by the user, open the closest official parent URL returned by search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl. If search returns no usable parent URL, stop; never try a URL variant.
-- Browser's google-search command is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
+- Browser's google-search command (explicit user Google requests only, like google_search) is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
 - ${INTENT_FULL ? 'In browser_intent, candidate links on the active page are listed as [1]..[N]. You may navigate to them using action: "open" with pick: <number> or by copying the exact candidate URL.' : "browser_intent's planner follows on-page links itself: give it the closest exact URL you have plus the destination in the goal."} Opening standard search engine queries (e.g. https://www.google.com/search?q=...) is also authorized.
 - image_search / image_search_batch (browser image-search / image-search-batch) uses an internally verified fixed provider entry, not an agent-supplied URL. Call it directly for authorized reverse-image searches; no preliminary URL search or manual navigation is needed.`;
 
@@ -82,7 +82,7 @@ Guidelines:
 - Tab LRU: Chrome is capped at 20 tabs globally. When capacity is needed, the least-recently-used inactive tab is evicted; recently operated, active-command, and in-progress-download tabs are protected.
 Workflow: open URL (auto-returns DOM @refs) → fill-submit @input "query" (auto-returns results DOM) → report answer.
 Commands:
-  google-search {"searches":[{"direction":"official","query":"search terms"}]} - Run up to four directional Google queries in parallel and return a globally de-duplicated Top 10; use exactly this JSON shape
+  google-search {"searches":[{"direction":"official","query":"search terms"}]} - ONLY when the user explicitly asked for a Google search (otherwise use the research tool). Run up to four directional Google queries in parallel and return a globally de-duplicated Top 10; use exactly this JSON shape
   crawl <url1> [url2]... - Crawl web pages or direct PDF URLs in parallel; PDFs return extracted text and downloaded embedded images
   open <url> [timeout_seconds] - Navigate using the current session browser mode (default 10s or PI_NODRIVER_OPEN_TIMEOUT; e.g. 'open https://example.com 4'; automatically returns interactive elements snapshot with @refs)
   browser-mode-switch [auto|android|linux] - Report or set the session identity mode used by subsequent open commands
@@ -544,19 +544,20 @@ export default function (pi: ExtensionAPI) {
 
   // research is the default web lookup (AGENTS.md); with little thinking models
   // still reach for google_search/crawl first. Those are for explicit requests.
-  const USER_WANTS_GOOGLE = /google|谷歌/i;
+  // research runs its own Google query, so Google is never a research fallback:
+  // google_search and browser google-search need the user to ask for Google.
+  const USER_WANTS_GOOGLE = /google|谷歌|估狗/i;
   const USER_GAVE_URL_OR_CRAWL = /https?:\/\/|crawl|爬/i;
   pi.on("tool_call", (event, ctx) => {
     const asked = lastInput.get(sessionId(ctx)) ?? "";
     if (event.toolName === "read" && IMAGE_SKILL_PATH.test(String((event.input as {path?: unknown})?.path ?? "")))
       imageTask.set(sessionId(ctx), true);
-    // After research ran (even if it failed) these are legitimate fallbacks.
+    // After research ran (even if it failed) crawl is a legitimate fallback.
     if (!researchTried.get(sessionId(ctx)) &&
-        ((event.toolName === "google_search" && !USER_WANTS_GOOGLE.test(asked)) ||
-         (event.toolName === "crawl" && crawlGuards && !USER_GAVE_URL_OR_CRAWL.test(asked)))) {
+        event.toolName === "crawl" && crawlGuards && !USER_GAVE_URL_OR_CRAWL.test(asked)) {
       return {
         block: true,
-        reason: "RESEARCH_FIRST: use the research tool for web lookups (four keyword queries q1-q4). google_search is only for an explicit Google request and crawl only for URLs the user gave.",
+        reason: "RESEARCH_FIRST: use the research tool for web lookups (four keyword queries q1-q4). crawl is only for URLs the user gave.",
       };
     }
     if (FOLLOW_UP_LOOKUPS.has(event.toolName) && (crawlGuards || event.toolName !== "crawl")
@@ -579,6 +580,15 @@ export default function (pi: ExtensionAPI) {
       return {
         block: true,
         reason: `RESEARCH_DONE_GUARD: research already returned enough evidence for this message. Answer now from that evidence, cite its URLs and say plainly what it does not cover, then ask the user whether they want a deep crawl of specific sources or more research. ${crawlGuards ? "crawl, " : ""}google_search, fetch_image(s), browser/browser_intent and another research call are only allowed after the user asks for them.${crawlGuards ? "" : " research already crawled its result pages, so do not crawl on your own either."}${event.toolName === "browser_intent" && !researchIntentUsed.get(sessionId(ctx)) ? " Exception: if research could not read data the user asked for because the page renders it with JavaScript (live numbers, stock, seat maps), you may make ONE browser_intent call whose url is copied exactly from the research results, describing the rest (which branch, which item) in the goal." : ""}`,
+      };
+    }
+    const googleSearch = event.toolName === "google_search" ||
+      (event.toolName === "browser" && /^\s*google-search(?:\s|$)/iu.test(String((event.input as {command?: unknown})?.command ?? "")));
+    // RESEARCH_DONE_GUARD above takes precedence once research has answered.
+    if (googleSearch && !USER_WANTS_GOOGLE.test(asked)) {
+      return {
+        block: true,
+        reason: "RESEARCH_FIRST: google_search (and browser google-search) only runs when the user explicitly asks for a Google search. research already includes its own Google query, so use research for web lookups (four keyword queries q1-q4), or retry research if it failed.",
       };
     }
     if (event.toolName !== "browser" && event.toolName !== "browser_intent") return;
@@ -750,10 +760,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "research",
     label: "Budgeted research",
-    description: "Web research: runs your keyword queries (3 fourget + 1 Google), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
+    description: "Web research, the default and only web search tool unless the user explicitly asks for Google: runs your keyword queries (3 fourget + 1 Google, so Google results are already included), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
     promptSnippet: "Default web search: four keyword queries in, crawled source-labelled evidence out (searches, crawls and dates handled by the tool)",
     promptGuidelines: [
       "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
+      "research already runs its own Google query. Never add google_search (or browser google-search) to get Google results, to supplement research, or as a fallback when research fails or comes back thin; those are reserved for a user who explicitly says Google (e.g. 「用 Google 搜」).",
       "For research queries, use the latest browser-date-context Today line for the local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates. Use gettime when exact current time is needed.",
       crawlGuards
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
@@ -1139,10 +1150,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "google_search",
     label: "Directional Google Search",
-    description: "Search Google directly through Nodriver with one to four distinct query directions in parallel. Returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
-    promptSnippet: "Run 1–4 directional Google searches in parallel and return a de-duplicated Top 10",
+    description: "EXPLICIT USER REQUEST ONLY: call this only when the user's own message explicitly asks for a Google search (e.g. 「用 Google 搜」, \"google it\"). For every other web lookup use research, which already includes a Google query. Searches Google directly through Nodriver with one to four distinct query directions in parallel and returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
+    promptSnippet: "Explicit user Google requests only (otherwise use research): run 1–4 directional Google searches in parallel and return a de-duplicated Top 10",
     promptGuidelines: [
-      "research is the default web lookup tool. Use google_search only when the user explicitly asks for a Google search; otherwise call research instead.",
+      "google_search is ONLY for a user who explicitly asks for a Google search in their message. Do not use it on your own initiative, to supplement research, or as a fallback when research fails or is thin: research already runs its own Google query, so call or retry research instead. Calls without an explicit Google request are blocked (RESEARCH_FIRST).",
       "For google_search, choose two to four task-appropriate directions. Good defaults are official or primary sources; current news or date-specific updates; independent reviews or community experience; and alternatives, risks, or counter-evidence.",
       "Do not mechanically use all four defaults when they do not fit. For shopping, prefer official specifications, retailer availability, independent reviews, and competing products; for technical research, prefer official docs, recent changes, implementation experience, and known limitations.",
       "For every google_search involving a date, time, relative time, recency, schedule, release, current price/stock, or other time-sensitive fact, first call gettime with action now, then copy its complete output into google_search.currentTime. The tool rejects missing or stale timestamps. Use the confirmed current year when a year improves retrieval; never default to 2025 from model memory.",
@@ -1266,7 +1277,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Crawl web pages or PDFs in parallel, extracting text and embedded images",
     promptGuidelines: [
       "Use crawl when you need the full content of one or multiple web pages or direct PDF URLs.",
-      "Never guess a crawl URL. Use web_search or google_search first, then pass only exact URLs returned by search results or supplied by the user.",
+      "Never guess a crawl URL. Use research first (google_search only when the user explicitly asked for Google), then pass only exact URLs returned by search results or supplied by the user.",
       "Reach for it right after web_search whenever the snippets are too thin to answer from: crawl the promising result URLs rather than guessing at what the pages say.",
       "Not after research: research already crawled its result pages. Answer from its evidence and offer a deep crawl; crawl those sources only after the user asks for it.",
       "Always pass every URL you want in a SINGLE call. Splitting them costs one agent round-trip per URL, which dwarfs the fetch itself — measured on this setup, four real pages came back in about 1.5s in one call, so the fetching was never the bottleneck.",

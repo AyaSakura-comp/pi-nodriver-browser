@@ -248,5 +248,13 @@ if ((await call('crawl'))?.block) throw new Error('explicit crawl request was bl
 
 await handlers.get('input')({text:'台南天氣'}, ctx);
 await research(true);
-if ((await call('google_search'))?.block) throw new Error('failed research must not block a fallback');
+if ((await call('crawl'))?.block) throw new Error('failed research must not block a crawl fallback');
+const fallback = await call('google_search');
+if (!fallback?.block || !fallback.reason.includes('research already includes its own Google query'))
+  throw new Error('google_search is never a research fallback without an explicit Google request');
+const browserGoogle = await handlers.get('tool_call')({toolName:'browser', toolCallId:'bg',
+  input:{command:'google-search {"searches":[{"direction":"official","query":"台南天氣"}]}'}}, ctx);
+if (!browserGoogle?.block) throw new Error('browser google-search must not bypass the Google rule');
+await handlers.get('input')({text:'幫我 google 一下台南天氣'}, ctx);
+if ((await call('google_search'))?.block) throw new Error('an explicit Google request is allowed');
 ''', suffix='.mts')
