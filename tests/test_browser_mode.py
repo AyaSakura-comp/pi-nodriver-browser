@@ -18,6 +18,6 @@ failed=false; try {parseBrowserConfig({crawlGuards:'off'});} catch {failed=true;
 if (!failed) throw Error('non-boolean crawlGuards accepted');
 ''', suffix='.mts')
         source = (ROOT / 'index.ts').read_text()
-        self.assertIn('if (browserMode === "direct") pi.registerTool', source)
-        self.assertIn('if (browserMode === "intent") registerIntent(pi,', source)
+        self.assertIn('if (browserMode === "direct") toolApi.registerTool', source)
+        self.assertIn('if (browserMode === "intent") registerIntent(toolApi,', source)
         self.assertTrue((ROOT / 'intent/intent_service.py').exists())

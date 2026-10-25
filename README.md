@@ -212,7 +212,8 @@ Every stage overlaps the next:
   background (they finish inside the crawl window); up to 3 are listed as
   `[[image: …]]` markers and the answer embeds them in the paragraphs they illustrate.
 
-The evidence closes by telling the agent it is enough and how to answer (direct
+The extension adds nothing to Pi's system prompt: tool rules travel in the tool
+descriptions and answer style in the evidence closure. The evidence closes by telling the agent it is enough and how to answer (direct
 answer first, only what serves the question, no repetition), and the extension
 restates the user's question after the evidence so a 20k-token packet does not
 pull the answer off topic. The answer ends by
@@ -228,7 +229,7 @@ research more?" offer, and an
 image-generation turn (a `create-image`/`qwen-image`/`photo-editing`/`create-gif`/
 `image-to-3d` skill was read) may still `crawl`/`fetch_image(s)`/`browser` for
 references. `"crawlGuards": false` in `browser-config.json` exempts `crawl` from both
-guards; the agent is then only *told* (system prompt, evidence closure, guard
+guards; the agent is then only *told* (tool description, evidence closure, guard
 messages) not to crawl after research and to offer it instead. URL provenance rules are unchanged.
 
 Tunables (all in the [Configuration Reference](#-configuration-reference)): `RESEARCH_CRAWL_CONCURRENCY` (32),
@@ -949,7 +950,7 @@ lists the value used on the reference deployment when it differs from the defaul
 | same file | `crawlGuards` | `true` | `false` exempts `crawl` from `RESEARCH_FIRST` and `RESEARCH_DONE_GUARD` (no hard block); the prompt still tells the agent not to crawl after research on its own but to offer a deep crawl or more research and crawl only once the user asks. The other follow-up lookups stay guarded. Read when Pi loads the extension (`/reload` or restart after editing). This host: `false`. |
 | `~/.pi/agent/settings.json` (Pi) | `prefill.enabled` / `providers` / `slots` | off | Enables Pi's speculative prefill (`ctx.prefill`): research evidence is prefilled into a llama.cpp slot while pages are still being crawled. Needs a Pi build with the prefill API. This host: `{ "enabled": true, "providers": ["local-llama"], "slots": [0] }`. |
 | `~/.pi/agent/settings.json` (Pi) | `thinkingBudgets` | Pi defaults | Thinking-token budget per level; `minimal` is the level used by the piweb Life channel. This host: minimal 128 (golden sweet spot: 0.3s buffer avoiding token exhaustion while maximizing TTFT speed), low 1024, medium 2048, high 4096, xhigh 12000. |
-| `~/.pi/agent/AGENTS.md` (Pi) | global guidelines | — | Makes `research` the default web lookup and sets answer style: direct answer first, length scaled to the question, off-topic evidence left out, each fact stated once (no restating 結論 or duplicate tables); the travel/academic/3C archetype checklists apply only to broad requests. |
+| `~/.pi/agent/AGENTS.md` (Pi) | global guidelines | — | Holds no browser or research rules. All browser/search guidance lives in the extension: each tool's description (its former `promptSnippet`/`promptGuidelines` are folded in at registration, so nothing is added to Pi's system prompt) and the research evidence closure (answer style: direct answer first, depth scaled to the question, no repetition, sources on every key fact). |
 
 ### Research (`research` tool)
 

@@ -192,7 +192,7 @@ packetBytes=0;
 await handlers.get('input')({text:'[Web user: web]\\n聯亞科技有上市嗎'},ctx);
 const asked=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.ok(asked.content[0].text.startsWith('Full evidence'));
-assert.ok(asked.content[0].text.endsWith('«聯亞科技有上市嗎»\\n'),'the user question is restated after the evidence');
+assert.match(asked.content[0].text,/\\nThe user's question: «聯亞科技有上市嗎»\\nAnswer it now: direct answer in the first sentence;[^\\n]*\\n$/,'the question and a compact checklist close the packet');
 ''',suffix='.mts')
 
     def test_active_prefill_drives_begin_append_end_and_reports_stats(self):

@@ -456,12 +456,22 @@ function currentYearQuery(query: string, userText: string | undefined, year = ne
   });
 }
 
+// Browser and search guidance belongs to the tools, not Pi's system prompt:
+// promptSnippet/promptGuidelines are folded into the tool description (the
+// tool schema) so no browser rule is rendered into the system prompt.
+function guidanceInDescription<T extends {description: string; promptSnippet?: string; promptGuidelines?: string[]}>(tool: T) {
+  const {promptSnippet: _snippet, promptGuidelines, ...rest} = tool;
+  const rules = (promptGuidelines ?? []).map((rule) => rule.trim()).filter(Boolean);
+  return {...rest, description: rules.length ? `${tool.description}\n\nUsage rules:\n${rules.map((rule) => `- ${rule}`).join("\n")}` : tool.description};
+}
+
 export default function (pi: ExtensionAPI) {
+  const toolApi: ExtensionAPI = {...pi, registerTool: (tool) => pi.registerTool(guidanceInDescription(tool))};
   // crawlGuards: false exempts crawl from RESEARCH_FIRST and RESEARCH_DONE_GUARD.
   const { browserMode, crawlGuards } = readBrowserConfig();
   const worker = new NodriverWorker();
   const ACTIVE_PREFILL = process.env.RESEARCH_ACTIVE_PREFILL !== "0";
-  if (browserMode === "intent") registerIntent(pi, () => worker.ensureStarted());
+  if (browserMode === "intent") registerIntent(toolApi, () => worker.ensureStarted());
   let queue = Promise.resolve<unknown>(undefined);
   const searchedUrls = new Map<string, Set<string>>();
   const sessionId = (ctx: { sessionManager: { getSessionId(): string } }) => ctx.sessionManager.getSessionId();
@@ -643,8 +653,7 @@ export default function (pi: ExtensionAPI) {
     const weekday = "日一二三四五六"[now.getDay()];
     return `Today: ${day} (週${weekday}), timezone ${Intl.DateTimeFormat().resolvedOptions().timeZone}. Resolve relative dates (今天/明天/這週…) against this.`;
   };
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\n${SEARCH_FIRST_URL_RULE}\n\n${RESEARCH_QUERY_RULE}`,
+  pi.on("before_agent_start", () => ({
     // Persist an appended context message. Never rewrite earlier date messages:
     // the system/tool prefix and existing conversation KV remain reusable.
     message: { customType: "browser-date-context", content: localDateLine(), display: false },
@@ -757,7 +766,7 @@ export default function (pi: ExtensionAPI) {
       if (!calls.has(id) || event.message.stopReason !== "toolUse") dropSpeculative(id, "speculative_research_not_called");
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "research",
     label: "Budgeted research",
     description: "Web research, the default and only web search tool unless the user explicitly asks for Google: runs your keyword queries (3 fourget + 1 Google, so Google results are already included), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
@@ -769,16 +778,8 @@ export default function (pi: ExtensionAPI) {
       crawlGuards
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
         : "Answer from the evidence research returns and cite its source URLs. research already crawled its result pages, so do not crawl on your own afterwards, even when the evidence is thin: offer a deep crawl instead, and crawl only after the user asks for it or gives a URL. Do not follow up with google_search unless the user asks.",
-      "Answer the user's actual question, not the topic. First decide what they asked (yes/no, one fact, why, what/where is it, compare, recommend/list, how-to) and what would satisfy it.",
-      "Open with the direct answer in the first one or two sentences (e.g. 「沒有，聯亞光電是上櫃公司，不是上市」), then give only the evidence that supports or qualifies it.",
-      "Scale length to the question: yes/no or one fact = a few lines; why = the reasons, most important first; only broad requests (推薦、行程、比較、整理、有什麼) get a longer structured answer.",
-      "Leave out evidence that does not serve the question, however interesting (e.g. branch addresses and opening hours when asked why portions are big). You may offer it in the closing question.",
-      "Say each fact once. No closing 結論/總結 that restates the body, no second table re-listing the same items, never the same content as both a table and bullets.",
-      "Use a table only to compare several items across several attributes; otherwise short prose or bullets.",
-      "Short is not sourceless: put a markdown link ([來源](https://…)) right after every key fact or list item, even in a two-line answer.",
-      "Checklists for broad requests only: 旅遊/活動/美食 → 時間地點、費用、交通、網友評價/注意事項; 學術/技術 → 原理、機制、步驟、優劣; 3C/產品 → 規格對比、售價、評測優缺點、適合誰. Include an item only when the evidence has it.",
-      "When research lists downloaded images, place at most 2 [[image: …]] markers, copied exactly, on their own lines (never inside a table) next to the text they illustrate, and only images that show the thing asked about (a place, dish, product, event); skip logos, thumbnails, site banners/og images, and skip images for yes/no or one-fact answers. Never fetch images yourself.",
-      "End with one short line on what the evidence does not cover that matters for this question, and one short question offering a deep crawl of specific sources or another research round.",
+      RESEARCH_QUERY_RULE,
+      "How to write the answer comes with the evidence (its closing instructions); follow them.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -871,7 +872,9 @@ export default function (pi: ExtensionAPI) {
         }
         // Restating the question after ~20k tokens of evidence keeps the answer on it.
         const asked = userBody(lastInput.get(sid) ?? "").replace(/\n\[accepted offer: 再查\]$/, "").slice(-600);
-        if (response.fullEvidenceDelivered && asked) text += `\nThe user's question — answer exactly this, directly, in the first sentences: «${asked}»\n`;
+        if (response.fullEvidenceDelivered && asked) text += `\nThe user's question: «${asked}»\n` +
+          "Answer it now: direct answer in the first sentence; then every concrete on-topic detail plus the 2-3 things the user needs next; " +
+          "a [來源](URL) link right after every key fact; nothing off-topic, nothing said twice. If the evidence is about a different product or company than the one asked, say so.\n";
         const {text: _packet,...details}=response;
         delivered = true;
         return {content:[{type:"text" as const,text}],details:{...details,estimatedInputTokens,
@@ -884,10 +887,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  if (browserMode === "direct") pi.registerTool({
+  if (browserMode === "direct") toolApi.registerTool({
     name: "browser",
     label: "Browser (Nodriver + Xvfb)",
-    description: DESCRIPTION,
+    description: `${DESCRIPTION}\n\n${SEARCH_FIRST_URL_RULE}`,
     promptSnippet: "Interact with web pages using a persistent Nodriver-controlled Chrome browser",
     promptGuidelines: [
       "Use browser for interactive web tasks that require clicking, typing, selecting, scrolling, or screenshots on a live page.",
@@ -977,7 +980,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "image_search",
     label: "Reverse Image Search",
     description: "Reverse-search one user-authorized local image with Google Lens in one action. Opens the verified Google Images entry in desktop mode, prepares the camera dialog and uploads once; returns up to 20 labeled result refs. No preliminary web search, open, mode switch or clicks needed. Sends the image to Google. Supports PNG/JPEG/WEBP/GIF up to 20 MiB/40 MP. Stops on gates; never retries uploads. Does not auto-select a match. Output capped at 50KB/2000 lines.",
@@ -1008,7 +1011,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "image_search_batch",
     label: "Parallel Reverse Image Search",
     description: "Reverse-search 1–3 user-authorized local images concurrently with Google Lens, using independent tabs and search IDs. Default concurrency 2, maximum 3. Each result is paired with its original path and owns its refs. Does not change the main browser tab or auto-select matches. No prerequisite search/open/camera clicks. A new batch expires prior batch IDs. Uploads go to Google; no upload replay on gates/errors. Output capped at 50KB/2000 lines.",
@@ -1038,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "fetch_image",
     label: "Fetch Image",
     description: "Fetch and validate one direct HTTP/HTTPS image URL discovered by web_search, crawl, or browser. Returns the image inline plus a local path that can be sent to PiWeb or Discord.",
@@ -1078,7 +1081,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "fetch_images",
     label: "Fetch Images in Parallel",
     description: "Securely fetch and validate up to four direct HTTP/HTTPS image URLs in parallel. Returns exact PiWeb/Discord delivery markers without injecting image bytes into the next model turn.",
@@ -1152,7 +1155,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "google_search",
     label: "Directional Google Search",
     description: "EXPLICIT USER REQUEST ONLY: call this only when the user's own message explicitly asks for a Google search (e.g. 「用 Google 搜」, \"google it\"). For every other web lookup use research, which already includes a Google query. Searches Google directly through Nodriver with one to four distinct query directions in parallel and returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
@@ -1231,7 +1234,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "pdf_query",
     label: "Query Temporary PDF Wiki",
     description: "Query the temporary PDF wiki created automatically for a large crawled or open PDF. Returns only a few relevant source chunks so the full PDF text is withheld from model context.",
@@ -1275,10 +1278,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  toolApi.registerTool({
     name: "crawl",
     label: "Parallel Browser Crawl",
-    description: "Crawl one or multiple web pages or PDF files in parallel using local headful Chromium. HTML returns clean page text plus ranked image candidates; PDFs return extracted text and downloaded embedded images.",
+    description: "Crawl one or multiple web pages or PDF files in parallel using local headful Chromium. HTML returns clean page text plus ranked image candidates; PDFs return extracted text and downloaded embedded images." + "\n\n" + SEARCH_FIRST_URL_RULE,
     promptSnippet: "Crawl web pages or PDFs in parallel, extracting text and embedded images",
     promptGuidelines: [
       "Use crawl when you need the full content of one or multiple web pages or direct PDF URLs.",
