@@ -187,6 +187,12 @@ packetBytes=2*1024*1024+1;
 const large=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.equal(large.details.status,'incomplete'); assert.equal(large.details.fullEvidenceDelivered,false);
 assert.equal(large.details.reason,'packet_too_large'); assert.ok(large.content[0].text.length<1000);
+assert.ok(!large.content[0].text.includes('«'),'an undelivered packet must not ask for an answer');
+packetBytes=0;
+await handlers.get('input')({text:'[Web user: web]\\n聯亞科技有上市嗎'},ctx);
+const asked=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
+assert.ok(asked.content[0].text.startsWith('Full evidence'));
+assert.ok(asked.content[0].text.endsWith('«聯亞科技有上市嗎»\\n'),'the user question is restated after the evidence');
 ''',suffix='.mts')
 
     def test_active_prefill_drives_begin_append_end_and_reports_stats(self):

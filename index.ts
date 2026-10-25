@@ -769,14 +769,16 @@ export default function (pi: ExtensionAPI) {
       crawlGuards
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
         : "Answer from the evidence research returns and cite its source URLs. research already crawled its result pages, so do not crawl on your own afterwards, even when the evidence is thin: offer a deep crawl instead, and crawl only after the user asks for it or gives a URL. Do not follow up with google_search unless the user asks.",
-      "Embody an enthusiastic knowledge curator persona: love sharing comprehensive, exhaustive intelligence without cutting corners. Avoid a monotonous wall of bullets; combine clean, well-formatted tables with in-depth narrative highlight sections.",
-      "Domain Archetypes (範例引導):",
-      "• 旅遊 / 活動 / 美食：提供完整人事時地物與交通，務必包含「費用明細 ($$)（門票/低消/預算）」與「網友真實評價與心得 / 避坑提醒（人潮時段/必看亮點/注意事項）」。",
-      "• 學術 / 理論 / 技術：深入清楚解釋概念原理、底層機制、步驟邏輯、業界最佳實踐與優劣對比，避免空泛名詞。",
-      "• 3C / 產品 / 規格：提供詳細規格對比表、售價與配置 ($$)、社群真實評測心得、優缺點與適合客群。",
-      "Ensure table readability: use informative columns, concise entries, and <br>• for sub-points. End every item and table row with its markdown link ([來源](https://…)). Never omit details or say 'refer to official website'; list all items the evidence supports.",
-      "When research lists downloaded images, place up to 3 relevant [[image: …]] markers, copied exactly, on their own lines inside the narrative highlight paragraphs they illustrate; never fetch images yourself.",
-      "Always end an answer based on research with an objective note on what is missing, and one short question offering the next step: a deep crawl of specific sources for their full text, or another research round for the missing details.",
+      "Answer the user's actual question, not the topic. First decide what they asked (yes/no, one fact, why, what/where is it, compare, recommend/list, how-to) and what would satisfy it.",
+      "Open with the direct answer in the first one or two sentences (e.g. 「沒有，聯亞光電是上櫃公司，不是上市」), then give only the evidence that supports or qualifies it.",
+      "Scale length to the question: yes/no or one fact = a few lines; why = the reasons, most important first; only broad requests (推薦、行程、比較、整理、有什麼) get a longer structured answer.",
+      "Leave out evidence that does not serve the question, however interesting (e.g. branch addresses and opening hours when asked why portions are big). You may offer it in the closing question.",
+      "Say each fact once. No closing 結論/總結 that restates the body, no second table re-listing the same items, never the same content as both a table and bullets.",
+      "Use a table only to compare several items across several attributes; otherwise short prose or bullets.",
+      "Short is not sourceless: put a markdown link ([來源](https://…)) right after every key fact or list item, even in a two-line answer.",
+      "Checklists for broad requests only: 旅遊/活動/美食 → 時間地點、費用、交通、網友評價/注意事項; 學術/技術 → 原理、機制、步驟、優劣; 3C/產品 → 規格對比、售價、評測優缺點、適合誰. Include an item only when the evidence has it.",
+      "When research lists downloaded images, place at most 2 [[image: …]] markers, copied exactly, on their own lines (never inside a table) next to the text they illustrate, and only images that show the thing asked about (a place, dish, product, event); skip logos, thumbnails, site banners/og images, and skip images for yes/no or one-fact answers. Never fetch images yourself.",
+      "End with one short line on what the evidence does not cover that matters for this question, and one short question offering a deep crawl of specific sources or another research round.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -867,6 +869,9 @@ export default function (pi: ExtensionAPI) {
           response.status="incomplete"; response.reason="packet_too_large"; response.fullEvidenceDelivered=false;
           text="Research incomplete: packet_too_large (tool/context reserve). Full evidence was NOT delivered; immutable artifact preserved for recovery.";
         }
+        // Restating the question after ~20k tokens of evidence keeps the answer on it.
+        const asked = userBody(lastInput.get(sid) ?? "").replace(/\n\[accepted offer: 再查\]$/, "").slice(-600);
+        if (response.fullEvidenceDelivered && asked) text += `\nThe user's question — answer exactly this, directly, in the first sentences: «${asked}»\n`;
         const {text: _packet,...details}=response;
         delivered = true;
         return {content:[{type:"text" as const,text}],details:{...details,estimatedInputTokens,
