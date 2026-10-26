@@ -192,7 +192,23 @@ packetBytes=0;
 await handlers.get('input')({text:'[Web user: web]\\n聯亞科技有上市嗎'},ctx);
 const asked=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.ok(asked.content[0].text.startsWith('Full evidence'));
-assert.match(asked.content[0].text,/\\nThe user's question: «聯亞科技有上市嗎»\\nAnswer it now: direct answer in the first sentence;[^\\n]*\\n$/,'the question and a compact checklist close the packet');
+assert.match(asked.content[0].text,/\\nThe user's question: «聯亞科技有上市嗎»\\nAnswer it now, breadth first: direct answer in the first sentence;[^\\n]*\\n$/,'the question and a compact checklist close the packet');
+assert.equal(actualParams.answer,'breadth','a new question gets the breadth-first overview');
+ctx.sessionManager.getBranch=()=>[{type:'message',message:{role:'assistant',content:'1. 大新營萬聖市集 10/31-11/1'}}];
+await handlers.get('input')({text:'[Web user: web]\\n<quoted_selection> 大新營萬聖市集 </quoted_selection>\\n\\n這什麼？'},ctx);
+const picked=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
+assert.equal(actualParams.answer,'depth','picking an item from the previous answer switches to depth');
+assert.match(picked.content[0].text,/\\nAnswer it now, in depth: /);
+await handlers.get('input')({text:'[Web user: web]\\n台北週末有什麼展覽'},ctx);
+await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
+assert.equal(actualParams.answer,'breadth','a new topic after an answer is breadth first again');
+ctx.sessionManager.getBranch=()=>[];
+await handlers.get('input')({text:'[Web user: web]\\n詳細介紹台積電 2 奈米製程'},ctx);
+await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
+assert.equal(actualParams.answer,'depth','asking for detail in so many words is depth on any turn');
+await handlers.get('input')({text:'[Web user: web]\\n這個是什麼'},ctx);
+await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
+assert.equal(actualParams.answer,'breadth','a pointer word with no earlier answer is not a pick');
 ''',suffix='.mts')
 
     def test_active_prefill_drives_begin_append_end_and_reports_stats(self):

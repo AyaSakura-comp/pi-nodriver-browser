@@ -488,6 +488,9 @@ export default function (pi: ExtensionAPI) {
   const researchBlocks = new Map<string, number>();
   const researchTried = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
+  // Research answers are breadth first (every option, one or two lines each) until the
+  // user picks something to expand: then the same session switches to depth.
+  const answerMode = new Map<string, "breadth" | "depth">();
   // research cannot read pages that render their data with JavaScript (live queue numbers,
   // stock, seat maps). One browser_intent call on a URL this message's research returned is
   // therefore not wandering; it is the only way to get that data.
@@ -501,6 +504,10 @@ export default function (pi: ExtensionAPI) {
   // question must unlock follow-up lookups like an explicit request does.
   const AFFIRMATIVE = /^(好|好啊|好喔|好的|好呀|要|要啊|可以|可|嗯|對|是|行|麻煩|麻煩了|請|拜託|查|搜|ok|okay|yes|yep|sure|go|y)[\s!！。.~～，,]*$/i;
   const OFFERED_MORE_SEARCH = /查|搜|研究|深度|search|crawl|爬|look up|more|deep/i;
+  // Asks for detail in so many words, on any turn.
+  const WANTS_DEPTH = /詳細|詳情|細節|深入|深度|展開|仔細|完整介紹|多說|多講|說明一下|介紹一下|in depth|more detail|tell me more|elaborate/i;
+  // Points back at something from the previous answer; only counts when there is one.
+  const PICKS_ITEM = /<quoted_selection>|這個|這家|這間|這場|這款|這項|這什麼|那個|那家|那場|第\s*[一二三四五六七八九十\d]+\s*(?:個|項|點|家|間|場|款|天)|怎麼去|交通|票價|門票|價格|評價/i;
   // Image-generation skills legitimately need reference pages and images.
   const IMAGE_SKILL_PATH = /skills\/(create-image|qwen-image|photo-editing|create-gif|image-to-3d)\//;
   const IMAGE_TASK_LOOKUPS = new Set(["crawl", "fetch_image", "fetch_images", "browser", "browser_intent"]);
@@ -533,6 +540,10 @@ export default function (pi: ExtensionAPI) {
       accepted = AFFIRMATIVE.test(userBody(text)) && OFFERED_MORE_SEARCH.test(lastAssistantText(ctx as any).slice(-600));
     } catch { /* branch unavailable: fall back to the literal text */ }
     lastInput.set(sessionId(ctx), accepted ? `${text}\n[accepted offer: 再查]` : text);
+    let hadAnswer = false;
+    try { hadAnswer = lastAssistantText(ctx as any).length > 0; } catch { /* no branch: treat as a new topic */ }
+    const body = userBody(text);
+    answerMode.set(sessionId(ctx), accepted || WANTS_DEPTH.test(body) || (hadAnswer && PICKS_ITEM.test(body)) ? "depth" : "breadth");
     const allowed = searchedUrls.get(sessionId(ctx)) || new Set<string>();
     for (const url of extractSearchResultUrls(event.text)) allowed.add(url);
     searchedUrls.set(sessionId(ctx), allowed);
@@ -730,7 +741,7 @@ export default function (pi: ExtensionAPI) {
         created.promise = worker.research({jobId, question: lastUserText(ctx) ?? query, provider: "auto",
           searchBudget: 8, searchConcurrency: 4, layaConcurrency: 2, crawlWordBudget, rankBatchSize: 4,
           ranker: "none", crawlConcurrency, searchRounds: 1, queries: [query], streaming: true,
-          evidence: "progressive", clock}, sid, created.planner, abort.signal,
+          evidence: "progressive", answer: answerMode.get(sid) ?? "breadth", clock}, sid, created.planner, abort.signal,
           (prefix) => { created.lastPrefix = prefix; created.listener?.(prefix); });
         created.promise.catch(() => {});
         speculative.set(id, created);
@@ -779,7 +790,8 @@ export default function (pi: ExtensionAPI) {
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
         : "Answer from the evidence research returns and cite its source URLs. research already crawled its result pages, so do not crawl on your own afterwards, even when the evidence is thin: offer a deep crawl instead, and crawl only after the user asks for it or gives a URL. Do not follow up with google_search unless the user asks.",
       RESEARCH_QUERY_RULE,
-      "How to write the answer comes with the evidence (its closing instructions); follow them.",
+      "How to write the answer comes with the evidence (its closing instructions); follow them. A new question is answered breadth first (every option, one or two lines each).",
+      "When the user asks to go deeper on one item from an earlier answer (quotes it, says 這個／第N個／詳細), call research again with queries about that item (its official page, details, 交通、票價、評價) instead of answering from the earlier overview.",
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -838,7 +850,7 @@ export default function (pi: ExtensionAPI) {
           response = await worker.research({jobId,question,provider:"auto",
             searchBudget:8,searchConcurrency:4,layaConcurrency:2,crawlWordBudget:crawlWordBudget,
             rankBatchSize:4,ranker:"none",crawlConcurrency,searchRounds:1,queries,
-            evidence:"progressive",clock},sid,planner,signal,
+            evidence:"progressive",answer:answerMode.get(sid) ?? "breadth",clock},sid,planner,signal,
             onPrefix);
         }
         prefill?.end();
@@ -872,8 +884,9 @@ export default function (pi: ExtensionAPI) {
         }
         // Restating the question after ~20k tokens of evidence keeps the answer on it.
         const asked = userBody(lastInput.get(sid) ?? "").replace(/\n\[accepted offer: 再查\]$/, "").slice(-600);
-        if (response.fullEvidenceDelivered && asked) text += `\nThe user's question: «${asked}»\n` +
-          "Answer it now: direct answer in the first sentence; then every concrete on-topic detail plus the 2-3 things the user needs next; " +
+        if (response.fullEvidenceDelivered && asked) text += `\nThe user's question: «${asked}»\n` + (answerMode.get(sid) === "depth"
+          ? "Answer it now, in depth: direct answer in the first sentence; then every concrete detail of the item asked about plus the 2-3 things the user needs next; "
+          : "Answer it now, breadth first: direct answer in the first sentence; then every distinct on-topic item in one or two lines each (時間、地點、費用 or the key fact + 一句亮點), no deep dive into any single item; end by naming 1-3 items to expand and asking which one; ") +
           "a [來源](URL) link right after every key fact; nothing off-topic, nothing said twice. If the evidence is about a different product or company than the one asked, say so.\n";
         const {text: _packet,...details}=response;
         delivered = true;

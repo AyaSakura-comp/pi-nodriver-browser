@@ -118,6 +118,28 @@ RESEARCH_CRAWL_TOP_PER_QUERY = max(0, int(os.environ.get('RESEARCH_CRAWL_TOP_PER
 RESEARCH_IMAGES = max(0, int(os.environ.get('RESEARCH_IMAGES', '3') or 0))
 RESEARCH_IMAGE_WAIT = max(0.0, float(os.environ.get('RESEARCH_IMAGE_WAIT', '1.0') or 0))
 
+# Answer rules 2 and 5 of the closing instructions. A new question gets the
+# breadth-first overview; the depth rules apply once the user picks an item.
+BREADTH_RULE = ('2. Breadth first: this is the overview, not the deep dive. Cover every distinct on-topic item the '
+                'evidence has; for 推薦、有什麼、活動、行程、比較、清單 questions aim for the widest coverage (typically 6-12 '
+                'items when the evidence has them), grouped by date or type when that helps. One or two lines per item: '
+                'its name, the key facts that decide whether it is worth a look (時間、地點、價格/費用, or the one number '
+                'that matters) and 一句亮點. Do not expand any single item into paragraphs, step lists or checklists yet. '
+                'A narrow factual question gets the direct answer plus its key supporting facts. Roughly 500-1500 '
+                'Chinese characters.\n')
+DEPTH_RULE = ('2. Depth: the user asked to go deeper on a specific item or point. Answer that item in full: cut only '
+              'off-topic and repeated content, never on-topic detail; keep every concrete fact (numbers, dates, prices, '
+              'names, places, conditions) that bears on it, and add the 2-3 things the user will most likely need next '
+              '(e.g. 有賣嗎 → 價格、怎麼買、庫存/替代管道). Checklists, each item only when the evidence has it: '
+              '旅遊/活動/美食 → 時間地點、交通、費用、網友評價/注意事項; 學術/技術 → 原理、機制、步驟、優劣; '
+              '3C/產品 → 規格對比、售價、評測優缺點、適合誰. Roughly 800-2500 Chinese characters.\n')
+BREADTH_CLOSURE = ('5. Closure: do not search, crawl, browse or fetch images on your own. End with one short line that '
+                   'offers depth: name 1-3 items above the user may want expanded (詳細內容、交通、票價、評價…) and ask '
+                   'which one to go deeper on.\n')
+DEPTH_CLOSURE = ('5. Closure: do not search, crawl, browse or fetch images on your own. End with one short line on what '
+                 'the evidence does not cover that matters for this question, then ask whether the user wants a deep '
+                 'crawl of specific sources above or another research round.\n')
+
 
 def local_date_line(clock):
     try:
@@ -250,7 +272,7 @@ class ResearchConnection:
         if self._closed or self.jobs:
             raise ValueError('research_connection_busy_or_closed')
         fields={'jobId','question','provider','searchBudget','searchConcurrency','layaConcurrency','clock'}
-        optional={'crawlWordBudget','rankBatchSize','ranker','crawlConcurrency','searchRounds','evidence','queries','streaming'}
+        optional={'crawlWordBudget','rankBatchSize','ranker','crawlConcurrency','searchRounds','evidence','queries','streaming','answer'}
         if not isinstance(params,dict) or not fields<=set(params) or set(params)-(fields|optional): raise ValueError('invalid_research_input')
         word_budget=params.get('crawlWordBudget',20000)
         rank_batch=params.get('rankBatchSize',4)
@@ -258,6 +280,9 @@ class ResearchConnection:
         crawl_concurrency=params.get('crawlConcurrency',16)
         search_rounds=params.get('searchRounds',1)
         evidence_mode=params.get('evidence','passages')
+        # breadth: overview of every option for a new question; depth: the user asked to expand one item.
+        answer_mode=params.get('answer','breadth')
+        if answer_mode not in ('breadth','depth'): raise ValueError('invalid_answer_mode')
         # Queries written by the invoking agent replace the first planner call.
         preset=params.get('queries')
         if preset is not None:
@@ -485,13 +510,7 @@ class ResearchConnection:
                          'that do not serve the question (other branches, opening hours, unrelated products) even if they are here. '
                          'If the evidence is about a different product, company or place than the one asked (a similar name, an '
                          'older model), say so plainly; never present it as the same thing.\n'
-                         '2. Depth: cut only off-topic and repeated content, never on-topic detail; keep every concrete fact '
-                         '(numbers, dates, prices, names, places, conditions) that bears on the question. After the direct answer '
-                         'add the 2-3 things the user will most likely need next (e.g. 有賣嗎 → 價格、怎麼買、庫存/替代管道). '
-                         'Roughly: narrow question 300-700 Chinese characters; why/how 500-1000, each reason with its evidence; '
-                         'broad requests (推薦、行程、比較、有什麼) 1000-2500, every relevant item with 時間、地點、費用、一句亮點. '
-                         'Checklists for broad requests only, each item only when the evidence has it: 旅遊/活動/美食 → 時間地點、'
-                         '交通、費用、網友評價/注意事項; 學術/技術 → 原理、機制、步驟、優劣; 3C/產品 → 規格對比、售價、評測優缺點、適合誰.\n'
+                         +(BREADTH_RULE if answer_mode=='breadth' else DEPTH_RULE)+
                          '3. No repetition: state each fact once. No closing 結論/總結 restating the body, no second table '
                          'repeating the same items, never the same content as both a table and bullets. Use a table only to '
                          'compare several items across several attributes.\n'
@@ -499,9 +518,7 @@ class ResearchConnection:
                          'fact or list item, even in a two-line answer. If downloaded images are listed below, place at most two '
                          '[[image: …]] markers on their own lines (never inside a table) next to the text they illustrate, only images that show the '
                          'thing asked about; skip logos, thumbnails and site banners, and skip images for yes/no or one-fact answers.\n'
-                         '5. Closure: do not search, crawl, browse or fetch images on your own. End with one short line on what '
-                         'the evidence does not cover that matters for this question, then ask whether the user wants a deep '
-                         'crawl of specific sources above or another research round.\n')
+                         +(BREADTH_CLOSURE if answer_mode=='breadth' else DEPTH_CLOSURE))
                 if images is not None and images.delivered:
                     packet+=('This evidence includes downloaded images: if they show the thing asked about, place '
                              'one or two [[image: …]] markers from the Images list, copied exactly, on their own lines '

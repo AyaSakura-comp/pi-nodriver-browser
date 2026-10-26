@@ -139,6 +139,35 @@ class ResearchJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['fullEvidenceDelivered'])
         self.assertIn('NT$19,900', result['text'])
 
+    async def test_answer_mode_picks_breadth_or_depth_closing_rules(self):
+        from research.jobs import ResearchConnection, BREADTH_RULE, DEPTH_RULE, BREADTH_CLOSURE, DEPTH_CLOSURE
+        class Provider:
+            async def search(self, task):
+                return [SearchResult('1', 'https://example.com/1', '台南 活動')]
+            async def close(self): pass
+        async def extract(url, *args, **kwargs):
+            return dict(ok=True, text='台南 活動 10/31 大新營嘉年華', contentMode='full')
+        texts = {}
+        for mode in (None, 'breadth', 'depth'):
+            engine = SimpleNamespace(ensure_browser=AsyncMock(), crawl_one=extract,
+                                     cleanup_research_owner=AsyncMock(), research_cleanup_tasks=set())
+            params = dict(jobId='job', question='台南 活動', provider='4get', searchBudget=1, searchConcurrency=1,
+                          layaConcurrency=1, queries=['台南 活動'], evidence='progressive',
+                          clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'})
+            if mode: params['answer'] = mode
+            with tempfile.TemporaryDirectory() as root:
+                conn = ResearchConnection(engine, AsyncMock(), Path(root), fourget_factory=Provider)
+                texts[mode] = (await asyncio.wait_for(conn.run(6, 'owner', params), 4))['text']
+        for mode in (None, 'breadth'):  # breadth is the default for a new question
+            self.assertIn(BREADTH_RULE, texts[mode]); self.assertIn(BREADTH_CLOSURE, texts[mode])
+            self.assertNotIn(DEPTH_RULE, texts[mode])
+        self.assertIn(DEPTH_RULE, texts['depth']); self.assertIn(DEPTH_CLOSURE, texts['depth'])
+        self.assertNotIn(BREADTH_RULE, texts['depth'])
+        conn = ResearchConnection(SimpleNamespace(), AsyncMock(), Path('/unused'))
+        with self.assertRaises(ValueError):
+            await conn.run(1, 'o', dict(jobId='job', question='q', provider='4get', searchBudget=1, searchConcurrency=1,
+                layaConcurrency=1, answer='deep', clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'}))
+
     async def test_crawl_top_per_query_crawls_only_each_querys_first_results(self):
         from research.jobs import ResearchConnection
         class Provider:
