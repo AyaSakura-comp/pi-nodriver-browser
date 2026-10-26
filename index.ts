@@ -48,7 +48,7 @@ function parseGettimeValue(value: string): number | undefined {
 const SEARCH_FIRST_URL_RULE = `MANDATORY URL PROVENANCE RULE:
 - Only exact URLs supplied verbatim by the user or returned by successful google_search or web_search results may be opened. This is enforced by URL_PROVENANCE_GUARD.
 - If the user supplied an exact HTTP(S) URL in their message, you may open that exact URL directly. Do not guess, modify, repair, or synthesize variations of it.
-- If no exact URL was provided by the user, you MUST search first with research. google_search and browser google-search are only for a user who explicitly asked for a Google search. Never guess, infer, synthesize, or construct a URL from memory.
+- If no exact URL was provided by the user, you MUST search first ${process.env.PI_RESEARCH_GOOGLE_FIRST === "1" ? "(google_search, then research)" : "with research. google_search and browser google-search are only for a user who explicitly asked for a Google search"}. Never guess, infer, synthesize, or construct a URL from memory.
 - Copy one exact URL from search results without changing its domain, path, query, casing, or percent-encoding. If a requested deep link is not indexed and was not provided by the user, open the closest official parent URL returned by search and navigate through visible links; do not pass the unindexed deep URL to open, browser_intent, or crawl. If search returns no usable parent URL, stop; never try a URL variant.
 - Browser's google-search command (explicit user Google requests only, like google_search) is also accepted when called with the exact JSON shape: google-search {"searches":[{"direction":"official","query":"site or destination"}]}.
 - ${INTENT_FULL ? 'In browser_intent, candidate links on the active page are listed as [1]..[N]. You may navigate to them using action: "open" with pick: <number> or by copying the exact candidate URL.' : "browser_intent's planner follows on-page links itself: give it the closest exact URL you have plus the destination in the goal."} Opening standard search engine queries (e.g. https://www.google.com/search?q=...) is also authorized.
@@ -471,6 +471,9 @@ export default function (pi: ExtensionAPI) {
   const { browserMode, crawlGuards } = readBrowserConfig();
   const worker = new NodriverWorker();
   const ACTIVE_PREFILL = process.env.RESEARCH_ACTIVE_PREFILL !== "0";
+  // Experiment: every web lookup starts with a breadth google_search (scattered directions),
+  // then research picks its queries from what Google turned up. Off by default.
+  const GOOGLE_FIRST = process.env.PI_RESEARCH_GOOGLE_FIRST === "1";
   if (browserMode === "intent") registerIntent(toolApi, () => worker.ensureStarted());
   let queue = Promise.resolve<unknown>(undefined);
   const searchedUrls = new Map<string, Set<string>>();
@@ -487,6 +490,9 @@ export default function (pi: ExtensionAPI) {
   const researchDone = new Map<string, boolean>();
   const researchBlocks = new Map<string, number>();
   const researchTried = new Map<string, boolean>();
+  // GOOGLE_FIRST: google_search calls this message, and whether research was already sent back once.
+  const googleCalls = new Map<string, number>();
+  const googleFirstBlocked = new Map<string, boolean>();
   const lastInput = new Map<string, string>();
   // Research answers are breadth first (every option, one or two lines each) until the
   // user picks something to expand: then the same session switches to depth.
@@ -531,6 +537,8 @@ export default function (pi: ExtensionAPI) {
     researchDone.set(sessionId(ctx), false);
     researchBlocks.set(sessionId(ctx), 0);
     researchTried.set(sessionId(ctx), false);
+    googleCalls.set(sessionId(ctx), 0);
+    googleFirstBlocked.set(sessionId(ctx), false);
     imageTask.set(sessionId(ctx), false);
     researchUrls.set(sessionId(ctx), new Set());
     researchIntentUsed.set(sessionId(ctx), false);
@@ -606,6 +614,22 @@ export default function (pi: ExtensionAPI) {
     const googleSearch = event.toolName === "google_search" ||
       (event.toolName === "browser" && /^\s*google-search(?:\s|$)/iu.test(String((event.input as {command?: unknown})?.command ?? "")));
     // RESEARCH_DONE_GUARD above takes precedence once research has answered.
+    if (GOOGLE_FIRST && googleSearch) {
+      const calls = (googleCalls.get(sessionId(ctx)) ?? 0) + 1;
+      googleCalls.set(sessionId(ctx), calls);
+      if (calls > 1 && !USER_WANTS_GOOGLE.test(asked)) return {
+        block: true,
+        reason: "GOOGLE_DONE: google_search already ran for this message. Now call research with q1-q4 spread over the distinct items, names and sources its results turned up.",
+      };
+      return;
+    }
+    if (GOOGLE_FIRST && event.toolName === "research" && !googleCalls.get(sessionId(ctx)) && !googleFirstBlocked.get(sessionId(ctx))) {
+      googleFirstBlocked.set(sessionId(ctx), true);
+      return {
+        block: true,
+        reason: "GOOGLE_FIRST: start with google_search: 3-4 scattered directions (different sub-topics, synonyms, official / news / community / English sources) for a broad view. Then call research with queries picked from what Google found.",
+      };
+    }
     if (googleSearch && !USER_WANTS_GOOGLE.test(asked)) {
       return {
         block: true,
@@ -655,7 +679,9 @@ export default function (pi: ExtensionAPI) {
   // The invoking agent writes the search queries itself (no planner model
   // call). Every extra token here is decoded on the critical path, so the
   // rule asks for keyword queries, not sentences.
-  const RESEARCH_QUERY_RULE = "research takes only q1, q2, q3, q4: four distinct keyword queries, each 2-6 keywords (no sentences, no filler words), different angles (official source, exact figure, date, English), relative dates replaced by concrete YYYY-MM-DD dates.";
+  const RESEARCH_QUERY_RULE = GOOGLE_FIRST
+    ? "research takes only q1, q2, q3, q4: four keyword queries, each 2-6 keywords (no sentences), relative dates replaced by concrete YYYY-MM-DD dates. Spread them wide: each query targets a different item, name, venue or source that google_search turned up (or a sub-topic it missed), never four rewordings of the user's question."
+    : "research takes only q1, q2, q3, q4: four distinct keyword queries, each 2-6 keywords (no sentences, no filler words), different angles (official source, exact figure, date, English), relative dates replaced by concrete YYYY-MM-DD dates.";
   // Research queries are written by the invoking agent, which must resolve
   // 今天/明天/這週 to concrete dates (the planner used to get this line).
   const localDateLine = () => {
@@ -732,6 +758,8 @@ export default function (pi: ExtensionAPI) {
         if (activeResearch.has(sid)) continue;  // another research owns this session
         // RESEARCH_DONE_GUARD will block this call; do not search and crawl for it.
         if (researchDone.get(sid) && !USER_WANTS_MORE.test(lastInput.get(sid) ?? "")) continue;
+        // GOOGLE_FIRST will block a research call written before google_search.
+        if (GOOGLE_FIRST && !googleCalls.get(sid) && !googleFirstBlocked.get(sid)) continue;
         const jobId = randomUUID();
         const clock = hostClock();
         const abort = new AbortController();
@@ -780,18 +808,24 @@ export default function (pi: ExtensionAPI) {
   toolApi.registerTool({
     name: "research",
     label: "Budgeted research",
-    description: "Web research, the default and only web search tool unless the user explicitly asks for Google: runs your keyword queries (3 fourget + 1 Google, so Google results are already included), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
+    description: GOOGLE_FIRST
+      ? "Web research, step 2 of every web lookup (step 1 is google_search): runs your four keyword queries (3 fourget + 1 Google), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool."
+      : "Web research, the default and only web search tool unless the user explicitly asks for Google: runs your keyword queries (3 fourget + 1 Google, so Google results are already included), resolves and deduplicates result URLs, crawls them in parallel in search order, and returns verbatim source-labelled evidence passages for your answer. You only choose what to search; everything else is fixed by the tool.",
     promptSnippet: "Default web search: four keyword queries in, crawled source-labelled evidence out (searches, crawls and dates handled by the tool)",
     promptGuidelines: [
-      "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
-      "research already runs its own Google query. Never add google_search (or browser google-search) to get Google results, to supplement research, or as a fallback when research fails or comes back thin; those are reserved for a user who explicitly says Google (e.g. 「用 Google 搜」).",
+      ...(GOOGLE_FIRST ? [
+        "Any question needing web or current information (events, news, prices, schedules, facts, docs): first ONE google_search for a broad view, then ONE research call whose queries are picked from the Google results. Never answer from the Google snippets alone.",
+      ] : [
+        "research is the default tool for any question needing web or current information (events, news, prices, schedules, facts, docs). Call it once, before any other search tool.",
+        "research already runs its own Google query. Never add google_search (or browser google-search) to get Google results, to supplement research, or as a fallback when research fails or comes back thin; those are reserved for a user who explicitly says Google (e.g. 「用 Google 搜」).",
+      ]),
       "For research queries, use the latest browser-date-context Today line for the local date; turn 今天/明天/這禮拜/週末 into concrete YYYY-MM-DD dates. Use gettime when exact current time is needed.",
       crawlGuards
         ? "Answer only from the evidence research returns and cite its source URLs; do not follow up with google_search or crawl unless the user asks."
         : "Answer from the evidence research returns and cite its source URLs. research already crawled its result pages, so do not crawl on your own afterwards, even when the evidence is thin: offer a deep crawl instead, and crawl only after the user asks for it or gives a URL. Do not follow up with google_search unless the user asks.",
       RESEARCH_QUERY_RULE,
       "How to write the answer comes with the evidence (its closing instructions); follow them. A new question is answered breadth first (every option, one or two lines each).",
-      "When the user asks to go deeper on one item from an earlier answer (quotes it, says 這個／第N個／詳細), call research again with queries about that item (its official page, details, 交通、票價、評價) instead of answering from the earlier overview.",
+      `When the user asks to go deeper on one item from an earlier answer (quotes it, says 這個／第N個／詳細), call ${GOOGLE_FIRST ? "google_search and research" : "research"} again with queries about that item (its official page, details, 交通、票價、評價) instead of answering from the earlier overview.`,
     ],
     // Four separate parameters, not one array: llama.cpp streams a tool call
     // one finished parameter at a time, so q1 reaches the extension (and its
@@ -1171,9 +1205,16 @@ export default function (pi: ExtensionAPI) {
   toolApi.registerTool({
     name: "google_search",
     label: "Directional Google Search",
-    description: "EXPLICIT USER REQUEST ONLY: call this only when the user's own message explicitly asks for a Google search (e.g. 「用 Google 搜」, \"google it\"). For every other web lookup use research, which already includes a Google query. Searches Google directly through Nodriver with one to four distinct query directions in parallel and returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
+    description: GOOGLE_FIRST
+      ? "Step 1 of every web lookup: a breadth-first Google search through Nodriver, one to four distinct query directions in parallel, returning a globally de-duplicated, diversity-balanced Top 10 (title/URL/snippet). Use what it finds to write the research queries (step 2)."
+      : "EXPLICIT USER REQUEST ONLY: call this only when the user's own message explicitly asks for a Google search (e.g. 「用 Google 搜」, \"google it\"). For every other web lookup use research, which already includes a Google query. Searches Google directly through Nodriver with one to four distinct query directions in parallel and returns a globally de-duplicated, diversity-balanced Top 10 in the same title/URL/snippet format as web_search.",
     promptSnippet: "Explicit user Google requests only (otherwise use research): run 1–4 directional Google searches in parallel and return a de-duplicated Top 10",
-    promptGuidelines: [
+    promptGuidelines: GOOGLE_FIRST ? [
+      "google_search is the first step of every web lookup: call it once, then call research. Never answer from Google snippets alone and never call google_search twice for one message.",
+      "Search breadth first with scattered keywords: three or four directions that each cover a different sub-topic, synonym or source type (official site, news, community such as PTT/Dcard/blogs, English or regional sources), 2-5 keywords each. Do not send near-duplicate queries.",
+      "Use concrete dates or the current year (from the browser-date-context Today line) when time matters; never default to 2025 from model memory.",
+      "After google_search, call research with q1-q4 spread over the distinct items, names, venues and sources the results turned up (plus any sub-topic Google missed).",
+    ] : [
       "google_search is ONLY for a user who explicitly asks for a Google search in their message. Do not use it on your own initiative, to supplement research, or as a fallback when research fails or is thin: research already runs its own Google query, so call or retry research instead. Calls without an explicit Google request are blocked (RESEARCH_FIRST).",
       "For google_search, choose two to four task-appropriate directions. Good defaults are official or primary sources; current news or date-specific updates; independent reviews or community experience; and alternatives, risks, or counter-evidence.",
       "Do not mechanically use all four defaults when they do not fit. For shopping, prefer official specifications, retailer availability, independent reviews, and competing products; for technical research, prefer official docs, recent changes, implementation experience, and known limitations.",
@@ -1222,7 +1263,10 @@ export default function (pi: ExtensionAPI) {
       if (isTimeSensitive) {
         confirmedCurrentTime = String(params.currentTime || "").trim();
         const suppliedTimestamp = parseGettimeValue(confirmedCurrentTime);
-        if (suppliedTimestamp === undefined || Math.abs(Date.now() - suppliedTimestamp) > FRESH_TIME_MAX_AGE_MS) {
+        if (GOOGLE_FIRST && (suppliedTimestamp === undefined || Math.abs(Date.now() - suppliedTimestamp) > FRESH_TIME_MAX_AGE_MS)) {
+          // The step-1 search runs on every lookup; the date context line already gives today.
+          confirmedCurrentTime = new Date().toISOString();
+        } else if (suppliedTimestamp === undefined || Math.abs(Date.now() - suppliedTimestamp) > FRESH_TIME_MAX_AGE_MS) {
           throw new Error('Time-sensitive google_search requires a fresh gettime(action: "now") result in currentTime. Call gettime first, copy its complete output, and retry.');
         }
       }
