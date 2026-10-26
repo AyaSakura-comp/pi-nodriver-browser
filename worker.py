@@ -51,6 +51,28 @@ logger = logging.getLogger('nodriver.worker')
 # Strip WAYLAND_DISPLAY so Ozone/Chrome and child processes bind strictly to X11 under Xvfb
 os.environ.pop('WAYLAND_DISPLAY', None)
 
+# nodriver's Tab.close() only sends Target.closeTarget, and update_targets()
+# drops a vanished target without closing its DevTools websocket. Every tab the
+# worker ever used therefore kept one socket open until the 1024-fd limit hit
+# (EMFILE: Google search and research failed for everyone). Close the websocket
+# of each target that update_targets() drops, whichever path closed the tab.
+_nodriver_update_targets = uc.Browser.update_targets
+
+
+async def _update_targets_closing_vanished(self):
+    before = list(self._targets)
+    await _nodriver_update_targets(self)
+    for vanished in before:
+        # Identity, not ==: Tab.__eq__ compares TargetInfo, which update_targets rewrites.
+        if all(live is not vanished for live in self._targets) and getattr(vanished, 'socket', None) is not None:
+            try:
+                await asyncio.wait_for(vanished.aclose(), timeout=2)
+            except Exception:
+                pass
+
+
+uc.Browser.update_targets = _update_targets_closing_vanished
+
 
 class StaleRefError(ValueError):
     def __init__(self, ref):
