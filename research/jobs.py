@@ -428,9 +428,20 @@ class ResearchConnection:
         async def extract(request):
             if not accepting[0] or request.job_id!=job_id or request.url not in authority:
                 raise ValueError('research_url_not_authorized')
-            await self.engine.ensure_browser(max_age=BROWSER_PROBE_MAX_AGE)
-            result=await self.engine.crawl_one(request.url,0,owner,asyncio.Semaphore(1),max_text_units=1_000_000,
-                                               fetch_timeout=RESEARCH_FETCH_TIMEOUT)
+            async def crawl():
+                await self.engine.ensure_browser(max_age=BROWSER_PROBE_MAX_AGE)
+                return await self.engine.crawl_one(request.url,0,owner,asyncio.Semaphore(1),max_text_units=1_000_000,
+                                                   fetch_timeout=RESEARCH_FETCH_TIMEOUT)
+            browser=getattr(self.engine,'browser',None)
+            result=await crawl()
+            if result.get('browserSuspect'):
+                # A hung Chrome fails every page at the fetch timeout while the job's own probe
+                # (started at job start) is still deciding; the first research after hours idle
+                # came back with 0 of 15 pages twice (2026-10-27/28). Wait for a full probe, which
+                # relaunches a dead browser, and retry the page once on the new one.
+                await self.engine.ensure_browser()
+                if getattr(self.engine,'browser',None) is not browser:
+                    result=await crawl()
             mode=result.get('contentMode','full')
             if mode not in ('full','temp-wiki'): mode='full'
             truncated=mode=='temp-wiki' or result.get('truncated',False)

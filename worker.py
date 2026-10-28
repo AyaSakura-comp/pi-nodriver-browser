@@ -7719,6 +7719,8 @@ class BrowserWorker:
                 ),
                 "chars": 0,
                 "elapsed": elapsed,
+                # Slow page or hung browser: callers that can wait may probe and retry.
+                'browserSuspect': not is_pdf,
                 'imageCandidates': [],
                 'imageCount': 0,
                 'imageCandidateText': self.format_image_candidates([], status='not-run'),
@@ -7736,6 +7738,7 @@ class BrowserWorker:
                 "error": str(err),
                 "chars": 0,
                 "elapsed": elapsed,
+                'browserSuspect': True,
                 'imageCandidates': [],
                 'imageCount': 0,
                 'imageCandidateText': self.format_image_candidates([], status='not-run'),

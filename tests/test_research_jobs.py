@@ -168,6 +168,59 @@ class ResearchJobTests(unittest.IsolatedAsyncioTestCase):
             await conn.run(1, 'o', dict(jobId='job', question='q', provider='4get', searchBudget=1, searchConcurrency=1,
                 layaConcurrency=1, answer='deep', clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'}))
 
+    async def test_a_hung_browser_is_relaunched_and_the_page_retried_once(self):
+        from research.jobs import ResearchConnection
+        class Provider:
+            async def search(self, task):
+                return [SearchResult(f'T+2 {i}', f'https://example.com/{i}', '台股 T+2 交割') for i in range(3)]
+            async def close(self): pass
+        hung, fresh = object(), object()
+        engine = SimpleNamespace(browser=hung, cleanup_research_owner=AsyncMock(), research_cleanup_tasks=set())
+        calls = []
+        async def ensure_browser(max_age=None):
+            if max_age is None:   # the job's full probe gives up on the hung Chrome and relaunches it
+                await asyncio.sleep(0.3)
+                engine.browser = fresh
+            return engine.browser
+        async def extract(url, *args, **kwargs):
+            calls.append((url, engine.browser is fresh))
+            if engine.browser is hung:
+                return dict(ok=False, text='', title='Timeout', browserSuspect=True)
+            return dict(ok=True, text=f'台股 T+2 交割 {url} 成交後第二個營業日', contentMode='full')
+        engine.ensure_browser, engine.crawl_one = ensure_browser, extract
+        params = dict(jobId='job', question='台股交割', provider='4get', searchBudget=1, searchConcurrency=1,
+                      layaConcurrency=1, queries=['台股 交割'], evidence='progressive',
+                      clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'})
+        with tempfile.TemporaryDirectory() as root:
+            result = await asyncio.wait_for(ResearchConnection(engine, AsyncMock(), Path(root), fourget_factory=Provider)
+                                            .run(7, 'owner', params), 4)
+        self.assertGreater(result['crawlWords'], 0)
+        self.assertNotIn('crawl_empty_or_failed', result['errors'])
+        for i in range(3):   # each page: one attempt on the hung browser at most, then one on the new one
+            url = f'https://example.com/{i}'
+            self.assertLessEqual([c for c in calls if c[0] == url].count((url, False)), 1)
+            self.assertEqual([c for c in calls if c[0] == url][-1], (url, True))
+
+    async def test_a_slow_page_on_a_healthy_browser_is_not_retried(self):
+        from research.jobs import ResearchConnection
+        class Provider:
+            async def search(self, task):
+                return [SearchResult('slow', 'https://example.com/slow', '台股 T+2')]
+            async def close(self): pass
+        calls = []
+        async def extract(url, *args, **kwargs):
+            calls.append(url)
+            return dict(ok=False, text='', title='Timeout', browserSuspect=True)
+        engine = SimpleNamespace(browser=object(), ensure_browser=AsyncMock(), crawl_one=extract,
+                                 cleanup_research_owner=AsyncMock(), research_cleanup_tasks=set())
+        params = dict(jobId='job', question='台股交割', provider='4get', searchBudget=1, searchConcurrency=1,
+                      layaConcurrency=1, queries=['台股 交割'], evidence='progressive',
+                      clock={'iso':'2026-01-01T00:00:00Z','timezone':'UTC'})
+        with tempfile.TemporaryDirectory() as root:
+            await asyncio.wait_for(ResearchConnection(engine, AsyncMock(), Path(root), fourget_factory=Provider)
+                                   .run(8, 'owner', params), 4)
+        self.assertEqual(calls, ['https://example.com/slow'])
+
     async def test_crawl_top_per_query_crawls_only_each_querys_first_results(self):
         from research.jobs import ResearchConnection
         class Provider:
