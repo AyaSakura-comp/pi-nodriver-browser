@@ -194,7 +194,8 @@ on a clean machine; do not treat it as a one-command, fully automated installer.
 ## Research (default web lookup)
 
 `research` is the agent's default web search. The agent writes only four keyword
-queries (`q1`–`q4`, concrete dates); the tool searches (3 fourget + 1 Google),
+queries (`q1`–`q4`, concrete dates). `q1` is the exact search: the subject copied
+verbatim (一字不差) from the user's message, nothing added; the tool searches (3 fourget + 1 Google),
 crawls results in search order through a dedicated 32-tab pool, and returns
 append-only, source-labelled evidence (~6,000-token budget) ending with an
 explicit "answer now" footer.

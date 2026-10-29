@@ -679,9 +679,12 @@ export default function (pi: ExtensionAPI) {
   // The invoking agent writes the search queries itself (no planner model
   // call). Every extra token here is decoded on the critical path, so the
   // rule asks for keyword queries, not sentences.
+  // q1 searches the subject exactly as the user wrote it: added keywords
+  // (妖怪, 故事, English glosses) narrow or drift the results for rare names.
+  const EXACT_Q1_RULE = "q1 is the exact search: the thing the user wants looked up, copied character for character (一字不差) from the user's message (for a follow-up on an earlier item: that item's name exactly as written), with nothing added, translated or reworded (user 「竹狐是什麼」 → q1 「竹狐」).";
   const RESEARCH_QUERY_RULE = GOOGLE_FIRST
-    ? "research takes only q1, q2, q3, q4: four keyword queries, each 2-6 keywords (no sentences), relative dates replaced by concrete YYYY-MM-DD dates. Spread them wide: each query targets a different item, name, venue or source that google_search turned up (or a sub-topic it missed), never four rewordings of the user's question."
-    : "research takes only q1, q2, q3, q4: four distinct keyword queries, each 2-6 keywords (no sentences, no filler words), different angles (official source, exact figure, date, English), relative dates replaced by concrete YYYY-MM-DD dates.";
+    ? `research takes only q1, q2, q3, q4. ${EXACT_Q1_RULE} q2-q4: keyword queries, each 2-6 keywords (no sentences), relative dates replaced by concrete YYYY-MM-DD dates. Spread them wide: each targets a different item, name, venue or source that google_search turned up (or a sub-topic it missed), never rewordings of the user's question.`
+    : `research takes only q1, q2, q3, q4. ${EXACT_Q1_RULE} q2-q4: distinct keyword queries, each 2-6 keywords (no sentences, no filler words), different angles (official source, exact figure, date, English), relative dates replaced by concrete YYYY-MM-DD dates.`;
   // Research queries are written by the invoking agent, which must resolve
   // 今天/明天/這週 to concrete dates (the planner used to get this line).
   const localDateLine = () => {
@@ -831,7 +834,7 @@ export default function (pi: ExtensionAPI) {
     // one finished parameter at a time, so q1 reaches the extension (and its
     // search starts) while q2..q4 are still being written.
     parameters: Type.Object({
-      q1: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 1 (2-6 keywords, concrete dates)" }),
+      q1: Type.String({ minLength: 1, maxLength: 80, description: "exact search: the thing asked about, copied verbatim (一字不差) from the user's message, no added words" }),
       q2: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 2, a different angle" }),
       q3: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 3, a different angle" }),
       q4: Type.String({ minLength: 1, maxLength: 80, description: "keyword query 4, a different angle" }),
