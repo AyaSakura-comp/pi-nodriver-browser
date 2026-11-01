@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, detect_access_block, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, canonicalize_search_url, configure_profile_preferences, detect_access_block, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, same_site_challenged_hosts, select_diverse_search_results, should_disable_sandbox, site_key
 
 
 class IdentityViewportMetricsTests(unittest.TestCase):
@@ -107,6 +107,26 @@ class AccessBlockDetectionTests(unittest.TestCase):
                 'Book a table and read our help article about avoiding captcha problems.',
             )
         )
+
+
+class CloudflareDataChallengeTests(unittest.TestCase):
+    def test_site_key_groups_subdomains_and_country_second_level_domains(self):
+        self.assertEqual(site_key('https://api.amiami.com/api/v1.0/item'), 'amiami.com')
+        self.assertEqual(site_key('https://www.amiami.com/eng/'), 'amiami.com')
+        self.assertEqual(site_key('https://store.kadokawa.co.jp/shop/'), 'kadokawa.co.jp')
+        self.assertEqual(site_key('https://24h.pchome.com.tw/'), 'pchome.com.tw')
+        self.assertNotEqual(site_key('https://a.co.jp/'), site_key('https://b.co.jp/'))
+
+    def test_only_the_pages_own_site_counts(self):
+        page = 'https://www.amiami.com/eng/detail/?gcode=GOODS-04842182'
+        challenged = [
+            'https://api.amiami.com/api/v1.0/item?gcode=GOODS-04842182&lang=eng',
+            'https://api.amiami.com/api/v1.0/likes?gcode=GOODS-04842182',
+            'https://widgets.example-ads.com/beacon',
+        ]
+        self.assertEqual(same_site_challenged_hosts(page, challenged), ['api.amiami.com'])
+        self.assertEqual(same_site_challenged_hosts(page, challenged[2:]), [])
+        self.assertEqual(same_site_challenged_hosts('about:blank', challenged), [])
 
 
 class AccessGateDetectionTests(unittest.TestCase):

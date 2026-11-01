@@ -34,7 +34,7 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
-from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, chrome_debug_port, pid_alive, profile_lock_pid, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
+from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, chrome_debug_port, pid_alive, profile_lock_pid, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, same_site_challenged_hosts, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
 SUPPORTED_ACTIONS = {
@@ -72,6 +72,12 @@ async def _update_targets_closing_vanished(self):
 
 
 uc.Browser.update_targets = _update_targets_closing_vanished
+
+
+# Reloads while Cloudflare challenges a page's own data requests. Keep this small and
+# spaced: 20 reloads in 60 s made Cloudflare challenge the whole site (2026-11-01).
+CF_DATA_CHALLENGE_MAX_RELOADS = int(os.environ.get('PI_NODRIVER_CF_DATA_RELOADS', '3'))
+CF_DATA_CHALLENGE_RELOAD_GAP_SEC = 5.0
 
 
 class StaleRefError(ValueError):
@@ -7519,6 +7525,78 @@ class BrowserWorker:
             finally:
                 search_slots.release()
 
+    async def watch_cloudflare_data_challenges(self, tab):
+        """Record URLs of this tab's requests that Cloudflare answered with a challenge.
+
+        Only page navigations can solve a challenge. A challenged XHR/fetch (or its CORS
+        preflight) just fails, and the site shows its own error instead of the data
+        (AmiAmi: "System Error Occured" while api.amiami.com was challenged).
+        """
+        urls, challenged = {}, []
+
+        def on_request(event):
+            if len(urls) < 4000:
+                urls[str(event.request_id)] = event.request.url
+
+        def on_response_extra(event):
+            if any(str(k).lower() == 'cf-mitigated' and str(v).lower() == 'challenge'
+                   for k, v in (event.headers or {}).items()):
+                url = urls.get(str(event.request_id))
+                if url:
+                    challenged.append(url)
+
+        tab._pi_cf_challenged = challenged
+        try:
+            tab.add_handler(uc.cdp.network.RequestWillBeSent, on_request)
+            tab.add_handler(uc.cdp.network.ResponseReceivedExtraInfo, on_response_extra)
+            await tab.send(uc.cdp.network.enable())
+        except Exception:
+            # Best effort: without it the page still opens, just without the retry.
+            pass
+
+    async def clear_cloudflare_data_challenge(self, tab, page_url, max_reloads=CF_DATA_CHALLENGE_MAX_RELOADS):
+        """Reload a few times while Cloudflare keeps challenging the page's own data requests.
+
+        Cloudflare challenges a browser session that is new to it, whatever the identity;
+        on 2026-11-01 fresh profiles usually passed within a few spaced loads, but rapid
+        repeated reloads made it escalate to the whole site. Returns (reloads, hosts still
+        challenged); callers report the latter instead of passing the error page off.
+        """
+        loop = asyncio.get_running_loop()
+        hosts = same_site_challenged_hosts(page_url, tab._pi_cf_challenged)
+        reloads = 0
+        while hosts and reloads < max_reloads:
+            tab._pi_cf_challenged.clear()
+            reloads += 1
+            started = loop.time()
+            try:
+                await asyncio.wait_for(tab.reload(), timeout=10)
+                await self.wait_for_page_ready(tab, timeout_sec=3.0, min_text_chars=21)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            # Data requests start after load; give them time to be answered, and space the
+            # reloads out (without a floor it reloaded ~3 times a second).
+            settle_until = started + CF_DATA_CHALLENGE_RELOAD_GAP_SEC
+            while loop.time() < settle_until:
+                await asyncio.sleep(0.25)
+            hosts = same_site_challenged_hosts(page_url, tab._pi_cf_challenged)
+        if reloads:
+            logger.info(f"[CF-DATA] {page_url}: {reloads} reload(s), still challenged: {hosts or 'none'}")
+        return reloads, hosts
+
+    async def settle_cloudflare_data_challenge(self, page):
+        """open returns before an SPA fires its data requests, so look again when the page is read."""
+        challenged = getattr(page, '_pi_cf_challenged', None)
+        if not challenged:
+            return
+        try:
+            # Tab.url is empty for tabs from browser.get(new_tab=True); ask the page.
+            url = str(await page.evaluate('location.href') or '')
+        except Exception:
+            return
+        if same_site_challenged_hosts(url, challenged):
+            await self.clear_cloudflare_data_challenge(page, url)
+
     async def crawl_one(self, target_url, idx, session_id, crawl_slots, *, max_text_units=None, fetch_timeout=3.0):
         if max_text_units is not None and (type(max_text_units) is not int or not 1 <= max_text_units <= 1_000_000):
             raise ValueError('invalid research DOM capture limit')
@@ -7549,6 +7627,7 @@ class BrowserWorker:
                 else:
                     tab = await self.create_managed_tab(session_id, 'crawl')
                     self.begin_tab_activity(tab)
+                    await self.watch_cloudflare_data_challenges(tab)
                 # Custom Crawl Mode Resolution: Force 1920x1080 Full-Desktop Viewport per tab
                 try:
                     await tab.send(uc.cdp.emulation.set_device_metrics_override(
@@ -7626,6 +7705,34 @@ class BrowserWorker:
                     },
                 }
 
+            cf_reloads, cf_hosts = 0, []
+            if not pooled and same_site_challenged_hosts(target_url, tab._pi_cf_challenged):
+                # Research crawls (pooled, 3 s budget) cannot wait this out; explicit crawls can.
+                cf_reloads, cf_hosts = await self.clear_cloudflare_data_challenge(tab, target_url)
+                title = str(await tab.evaluate("document.title") or "No Title").strip()
+                clean_text = str(await tab.evaluate("document.body.innerText") or "").strip()
+                elapsed = round(asyncio.get_running_loop().time() - t0, 2)
+            if cf_hosts:
+                return {
+                    "index": idx + 1,
+                    "url": target_url,
+                    "title": title,
+                    "text": "",
+                    "ok": False,
+                    "error": (f"Cloudflare bot check kept blocking this page's data requests to "
+                              f"{', '.join(cf_hosts)} after {cf_reloads} reloads; the page shows an "
+                              f"error instead of its content. Do not retry right away: repeated loads make "
+                              f"Cloudflare block the whole site for longer. Try again in 10-30 minutes."),
+                    "chars": 0,
+                    "elapsed": elapsed,
+                    'cloudflareDataChallenge': cf_hosts,
+                    'imageCandidates': [],
+                    'imageCount': 0,
+                    'imageCandidateText': self.format_image_candidates([], status='not-run'),
+                    'imageDiscoveryStatus': 'not-run',
+                    'imageDiscoveryError': 'cloudflare data challenge before image discovery',
+                }
+
             # Detect Anti-Bot / Cloudflare Challenge Validation
             lower_title = title.lower()
             lower_text = clean_text.lower()
@@ -7676,6 +7783,7 @@ class BrowserWorker:
                 'imageCandidateText': image_candidate_text,
                 'imageDiscoveryStatus': image_discovery['status'],
                 'imageDiscoveryError': image_discovery['error'],
+                **({'cloudflareReloads': cf_reloads} if cf_reloads else {}),
                 **capture,
             }
         except asyncio.TimeoutError:
@@ -8082,6 +8190,7 @@ class BrowserWorker:
             page = await self.create_managed_tab(session_id, 'page')
             t_open_tab = time.perf_counter()
             self.begin_tab_activity(page)
+            await self.watch_cloudflare_data_challenges(page)
             browser_mode = self.browser_modes.get(session_id, 'linux')
             target_origin = normalize_origin(target_url)
             origin_route_reason = (
@@ -8164,9 +8273,12 @@ class BrowserWorker:
 
                     page = await self.create_managed_tab(session_id, 'page')
                     self.begin_tab_activity(page)
+                    await self.watch_cloudflare_data_challenges(page)
                     identity_used = 'linux-fallback'
                     viewport_metrics = await self.apply_identity_viewport(page, identity_used)
                     await navigate_with_timeout(page, timeout_sec)
+
+                cf_reloads, cf_hosts = await self.clear_cloudflare_data_challenge(page, target_url)
 
                 if not preserve_overlays:
                     try:
@@ -8328,9 +8440,18 @@ class BrowserWorker:
                 f"TOTAL={(t_open_meta-t_open_0)*1000:.1f}ms"
             )
 
+            cf_text = (
+                f'\n\nCloudflare bot check is still blocking this site\'s data requests to {", ".join(cf_hosts)} '
+                f'after {cf_reloads} reloads, so the page shows an error instead of its content. '
+                'Do not treat the error as the page\'s real state, and do not reload or reopen it right away: '
+                'repeated loads make Cloudflare block the whole site for longer. Try again in 10-30 minutes.'
+                if cf_hosts else
+                f'\n\nCloudflare challenged this site\'s data requests; passed after {cf_reloads} reload(s).'
+                if cf_reloads else ''
+            )
             return {
                 'text': (
-                    f'Opened {page.url or parts[1]} ({identity_text}; {layout_text})'
+                    f'Opened {page.url or parts[1]} ({identity_text}; {layout_text}){cf_text}'
                     f'\n\nInteractive elements on page:\n{snapshot_text}'
                 ),
                 'action': action,
@@ -8358,6 +8479,7 @@ class BrowserWorker:
 
         if action == 'snapshot':
             page = await self.require_page(session_id)
+            await self.settle_cloudflare_data_challenge(page)
             args_str = ' '.join(parts[1:]).lower()
             is_full = '--full' in args_str or '-full' in args_str
 
@@ -9685,6 +9807,7 @@ class BrowserWorker:
             if len(parts) < 2:
                 raise ValueError('usage: get text|images|url|title [@ref]')
             page = await self.require_page(session_id)
+            await self.settle_cloudflare_data_challenge(page)
             kind = parts[1].lower()
             image_candidates = None
             image_discovery = None
@@ -10007,6 +10130,7 @@ class BrowserWorker:
 
         if action == 'screenshot':
             page = await self.require_page(session_id)
+            await self.settle_cloudflare_data_challenge(page)
             args_str = ' '.join(parts[1:]).lower()
             full_page = '--full' in args_str or '-full' in args_str or '-i' in args_str and ('full' in args_str)
             prefer_png = '--png' in args_str or '-png' in args_str

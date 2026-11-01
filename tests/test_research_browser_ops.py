@@ -9,7 +9,7 @@ from worker import BrowserWorker, GOOGLE_RESULTS_JS
 class BrowserResearchOpsTests(unittest.IsolatedAsyncioTestCase):
     def engine(self, results=None, text='Complete rendered text for offline fixture.'):
         engine = BrowserWorker()
-        tab = SimpleNamespace(send=AsyncMock(), get=AsyncMock(), close=AsyncMock())
+        tab = SimpleNamespace(send=AsyncMock(), get=AsyncMock(), close=AsyncMock(), add_handler=Mock())
         async def evaluate(js):
             if js == GOOGLE_RESULTS_JS:
                 return results or []

@@ -148,6 +148,44 @@ def normalize_origin(url: str) -> str | None:
     return None
 
 
+_SECOND_LEVEL_SUFFIXES = {'co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'or', 'ne', 'go'}
+
+
+def site_key(url: str) -> str | None:
+    """Approximate registrable domain (www.amiami.com and api.amiami.com -> amiami.com)."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or '').lower().rstrip('.')
+    except (TypeError, ValueError):
+        return None
+    if not host:
+        return None
+    if re.fullmatch(r'[\d.]+|[0-9a-f:]+', host):
+        return host
+    labels = host.split('.')
+    keep = 3 if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL_SUFFIXES else 2
+    return '.'.join(labels[-keep:])
+
+
+def same_site_challenged_hosts(page_url: str, challenged_urls) -> list[str]:
+    """Hosts of the page's own site whose requests Cloudflare answered with a challenge.
+
+    A data request (XHR/fetch or its CORS preflight) cannot solve a challenge, so the
+    page renders an error instead of its content. Third-party challenges are ignored.
+    """
+    site = site_key(page_url)
+    if site is None:
+        return []
+    hosts = []
+    for url in challenged_urls:
+        try:
+            host = urllib.parse.urlsplit(url).hostname
+        except (TypeError, ValueError):
+            continue
+        if host and site_key(url) == site and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
 def is_auth_url(url: str) -> bool:
     """Return whether a URL path itself is an explicit authentication destination."""
     try:
