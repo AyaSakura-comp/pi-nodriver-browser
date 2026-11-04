@@ -97,6 +97,9 @@ class WorkerLiveTests(unittest.TestCase):
         self.assertIn('Visible link', snap)
         self.assertNotIn('Clipped hidden link', snap, 'content clipped by overflow:hidden is not visible')
         self.assertIn('Inner button', snap, 'same-origin iframe content is part of the snapshot')
+        # PChome wraps the whole product box in role=button: its text and buttons must be listed.
+        self.assertIn('Delivery: 24h到貨, ships from the Taipei warehouse', snap)
+        self.ref(snap, r'button "Add to wishlist"')
 
         selected = self.ok(f'select {self.ref(snap, "select")} "R02 台北車站"')
         self.assertIn('Selected: R10 台北車站', selected['snapshot'])

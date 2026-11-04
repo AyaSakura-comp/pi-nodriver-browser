@@ -194,8 +194,10 @@
     }
     let role = count < MAX_ELEMENTS ? roleOf(el, s) : null;
     if (role && !NATIVE.has(el.tagName) && el.querySelector('input:not([type=hidden]),select,textarea')) role = null;
-    // A pointer-cursor container around real links/buttons: list the inner controls only.
-    if (role === 'clickable' && el.querySelector(NESTED)) role = null;
+    // A wrapper (pointer-cursor box, or a div with a widget role) around real links/buttons:
+    // list its text and inner controls. PChome marks the whole product box (title, price,
+    // delivery, cart buttons) role=button; as one element it was cut to a 120-char name.
+    if (role && !NATIVE.has(el.tagName) && el.querySelector(NESTED)) role = null;
     // A label whose own control is rendered: the control is listed (named by this label).
     if (role === 'clickable' && el.tagName === 'LABEL' && el.control) {
       const cs = style(el.control);
