@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Modal fixture</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body.locked { overflow: hidden; }
+  .tall { height: 3000px; }
+  #picker { display: none; position: fixed; inset: 0; background: #fff; z-index: 9999; }
+  #picker.open { display: block; }
+</style></head>
+<body>
+<h1>Job search</h1>
+<button onclick="document.getElementById('picker').classList.add('open'); document.body.classList.add('locked')">地區</button>
+<div class="tall">Python engineer listings</div>
+<!-- Like 104's region picker: a fixed dialog inside a wrapper at the end of a long page. -->
+<div style="position:relative"><div id="picker" role="dialog">
+  <h2>地區類別選單</h2>
+  <label><input type="checkbox"> 台北市</label>
+  <button onclick="document.getElementById('picker').classList.remove('open'); document.body.classList.remove('locked')">確定</button>
+</div></div>
+</body></html>

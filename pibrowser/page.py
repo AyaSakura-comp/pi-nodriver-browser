@@ -232,9 +232,11 @@ class Tab:
             raise PageError(f'{error} while loading {url}')
         return result
 
-    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0):
+    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True):
         """Wait until the document is parsed and its text and element count stop changing
-        for `quiet` seconds. Returns False at the deadline (the page may still be usable)."""
+        for `quiet` seconds. Returns False at the deadline (the page may still be usable).
+        blank_ok=False: a tab still on about:blank is not ready (a popup that has not
+        started loading its URL yet looks complete and quiet)."""
         deadline = time.monotonic() + timeout
         last = None
         since = time.monotonic()
@@ -250,7 +252,7 @@ class Tab:
                 if self.chrome.conn.closed:
                     raise CDPClosed('browser connection closed')
                 state = None
-            if state and state[0] != 'loading' and state[1] >= min_chars:
+            if state and state[0] != 'loading' and state[1] >= min_chars and (blank_ok or state[3] != 'about:blank'):
                 fingerprint = (state[1], state[2], state[3])
                 if fingerprint == last:
                     if time.monotonic() - since >= quiet:

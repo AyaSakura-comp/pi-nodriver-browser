@@ -26,7 +26,7 @@ class FakeTab:
         self.url = url
         await self.chrome.navigate_hook(self, url)
 
-    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0):
+    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True):
         return True
 
     async def eval(self, expression, *, timeout=10.0, await_promise=False):
@@ -194,6 +194,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.stopped)
         self.assertIsNot(self.service.browser, first)
         self.assertEqual(self.service.restarts, 1)
+
+    async def test_a_slow_but_working_browser_is_kept(self):
+        slow = self.service.browser
+        timeouts = []
+
+        async def probe(timeout=5.0):
+            timeouts.append(timeout)
+            return timeout > 5.0  # misses 5 s on a busy machine, answers the long probe
+        slow.probe = probe
+        await self.service.ensure_browser()
+        self.assertIs(self.service.browser, slow)
+        self.assertEqual(self.service.restarts, 0)
+        self.assertEqual(timeouts, [5.0, worker.SLOW_PROBE_SECONDS])
 
     async def test_recent_probe_is_reused_within_max_age(self):
         with mock.patch.object(FakeChrome, 'probe', side_effect=AssertionError('probed')):

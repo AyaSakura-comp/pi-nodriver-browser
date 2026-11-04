@@ -27,9 +27,16 @@ MARKER = b'__PI_NODRIVER__'
 class WorkerLiveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(SITE))
-        handler.log_message = lambda *args: None
-        cls.http = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith('/slow'):
+                    time.sleep(1.5)  # a popup stays on about:blank until this answers
+                return super().do_GET()
+
+        cls.http = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=str(SITE)))
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.base = f'http://127.0.0.1:{cls.http.server_address[1]}'
         cls.tmp = tempfile.TemporaryDirectory()
@@ -124,6 +131,13 @@ class WorkerLiveTests(unittest.TestCase):
         result = self.ok('back')
         self.assertIn('/fixture.html', result['url'])
 
+        slow = self.ref(result['snapshot'], r'button "Open scripted report"')
+        result = self.ok(f'click {slow}')
+        self.assertIn('/slow-report.html', result['url'], 'a popup is read after it loads, not on about:blank')
+        self.assertIn('Slow report loaded', result['snapshot'])
+        result = self.ok('back')
+        self.assertIn('/fixture.html', result['url'])
+
         snap = result['snapshot']
         result = self.ok(f'type {self.ref(snap, "textbox")} 手機散熱器 --submit')
         self.assertIn('/results.html?q=', result['url'])
@@ -134,6 +148,15 @@ class WorkerLiveTests(unittest.TestCase):
         shot = self.ok('screenshot')
         self.assertTrue(Path(shot['path']).stat().st_size > 1000)
         self.ok('session-cleanup')
+
+    def test_open_dialog_is_listed_first(self):
+        snap = self.ok(f'open {self.base}/modal.html', session='modal')['snapshot']
+        snap = self.ok(f'click {self.ref(snap, r"button \"地區\"")}', session='modal')['snapshot']
+        dialog = snap.split('[dialog]', 1)[1].split('[/dialog]', 1)[0]
+        self.assertIn('地區類別選單', dialog)
+        self.ref(dialog, r'checkbox "台北市"')
+        self.ref(dialog, r'button "確定"')
+        self.ok('session-cleanup', session='modal')
 
     def test_crawl_and_health(self):
         result = self.ok(f'crawl {self.base}/results.html?q=abc {self.base}/missing-page.html')

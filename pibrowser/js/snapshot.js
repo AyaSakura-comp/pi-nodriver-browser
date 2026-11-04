@@ -152,8 +152,23 @@
   // clip: the visible box left by ancestors with overflow hidden/clip (null = none).
   // Content scrolled inside auto/scroll panes is kept, like content below the fold.
   const intersects = (r, c) => r.right > c.left - 1 && r.left < c.right + 1 && r.bottom > c.top - 1 && r.top < c.bottom + 1;
+  // Open dialogs are listed first: they cover the page, but often sit at the end of the
+  // DOM (past the character budget) or inside a wrapper below the fold that the clip test
+  // drops while the page's scroll is locked (104's region picker).
+  const vw = window.innerWidth;
+  const dialogs = [];
+  for (const el of document.querySelectorAll('dialog[open],[role=dialog],[role=alertdialog],[aria-modal=true]')) {
+    if (dialogs.some((d) => d.contains(el))) continue;
+    if (el.checkVisibility && !el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40 || r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) continue;
+    dialogs.push(el);
+  }
+  const listed = new Set(dialogs);
+
   const walk = (node, clip) => {
     if (truncated) return;
+    if (listed.has(node)) return;
     if (node.nodeType === Node.TEXT_NODE) {
       const text = node.nodeValue;
       if (text && text.trim()) buffer.push(text.trim());
@@ -243,6 +258,13 @@
     if (block) flush();
   };
 
+  for (const dialog of dialogs) {
+    flush();
+    push('[dialog]');
+    for (const child of dialog.childNodes) walk(child, null);
+    flush();
+    push('[/dialog]');
+  }
   if (document.body) walk(document.body, null);
   flush();
   const scroller = document.scrollingElement || document.documentElement;

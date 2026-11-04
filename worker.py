@@ -47,6 +47,7 @@ MAX_SESSION_TABS = int(os.environ.get('PI_NODRIVER_MAX_TABS', '12'))
 IDLE_TAB_SECONDS = float(os.environ.get('PI_BROWSER_IDLE_TAB_SECONDS', '1800'))
 HEALTH_INTERVAL = float(os.environ.get('PI_BROWSER_HEALTH_INTERVAL', '60'))
 COMMAND_PROBE_AGE = 30.0
+SLOW_PROBE_SECONDS = 20.0
 IDLE_PROBE_AGE = float(os.environ.get('PI_BROWSER_IDLE_PROBE_SECONDS', '300'))
 MAX_PAGE_TARGETS = 40
 JS_DIR = HERE / 'pibrowser' / 'js'
@@ -138,7 +139,15 @@ class BrowserService:
                 return self.chrome
             if self.chrome is not None:
                 started = time.monotonic()
-                if await self.chrome.probe():
+                healthy = await self.chrome.probe()
+                if not healthy and self.chrome.alive():
+                    # A loaded machine (a model loading, a CPU-bound job) can make a working
+                    # Chrome miss 5 s; a restart would close every conversation's window.
+                    # A wedged Chrome fails the long probe too.
+                    healthy = await self.chrome.probe(timeout=SLOW_PROBE_SECONDS)
+                    if healthy:
+                        log_event('probe_slow', ms=round((time.monotonic() - started) * 1000))
+                if healthy:
                     self.verified_at = time.monotonic()
                     return self.chrome
                 log_event('probe_failed', alive=self.chrome.alive(),
@@ -283,7 +292,7 @@ class BrowserService:
                 tab = new_tab
                 note = 'The action opened a new tab; you are now on it (back returns to the previous tab).'
                 break
-        await tab.wait_ready(8, quiet=0.6)
+        await tab.wait_ready(8, quiet=0.6, blank_ok=not note)
         return tab, note
 
     async def page_result(self, session_id, tab, *, action, note='', status=None, from_viewport=False):
