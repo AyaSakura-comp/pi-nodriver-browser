@@ -154,6 +154,17 @@
       if (el.getAttribute('aria-current') && el.getAttribute('aria-current') !== 'false') line += ' current';
     }
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') line += ' disabled';
+    // Item links (a job, a product, an article) show where they go, so an answer can give
+    // real links; menus and short links do not, to keep the snapshot small.
+    if (role === 'link' && /^https?:/.test(el.href || '') && name.length >= 4 &&
+        !el.closest('nav,header,footer,[role=navigation]')) {
+      try {
+        const u = new URL(el.href);
+        if (u.href.split('#')[0] !== location.href.split('#')[0]) {
+          line += ` → ${clean(u.origin === location.origin ? u.pathname + u.search : u.host + u.pathname + u.search, 100)}`;
+        }
+      } catch (e) {}
+    }
     return line;
   };
 

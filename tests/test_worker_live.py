@@ -145,6 +145,9 @@ class WorkerLiveTests(unittest.TestCase):
         result = self.ok('back')
         self.assertIn('/fixture.html', result['url'])
 
+        # Item links show where they go; menu links do not.
+        self.ref(result['snapshot'], r'link "Open report in new tab" → /newtab\.html')
+        self.ref(result['snapshot'], r'link "Menu results link"$')
         links = self.ok('get links')['text'].split('\n')
         self.assertIn(f'{self.base}/newtab.html', links)
 

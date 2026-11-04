@@ -219,7 +219,7 @@ test("a link in the answer must be one the page links to", async () => {
       async request(command: string) {
         if (command === "screenshot") return { path: "/tmp/none.jpg" };
         if (command === "get text") return { text: page };
-        if (command === "get links") return { text: "https://www.104.com.tw/job/89657754\nhttps://www.104.com.tw/" };
+        if (command === "get links") return { text: "https://www.104.com.tw/job/89657754?jobsource=jolist_b\nhttps://www.104.com.tw/" };
         return { url: "https://www.104.com.tw/jobs/search/?keyword=Python", title: "Jobs", snapshot: page };
       },
     };
@@ -238,5 +238,16 @@ test("a link in the answer must be one the page links to", async () => {
   assert.equal(made.status, "TASK_UNVERIFIED");
   assert.deepEqual(made.missing_evidence, ["link not on the page: https://www.104.com.tw/job/69x4g"]);
   assert.equal(made.reason, "the answer has links that are not on the page");
+});
+
+test("a link's address does not trip the irreversible gate", async () => {
+  const page = PAGE('[e7] link "購物說明" → /help/checkout-guide');
+  const next = PAGE("購物說明 退換貨");
+  const h = harness(['{"action":"click","ref":"e7"}', '{"action":"done","answer":"退換貨","evidence":["退換貨"]}'],
+    { 'open "https://shop.example/item"': page, "click e7": next });
+  const result = await h.run("看購物說明");
+  assert.ok(h.sent.includes("click e7"));
+  assert.equal(result.status, "TASK_DONE");
+  assert.ok(result.steps[1].startsWith('click link "購物說明" →'), result.steps[1]);
 });
 

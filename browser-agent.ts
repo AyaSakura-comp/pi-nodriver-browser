@@ -76,7 +76,7 @@ Rules:
 - Among similar options (suggestions, stations, products), choose the one whose name equals what the goal names; an option with extra words ("-環島", "Pro", "2入組") is a different item.
 - Reply done as soon as the page shows what the goal asks for; do not keep browsing. For a list, give the top items with their prices or key facts.
 - evidence: 1-3 short quotes copied character for character from the current page.
-- The snapshot does not show link addresses: never write a URL you did not see (the URL line at the top is the current page's). Name the item instead, or open it and report its URL.
+- Item links show where they go after →, a path starting with / is on the current site (the URL line at the top). Never write a URL you did not see.
 - Never type passwords, OTP/verification codes, card numbers or personal data unless the goal gives them. At a login or verification wall the goal cannot pass, stop with needs_input and list the fields the page asks for.
 - Never buy, pay, check out, place or submit an order, delete, unsubscribe or log out unless the goal asks for it and says it is confirmed; otherwise stop with needs_confirm. Add to cart only when the goal asks for it.
 - CAPTCHA, "unusual traffic" or app-only pages: stop with blocked.
@@ -148,7 +148,9 @@ function normalize(text: string): string {
 
 function elementLine(snapshot: string, ref: string): string | undefined {
   const match = snapshot.match(new RegExp(`^\\[${ref}\\] .*$`, "m"));
-  return match?.[0];
+  // Without the link's " → /path": gates and step labels judge what the element says
+  // (a link to /checkout-guide is not a checkout button).
+  return match?.[0].replace(/ → \S+$/, "");
 }
 
 function describeElement(line: string | undefined, ref: string): string {
@@ -342,16 +344,20 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         const haystack = normalize(pageText);
         const missing = evidence.filter((e: string) => !haystack.includes(normalize(e.replace(/^["'「『]|["'」』]$/g, ""))));
         // A URL in the answer must be one the page links to (or the page itself, or one the goal
-        // gave): the snapshot shows no addresses, and the planner made up 104 job links.
+        // gave): asked for 104 job links, the planner made up addresses. Query strings and
+        // fragments may be dropped (a link's tracking parameters).
         const urls = [...new Set(answer.match(/https?:\/\/[^\s"'<>()（）\]｜|，、]+/g) ?? [])].map((u) => u.replace(/[.,;:!?。]+$/, ""));
         if (urls.length) {
           let links = "";
           try {
             links = String((await browser("get links")).text ?? "");
           } catch {}
-          const known = new Set([...links.split("\n"), page.url ?? "", options.url ?? ""].map((u) => u.replace(/\/$/, "")));
+          const bare = (u: string) => u.split(/[?#]/)[0].replace(/\/$/, "");
+          const known = new Set([...links.split("\n"), page.url ?? "", options.url ?? ""].flatMap((u) => [u.replace(/\/$/, ""), bare(u)]));
           for (const url of urls) {
-            if (!known.has(url.replace(/\/$/, "")) && !goal.includes(url) && !pageText.includes(url)) missing.push(`link not on the page: ${url}`);
+            if (!known.has(url.replace(/\/$/, "")) && !known.has(bare(url)) && !goal.includes(url) && !pageText.includes(url)) {
+              missing.push(`link not on the page: ${url}`);
+            }
           }
         }
         progress(`✅ done`);

@@ -12,6 +12,7 @@
 <button onclick="alert('Saved!'); document.getElementById('status').textContent='after alert'">Save with alert</button>
 <p id="status">idle</p>
 <a href="/newtab.html" target="_blank">Open report in new tab</a>
+<nav><a href="/results.html?q=menu">Menu results link</a></nav>
 <!-- Like some ad links: the tab opens on about:blank and is pointed at its page later. -->
 <button onclick="const w = window.open('', '_blank'); setTimeout(() => { w.location.href = '/slow-report.html'; }, 1200)">Open scripted report</button>
 <iframe src="/inner.html" title="inner frame" width="320" height="60"></iframe>
