@@ -32,7 +32,9 @@ browser-level health check called it healthy and every `open` timed out until th
 worker was restarted by hand. Now:
 
 - every CDP call has a timeout, so a hung page becomes an error, never a hang;
-- a page command that times out triggers a probe; a failed probe kills the whole
+- a page command that times out triggers a probe (a probe that misses 5 s gets a second,
+  20 s one: a loaded machine is not a wedged browser, and a restart closes every
+  conversation's window); a failed probe kills the whole
   Chrome process group and starts a new Chrome, and `open`/`snapshot`/`crawl` are
   retried once on it (measured: frozen Chrome → `open` succeeded in 15.6 s);
 - when idle, Chrome is probed every 5 minutes (`PI_BROWSER_IDLE_PROBE_SECONDS`) and a
@@ -57,9 +59,13 @@ and `~/.pi/agent/nodriver-browser-events.jsonl`; Chrome's own log is
 `/chat/completions`, otherwise `PI_BROWSER_AGENT_URL`/`PI_BROWSER_AGENT_MODEL`, default
 local `qwen3.8-flash` on :8090) reads a page snapshot and answers with one JSON action
 per step: `click`, `type` (+submit), `select` (dropdowns; on anything else it is a click), `press`, `scroll`, `back`,
-`google` (Google search), `open` (only URLs written in the goal), `done`, `stop`. At most 20 steps /
-150 s. The snapshot lists visible text in page order with interactive elements inline
-as `[eN] role "name"`, so a price sits next to its product link.
+`google` (Google search), `open` (a URL from the goal, any site's home page, or a page on a
+site the goal or the current page names; a guessed deep link elsewhere is refused), `done`,
+`stop`. At most 20 steps / 150 s. The snapshot lists visible text in page order with
+interactive elements inline as `[eN] role "name"`, so a price sits next to its product link.
+Open dialogs come first (`[dialog]` … `[/dialog]`); a `role=button`/clickable wrapper that
+holds real controls is listed as its text and controls (PChome's product box); a tab opened
+by a click is read once it has left `about:blank`.
 
 Results: `TASK_DONE` (answer whose evidence quotes were found on the page),
 `TASK_UNVERIFIED`, `TASK_NEEDS_INPUT` (login/OTP the goal does not give),

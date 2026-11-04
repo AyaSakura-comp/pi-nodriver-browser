@@ -78,7 +78,7 @@ test("the same action three times on an unchanged page stops the task", async ()
   assert.equal(h.sent.filter((c) => c === "click e1").length, 2);
 });
 
-test("open only accepts URLs written in the goal", async () => {
+test("open refuses a guessed deep link on a site nothing mentions", async () => {
   const page = PAGE("[e1] link \"home\"");
   const h = harness(['{"action":"open","url":"https://guessed.example/deep/link"}', '{"action":"stop","status":"failed","reason":"x"}'],
     { 'open "https://shop.example/item"': page });
@@ -131,4 +131,23 @@ test("a planner that cannot produce actions hands the task to the fallback plann
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("open takes pages on a site the current page shows and any site's home page", async () => {
+  const results = PAGE('[e1] link "行動電源 - PChome 24h購物 https://24h.pchome.com.tw › 通訊"');
+  const h = harness([
+    '{"action":"open","url":"https://24h.pchome.com.tw/search/?q=%E8%A1%8C%E5%8B%95%E9%9B%BB%E6%BA%90"}',
+    '{"action":"open","url":"https://www.thsrc.com.tw/"}',
+    '{"action":"open","url":"https://made-up.example/deep/page"}',
+    '{"action":"stop","status":"failed","reason":"x"}',
+  ], {
+    'open "https://shop.example/item"': results,
+    'open "https://24h.pchome.com.tw/search/?q=%E8%A1%8C%E5%8B%95%E9%9B%BB%E6%BA%90"': PAGE("搜尋結果"),
+    'open "https://www.thsrc.com.tw/"': PAGE("台灣高鐵"),
+  });
+  const result = await h.run("查行動電源和高鐵");
+  assert.ok(h.sent.includes('open "https://24h.pchome.com.tw/search/?q=%E8%A1%8C%E5%8B%95%E9%9B%BB%E6%BA%90"'));
+  assert.ok(h.sent.includes('open "https://www.thsrc.com.tw/"'));
+  assert.ok(!h.sent.some((c) => c.includes("made-up.example")));
+  assert.ok(result.steps.some((step) => step.includes("made-up.example") && step.includes("refused")));
 });

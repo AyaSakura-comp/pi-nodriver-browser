@@ -65,7 +65,7 @@ Reply with exactly one JSON object and nothing else. Actions:
 {"action":"scroll","direction":"down"}  (down, up, top, bottom)
 {"action":"back"}
 {"action":"google","query":"keywords"}  (Google search: only to find a site, or when this site is wrong or broken)
-{"action":"open","url":"https://..."}  (only a URL that is written in the goal)
+{"action":"open","url":"https://..."}  (a URL from the goal, a site's home page, or a page on a site shown on the current page; never a guessed deep link)
 {"action":"done","answer":"the result the goal asks for, with exact names, prices, dates, numbers","evidence":["short quote copied exactly from the page"]}
 {"action":"stop","status":"needs_input|needs_confirm|blocked|failed","reason":"why, and what is needed"}
 
@@ -154,6 +154,24 @@ function describeElement(line: string | undefined, ref: string): string {
   if (!line) return ref;
   const body = line.replace(/^\[e\d+\]\s*/, "");
   return body.length > 70 ? body.slice(0, 69) + "…" : body;
+}
+
+/** open takes a URL from the goal or the start URL, a Google search, any site's home page,
+ * or a page on a site the goal, start URL or current page names (a search result shows its
+ * host). Refused: a deep link the planner guessed on a site nothing mentions. */
+function openAllowed(url: string, goal: string, start: string | undefined, page: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+  if (goal.includes(url) || url === start) return true;
+  if (/^www\.google\.[a-z.]+$/.test(u.hostname) && u.pathname === "/search") return true;
+  if (u.pathname === "/" && !u.search) return true;
+  const host = u.hostname.toLowerCase().replace(/^www\./, "");
+  return [goal, start ?? "", page].some((text) => text.toLowerCase().includes(host));
 }
 
 function shortUrl(url: string | undefined): string {
@@ -383,10 +401,9 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
       label = `🔎 google ${quote(query)}`;
     } else if (kind === "open") {
       const url = String(action.url ?? "").trim();
-      const allowed = url && (goal.includes(url) || url === options.url || /^https:\/\/www\.google\.[a-z.]+\/search\?/.test(url));
-      if (!allowed) {
-        lastError = `open only accepts a URL written in the goal (${url || "none given"}); use search or click links instead`;
-        steps.push(`open ${url} → refused (not in the goal)`);
+      if (!openAllowed(url, goal, options.url, snapshot)) {
+        lastError = `open does not take a guessed link on a site that is not in the goal or on this page (${url || "none given"}); open the site's home page, search, or click links instead`;
+        steps.push(`open ${url} → refused (guessed link)`);
         continue;
       }
       command = `open ${quote(url)}`;
