@@ -145,6 +145,9 @@ class WorkerLiveTests(unittest.TestCase):
         result = self.ok('back')
         self.assertIn('/fixture.html', result['url'])
 
+        links = self.ok('get links')['text'].split('\n')
+        self.assertIn(f'{self.base}/newtab.html', links)
+
         shot = self.ok('screenshot')
         self.assertTrue(Path(shot['path']).stat().st_size > 1000)
         self.ok('session-cleanup')

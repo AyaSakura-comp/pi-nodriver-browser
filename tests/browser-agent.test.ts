@@ -212,3 +212,31 @@ test("the tool's hard time limit ends the task with its steps; a cancel still th
   }
 });
 
+test("a link in the answer must be one the page links to", async () => {
+  const page = PAGE('[e5] link "Python 工程師"\n百商數位');
+  const run = async (answer: string) => {
+    const worker = {
+      async request(command: string) {
+        if (command === "screenshot") return { path: "/tmp/none.jpg" };
+        if (command === "get text") return { text: page };
+        if (command === "get links") return { text: "https://www.104.com.tw/job/89657754\nhttps://www.104.com.tw/" };
+        return { url: "https://www.104.com.tw/jobs/search/?keyword=Python", title: "Jobs", snapshot: page };
+      },
+    };
+    const realFetch = globalThis.fetch;
+    const reply = JSON.stringify({ action: "done", answer, evidence: ["百商數位"] });
+    globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: reply } }] }))) as typeof fetch;
+    try {
+      return await runBrowserTask({ goal: "Python 職缺", url: "https://www.104.com.tw/jobs/search/?keyword=Python", session: "t", worker,
+        llm: { endpoint: "http://llm/chat", model: "m", local: true } });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+  assert.equal((await run("Python 工程師｜百商數位｜https://www.104.com.tw/job/89657754")).status, "TASK_DONE");
+  const made = await run("Python 工程師｜百商數位｜https://www.104.com.tw/job/69x4g");
+  assert.equal(made.status, "TASK_UNVERIFIED");
+  assert.deepEqual(made.missing_evidence, ["link not on the page: https://www.104.com.tw/job/69x4g"]);
+  assert.equal(made.reason, "the answer has links that are not on the page");
+});
+

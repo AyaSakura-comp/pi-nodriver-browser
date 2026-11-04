@@ -443,8 +443,12 @@ class BrowserService:
                 value = await tab.eval('document.title')
             elif what == 'text':
                 value = await tab.eval("document.body ? document.body.innerText.slice(0, 60000) : ''", timeout=15)
+            elif what == 'links':
+                # Every link address on the page, for checking URLs an answer gives.
+                value = await tab.eval("[...new Set([...document.links].map((a) => a.href)"
+                                       ".filter((h) => /^https?:/.test(h)))].slice(0, 3000).join('\\n')", timeout=15)
             else:
-                raise ValueError('usage: get url|title|text')
+                raise ValueError('usage: get url|title|text|links')
             return {'action': 'get', 'text': value or ''}
         if action == 'screenshot':
             directory = DOWNLOADS / safe_name(session_id, 80)
