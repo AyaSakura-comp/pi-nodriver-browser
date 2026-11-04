@@ -111,13 +111,21 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
       const { llm, note } = await plannerFor(ctx);
       const started = Date.now();
       const lines = [`🎯 瀏覽任務：${goal}`];
-      const show = () => onUpdate?.({ content: [{ type: "text", text: lines.length > 14 ? [lines[0], "…", ...lines.slice(-12)].join("\n") : lines.join("\n") }], details: {} });
-      show();
+      // piweb shows one progress row per update from details.message (transport/web.ts).
+      const show = (message: string) => onUpdate?.({
+        content: [{ type: "text", text: lines.length > 14 ? [lines[0], "…", ...lines.slice(-12)].join("\n") : lines.join("\n") }],
+        details: { message },
+      });
+      show(lines[0]);
       const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(170_000)]);
       const result = await runBrowserTask({
         goal, url, confirm: params.confirm === true, session: `intent-${ctx.sessionManager.getSessionId()}`,
         worker, llm, signal: bounded,
-        onProgress: (line) => { lines.push(`${((Date.now() - started) / 1000).toFixed(1)}s ${line}`); show(); },
+        onProgress: (line) => {
+          const stamped = `${((Date.now() - started) / 1000).toFixed(1)}s ${line}`;
+          lines.push(stamped);
+          show(stamped);
+        },
       });
       const details = { ...result, planner: note };
       const content: any[] = [{ type: "text" as const, text: `${summary(result, goal, note)}\n\n\`\`\`json\n${JSON.stringify(details, null, 1)}\n\`\`\`` }];
