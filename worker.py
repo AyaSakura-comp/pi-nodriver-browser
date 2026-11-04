@@ -48,6 +48,7 @@ IDLE_TAB_SECONDS = float(os.environ.get('PI_BROWSER_IDLE_TAB_SECONDS', '1800'))
 HEALTH_INTERVAL = float(os.environ.get('PI_BROWSER_HEALTH_INTERVAL', '60'))
 COMMAND_PROBE_AGE = 30.0
 SLOW_PROBE_SECONDS = 20.0
+POPUP_URL = re.compile(r'(https?:|about:blank)')
 IDLE_PROBE_AGE = float(os.environ.get('PI_BROWSER_IDLE_PROBE_SECONDS', '300'))
 MAX_PAGE_TARGETS = 40
 JS_DIR = HERE / 'pibrowser' / 'js'
@@ -268,8 +269,12 @@ class BrowserService:
         return len(tabs)
 
     def _new_popup(self, opener_id, since):
+        """The tab an action opened: one this tab opened, else a new web page nobody here
+        owns. Never Chrome's own UI targets (chrome://omnibox-popup appeared after a click
+        on thsrc.com.tw) or another session's or job's tab."""
         candidates = [info for info in self.chrome.pages()
-                      if info['targetId'] not in self.owned and info['_seen'] >= since]
+                      if info['targetId'] not in self.owned and info['targetId'] not in self.temp_tabs
+                      and info['_seen'] >= since and POPUP_URL.match(info.get('url') or 'about:blank')]
         preferred = [info for info in candidates if info.get('openerId') == opener_id]
         return (preferred or candidates or [None])[0]
 

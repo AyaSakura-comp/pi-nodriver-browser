@@ -195,6 +195,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(self.service.browser, first)
         self.assertEqual(self.service.restarts, 1)
 
+    async def test_a_click_adopts_its_popup_but_never_chrome_ui_or_other_tabs(self):
+        tab = await self.service.session_tab('s1', create=True)
+        started = time.monotonic() - 1
+        self.chrome.targets['ui'] = {'targetId': 'ui', 'type': 'page', '_seen': time.monotonic(),
+                                     'url': 'chrome://omnibox-popup.top-chrome/'}
+        crawl = await self.service._temp_tab('job-a')
+        self.chrome.targets[crawl.target_id]['url'] = 'https://example.com/crawl'
+        self.assertIsNone(self.service._new_popup(tab.target_id, started))
+        self.chrome.targets['pop'] = {'targetId': 'pop', 'type': 'page', '_seen': time.monotonic(),
+                                      'url': 'about:blank', 'openerId': tab.target_id}
+        self.assertEqual(self.service._new_popup(tab.target_id, started)['targetId'], 'pop')
+
     async def test_a_slow_but_working_browser_is_kept(self):
         slow = self.service.browser
         timeouts = []
