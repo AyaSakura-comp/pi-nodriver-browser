@@ -107,6 +107,14 @@
     if (tag === 'INPUT' || tag === 'TEXTAREA') {
       if (!s && ['button', 'submit', 'reset'].includes((el.type || '').toLowerCase())) s = el.value;
       if (!s) s = el.title || el.alt || '';
+      // A box whose text is a sibling, not a <label> (104: <span><input></span><span>台北市</span>):
+      // name it after the nearest enclosing row with short text.
+      if (!s && /^(checkbox|radio)$/i.test(el.type || '')) {
+        for (let up = el.parentElement, depth = 0; up && depth < 3 && !s; up = up.parentElement, depth++) {
+          const text = clean(up.innerText, 200);
+          if (text && text.length <= 40) s = text;
+        }
+      }
       placeholder = el.placeholder || '';
     } else if (!s && tag !== 'SELECT') {
       s = el.innerText || '';

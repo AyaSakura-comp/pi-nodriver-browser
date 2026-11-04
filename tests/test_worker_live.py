@@ -155,6 +155,7 @@ class WorkerLiveTests(unittest.TestCase):
         dialog = snap.split('[dialog]', 1)[1].split('[/dialog]', 1)[0]
         self.assertIn('地區類別選單', dialog)
         self.ref(dialog, r'checkbox "台北市"')
+        self.ref(dialog, r'checkbox "新北市"')  # named after its row: the text is a sibling
         self.ref(dialog, r'button "確定"')
         self.ok('session-cleanup', session='modal')
 

@@ -151,3 +151,31 @@ test("open takes pages on a site the current page shows and any site's home page
   assert.ok(!h.sent.some((c) => c.includes("made-up.example")));
   assert.ok(result.steps.some((step) => step.includes("made-up.example") && step.includes("refused")));
 });
+
+test("scrolling through a long page is progress; the bottom of the page is not", async () => {
+  const at = (y: number) => `URL: https://shop.example/list\nTitle: List\nScroll: ${y}/3000px (viewport 600px)\n---\nitems from ${y}`;
+  const views = [at(600), at(1200), at(1800), at(2400), at(2400), at(2400), at(2400)];
+  const sent: string[] = [];
+  let current = at(0);
+  const worker = {
+    async request(command: string) {
+      sent.push(command);
+      if (command === "screenshot") return { path: "/tmp/none.jpg" };
+      if (command === "get text") return { text: current };
+      if (command === "scroll down") current = views.shift() ?? current;
+      return { url: "https://shop.example/list", title: "List", snapshot: current };
+    },
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: '{"action":"scroll","direction":"down"}' } }] }))) as typeof fetch;
+  try {
+    const result = await runBrowserTask({ goal: "read the whole list", url: "https://shop.example/list", session: "t", worker,
+      llm: { endpoint: "http://llm/chat", model: "m", local: true } });
+    assert.equal(result.status, "TASK_STOPPED");
+    assert.equal(sent.filter((c) => c === "scroll down").length, 6, "four scrolls that move the page, then two at the bottom");
+    assert.ok(result.steps.includes("scroll down → now at 600/3000px"), result.steps.join("\n"));
+    assert.ok(result.steps.includes("scroll down → no visible change"), result.steps.join("\n"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

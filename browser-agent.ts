@@ -174,6 +174,17 @@ function openAllowed(url: string, goal: string, start: string | undefined, page:
   return [goal, start ?? "", page].some((text) => text.toLowerCase().includes(host));
 }
 
+function fingerprint(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) hash = (Math.imul(hash, 31) + text.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(36);
+}
+
+/** "506/5584px" from the snapshot's "Scroll: 506/5584px (viewport 633px)" line. */
+function scrollPosition(snapshot: string): string {
+  return snapshot.match(/^Scroll: (\d+\/\d+px)/m)?.[1] ?? "";
+}
+
 function shortUrl(url: string | undefined): string {
   if (!url) return "";
   try {
@@ -347,7 +358,10 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     }
 
     // Loop guard: the same action on the same page three times means it is not working.
-    const key = `${kind}|${line ?? ref}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? ""}|${page.url ?? ""}`;
+    // Scrolling and keys move through one URL, so for them the page is what the snapshot
+    // shows: reading a long list scroll by scroll is progress, the end of the page is not.
+    const where = kind === "scroll" || kind === "press" ? `|${fingerprint(snapshot)}` : "";
+    const key = `${kind}|${line ?? ref}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? ""}|${page.url ?? ""}${where}`;
     const count = (repeats.get(key) ?? 0) + 1;
     repeats.set(key, count);
     if (count >= 3) {
@@ -416,8 +430,13 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     progress(label);
     try {
       const before = page.url;
+      const shown = fingerprint(snapshot);
       adopt(await browser(command));
-      const moved = page.url && page.url !== before ? ` → ${page.title || shortUrl(page.url)}` : " → same page";
+      // Say what changed: "same page" after a working scroll read as "scroll does nothing".
+      const moved = page.url && page.url !== before ? ` → ${page.title || shortUrl(page.url)}`
+        : fingerprint(snapshot) === shown ? " → no visible change"
+        : (kind === "scroll" || kind === "press") && scrollPosition(snapshot) ? ` → now at ${scrollPosition(snapshot)}`
+        : " → page updated";
       steps.push(`${label.replace(/^\S+\s/, "")}${moved}`);
       if (repeatNote) lastError = repeatNote + "Try something different or stop.";
     } catch (error) {
