@@ -196,13 +196,14 @@ function shortUrl(url: string | undefined): string {
   }
 }
 
-async function chat(llm: LlmConfig, messages: { role: string; content: string }[], signal?: AbortSignal): Promise<string> {
+async function chat(llm: LlmConfig, messages: { role: string; content: string }[], signal?: AbortSignal,
+  timeoutMs = 60_000): Promise<string> {
   const body: Record<string, unknown> = { model: llm.model, messages, max_tokens: 2000 };
   if (llm.local) {
     body.temperature = 0;
     body.chat_template_kwargs = { enable_thinking: false };
   }
-  const timeout = AbortSignal.timeout(60_000);
+  const timeout = AbortSignal.timeout(timeoutMs);
   const response = await fetch(llm.endpoint, {
     method: "POST",
     headers: { "content-type": "application/json", ...(llm.headers ?? {}) },
@@ -250,7 +251,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     let screenshot: string | undefined;
     if (page.url) {
       try {
-        screenshot = (await browser("screenshot")).path;
+        screenshot = (await worker.request("screenshot", session, AbortSignal.timeout(10_000))).path;
       } catch {}
     }
     const body = snapshot.split("\n---\n").slice(1).join("\n---\n");
@@ -262,192 +263,201 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     };
   };
 
-  if (options.url) {
-    progress(`🌐 open ${shortUrl(options.url)}`);
-    try {
-      adopt(await browser(`open ${quote(options.url)}`));
-      steps.push(`open ${options.url} → ${page.title || shortUrl(page.url)}`);
-    } catch (error) {
-      lastError = `open ${options.url} failed: ${(error as Error).message}`;
-      steps.push(lastError);
-    }
-  } else {
-    try {
-      adopt(await browser("snapshot"));
-    } catch {}
-  }
-
-  for (let step = 1; step <= maxSteps; step++) {
-    signal?.throwIfAborted();
-    if (Date.now() > deadline) break;
-    const history = steps.length ? steps.map((s, i) => `${i + 1}. ${s}`).join("\n") : "(none yet)";
-    const view = snapshot.length > MAX_SNAPSHOT_CHARS
-      ? snapshot.slice(0, MAX_SNAPSHOT_CHARS) + "\n(… snapshot cut; scroll down for more)" : snapshot;
-    const user = `Goal: ${goal}\nConfirmed by the user for irreversible steps: ${options.confirm ? "yes" : "no"}\n` +
-      `Step ${step} of at most ${maxSteps}. Steps so far:\n${history}\n` +
-      (lastError ? `Last action failed: ${lastError}\n` : "") +
-      `\nCurrent page:\n${view}\n\nReply with one JSON object.`;
-    let action: Record<string, any> | undefined;
-    let lastReply = "";
-    let callError = "";
-    for (let attempt = 0; attempt < 2 && !action; attempt++) {
-      const t = Date.now();
-      const messages = [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: user }];
-      if (attempt) messages.push({ role: "user", content: `Your reply was not one valid JSON action (it began: ${JSON.stringify(lastReply.slice(0, 160))}). Reply with ONLY one JSON object from the action list; write line breaks inside strings as \\n.` });
-      let reply = "";
+  try {
+    if (options.url) {
+      progress(`🌐 open ${shortUrl(options.url)}`);
       try {
-        reply = await chat(llm, messages, signal);
+        adopt(await browser(`open ${quote(options.url)}`));
+        steps.push(`open ${options.url} → ${page.title || shortUrl(page.url)}`);
       } catch (error) {
-        signal?.throwIfAborted();
-        llmMs += Date.now() - t;
-        callError = `browser planner model failed: ${(error as Error).message}`;
-        break;
+        lastError = `open ${options.url} failed: ${(error as Error).message}`;
+        steps.push(lastError);
       }
-      llmMs += Date.now() - t;
-      lastReply = reply;
-      action = parseAction(reply);
-      if (process.env.PI_BROWSER_AGENT_TRACE) progress(`· model: ${reply.replace(/\s+/g, " ").slice(0, 300)}`);
-    }
-    if (!action && options.fallbackLlm && options.fallbackLlm.model !== llm.model && !switched) {
-      // The conversation's model cannot drive the browser (seen: a 1.7B model answering with
-      // <tool_call> markup): continue the task on the known-good planner.
-      switched = `${llm.model} → ${options.fallbackLlm.model}`;
-      llm = options.fallbackLlm;
-      progress(`🔁 planner ${switched}`);
-      step--;
-      continue;
-    }
-    if (!action) {
-      return finish("TASK_FAILED", { reason: callError || "the planner model did not return a valid action twice in a row" });
-    }
-    lastError = "";
-    let kind = String(action.action).toLowerCase();
-    const ref = typeof action.ref === "string" ? action.ref.replace(/^@/, "").toLowerCase() : "";
-    const line = ref ? elementLine(snapshot, ref) : undefined;
-    // Models say "select" for "choose this result": on anything but a dropdown that is a click.
-    if (kind === "select" && line && !/^\[e\d+\] select /.test(line)) kind = "click";
-    if (kind === "search") kind = "google";
-
-    if (kind === "done") {
-      const answer = String(action.answer ?? "").trim();
-      const evidence = (Array.isArray(action.evidence) ? action.evidence : [action.evidence])
-        .map((e: unknown) => String(e ?? "").trim()).filter(Boolean).slice(0, 5);
-      let pageText = snapshot;
+    } else {
       try {
-        pageText += "\n" + String((await browser("get text")).text ?? "");
+        adopt(await browser("snapshot"));
       } catch {}
-      const haystack = normalize(pageText);
-      const missing = evidence.filter((e: string) => !haystack.includes(normalize(e.replace(/^["'「『]|["'」』]$/g, ""))));
-      progress(`✅ done`);
-      steps.push(`done`);
-      const verified = evidence.length > 0 && missing.length === 0;
-      return finish(verified ? "TASK_DONE" : "TASK_UNVERIFIED", {
-        answer, evidence, ...(missing.length ? { missing_evidence: missing } : {}),
-        ...(verified ? {} : { reason: evidence.length ? "some evidence quotes are not on the page" : "no evidence quoted" }),
-      });
-    }
-    if (kind === "stop") {
-      const status = String(action.status ?? "failed").toLowerCase();
-      const reason = String(action.reason ?? "").trim();
-      const mapped: TaskStatus = status.includes("input") ? "TASK_NEEDS_INPUT"
-        : status.includes("confirm") ? "TASK_NEEDS_CONFIRM"
-        : status.includes("block") ? "TASK_BLOCKED" : "TASK_FAILED";
-      progress(`🛑 ${mapped}: ${reason}`);
-      steps.push(`stop ${status}: ${reason}`);
-      return finish(mapped, { reason });
     }
 
-    // Loop guard: the same action on the same page three times means it is not working.
-    // Scrolling and keys move through one URL, so for them the page is what the snapshot
-    // shows: reading a long list scroll by scroll is progress, the end of the page is not.
-    const where = kind === "scroll" || kind === "press" ? `|${fingerprint(snapshot)}` : "";
-    const key = `${kind}|${line ?? ref}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? ""}|${page.url ?? ""}${where}`;
-    const count = (repeats.get(key) ?? 0) + 1;
-    repeats.set(key, count);
-    if (count >= 3) {
-      steps.push(`${kind} ${describeElement(line, ref)} repeated without progress`);
-      return finish("TASK_STOPPED", { reason: "the same action kept repeating without changing the page" });
-    }
-    const repeatNote = count === 2 ? "This exact action was already tried on this page and did not reach the goal; if it fails again the task stops. " : "";
-
-    let command = "";
-    let label = "";
-    if (kind === "click") {
-      if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; steps.push(`click ${ref} → not on the page`); continue; }
-      const name = describeElement(line, ref);
-      if (IRREVERSIBLE.test(line) && !options.confirm) {
-        steps.push(`click ${name} → not taken (irreversible)`);
-        return finish("TASK_NEEDS_CONFIRM", { reason: `the next step is an irreversible action: ${name}. Ask the user; call again with confirm=true only if they agree.` });
+    for (let step = 1; step <= maxSteps; step++) {
+      signal?.throwIfAborted();
+      if (Date.now() > deadline) break;
+      const history = steps.length ? steps.map((s, i) => `${i + 1}. ${s}`).join("\n") : "(none yet)";
+      const view = snapshot.length > MAX_SNAPSHOT_CHARS
+        ? snapshot.slice(0, MAX_SNAPSHOT_CHARS) + "\n(… snapshot cut; scroll down for more)" : snapshot;
+      const user = `Goal: ${goal}\nConfirmed by the user for irreversible steps: ${options.confirm ? "yes" : "no"}\n` +
+        `Step ${step} of at most ${maxSteps}. Steps so far:\n${history}\n` +
+        (lastError ? `Last action failed: ${lastError}\n` : "") +
+        `\nCurrent page:\n${view}\n\nReply with one JSON object.`;
+      let action: Record<string, any> | undefined;
+      let lastReply = "";
+      let callError = "";
+      for (let attempt = 0; attempt < 2 && !action; attempt++) {
+        const t = Date.now();
+        const messages = [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: user }];
+        if (attempt) messages.push({ role: "user", content: `Your reply was not one valid JSON action (it began: ${JSON.stringify(lastReply.slice(0, 160))}). Reply with ONLY one JSON object from the action list; write line breaks inside strings as \\n.` });
+        let reply = "";
+        try {
+          reply = await chat(llm, messages, signal, Math.max(5_000, Math.min(60_000, deadline - Date.now() + 15_000)));
+        } catch (error) {
+          signal?.throwIfAborted();
+          llmMs += Date.now() - t;
+          callError = `browser planner model failed: ${(error as Error).message}`;
+          break;
+        }
+        llmMs += Date.now() - t;
+        lastReply = reply;
+        action = parseAction(reply);
+        if (process.env.PI_BROWSER_AGENT_TRACE) progress(`· model: ${reply.replace(/\s+/g, " ").slice(0, 300)}`);
       }
-      if (ADD_TO_CART.test(line) && !/購物車|購物籃|cart|basket|bag|加入|下單|購買|buy/i.test(goal)) {
-        steps.push(`click ${name} → not taken (adds to cart)`);
-        return finish("TASK_NEEDS_CONFIRM", { reason: `the next step adds an item to the cart (${name}), which the goal did not ask for.` });
-      }
-      command = `click ${ref}`;
-      label = `🖱️ click ${name}`;
-    } else if (kind === "type" || kind === "fill") {
-      if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; steps.push(`type into ${ref} → not on the page`); continue; }
-      const text = String(action.text ?? action.value ?? "");
-      if (SECRET_FIELD.test(line) && text && !goal.includes(text)) {
-        steps.push(`type into ${describeElement(line, ref)} → not taken (secret not given in the goal)`);
-        return finish("TASK_NEEDS_INPUT", { reason: `the page asks for ${describeElement(line, ref)}; the goal does not give that value. Ask the user for it.` });
-      }
-      command = `type ${ref} ${quote(text)}${action.submit ? " --submit" : ""}`;
-      label = `⌨️ type ${quote(text)} into ${describeElement(line, ref)}${action.submit ? " + Enter" : ""}`;
-    } else if (kind === "select") {
-      if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; continue; }
-      command = `select ${ref} ${quote(String(action.option ?? action.value ?? ""))}`;
-      label = `🔽 select ${quote(String(action.option ?? action.value ?? ""))} in ${describeElement(line, ref)}`;
-    } else if (kind === "press") {
-      command = `press ${quote(String(action.key ?? "Enter"))}`;
-      label = `⌨️ press ${action.key ?? "Enter"}`;
-    } else if (kind === "scroll") {
-      const direction = ["down", "up", "top", "bottom"].includes(String(action.direction)) ? String(action.direction) : "down";
-      command = `scroll ${direction}`;
-      label = `📜 scroll ${direction}`;
-    } else if (kind === "back") {
-      command = "back";
-      label = "⬅️ back";
-    } else if (kind === "google") {
-      const query = String(action.query ?? "").trim();
-      if (!query) { lastError = "google needs a query"; continue; }
-      command = `open ${quote(`https://www.google.com/search?hl=zh-TW&gl=tw&q=${encodeURIComponent(query)}`)}`;
-      label = `🔎 google ${quote(query)}`;
-    } else if (kind === "open") {
-      const url = String(action.url ?? "").trim();
-      if (!openAllowed(url, goal, options.url, snapshot)) {
-        lastError = `open does not take a guessed link on a site that is not in the goal or on this page (${url || "none given"}); open the site's home page, search, or click links instead`;
-        steps.push(`open ${url} → refused (guessed link)`);
+      if (!action && options.fallbackLlm && options.fallbackLlm.model !== llm.model && !switched) {
+        // The conversation's model cannot drive the browser (seen: a 1.7B model answering with
+        // <tool_call> markup): continue the task on the known-good planner.
+        switched = `${llm.model} → ${options.fallbackLlm.model}`;
+        llm = options.fallbackLlm;
+        progress(`🔁 planner ${switched}`);
+        step--;
         continue;
       }
-      command = `open ${quote(url)}`;
-      label = `🌐 open ${shortUrl(url)}`;
-    } else {
-      lastError = `unknown action ${kind}`;
-      continue;
-    }
+      if (!action) {
+        return finish("TASK_FAILED", { reason: callError || "the planner model did not return a valid action twice in a row" });
+      }
+      lastError = "";
+      let kind = String(action.action).toLowerCase();
+      const ref = typeof action.ref === "string" ? action.ref.replace(/^@/, "").toLowerCase() : "";
+      const line = ref ? elementLine(snapshot, ref) : undefined;
+      // Models say "select" for "choose this result": on anything but a dropdown that is a click.
+      if (kind === "select" && line && !/^\[e\d+\] select /.test(line)) kind = "click";
+      if (kind === "search") kind = "google";
 
-    progress(label);
-    try {
-      const before = page.url;
-      const shown = fingerprint(snapshot);
-      adopt(await browser(command));
-      // Say what changed: "same page" after a working scroll read as "scroll does nothing".
-      const moved = page.url && page.url !== before ? ` → ${page.title || shortUrl(page.url)}`
-        : fingerprint(snapshot) === shown ? " → no visible change"
-        : (kind === "scroll" || kind === "press") && scrollPosition(snapshot) ? ` → now at ${scrollPosition(snapshot)}`
-        : " → page updated";
-      steps.push(`${label.replace(/^\S+\s/, "")}${moved}`);
-      if (repeatNote) lastError = repeatNote + "Try something different or stop.";
-    } catch (error) {
-      lastError = String((error as Error).message || error).replace(/^\w+Error: /, "");
-      steps.push(`${label.replace(/^\S+\s/, "")} → failed: ${lastError.slice(0, 160)}`);
-      if (/STALE_REF|not on the page/.test(lastError)) {
-        try { adopt(await browser("snapshot")); } catch {}
+      if (kind === "done") {
+        const answer = String(action.answer ?? "").trim();
+        const evidence = (Array.isArray(action.evidence) ? action.evidence : [action.evidence])
+          .map((e: unknown) => String(e ?? "").trim()).filter(Boolean).slice(0, 5);
+        let pageText = snapshot;
+        try {
+          pageText += "\n" + String((await browser("get text")).text ?? "");
+        } catch {}
+        const haystack = normalize(pageText);
+        const missing = evidence.filter((e: string) => !haystack.includes(normalize(e.replace(/^["'「『]|["'」』]$/g, ""))));
+        progress(`✅ done`);
+        steps.push(`done`);
+        const verified = evidence.length > 0 && missing.length === 0;
+        return finish(verified ? "TASK_DONE" : "TASK_UNVERIFIED", {
+          answer, evidence, ...(missing.length ? { missing_evidence: missing } : {}),
+          ...(verified ? {} : { reason: evidence.length ? "some evidence quotes are not on the page" : "no evidence quoted" }),
+        });
+      }
+      if (kind === "stop") {
+        const status = String(action.status ?? "failed").toLowerCase();
+        const reason = String(action.reason ?? "").trim();
+        const mapped: TaskStatus = status.includes("input") ? "TASK_NEEDS_INPUT"
+          : status.includes("confirm") ? "TASK_NEEDS_CONFIRM"
+          : status.includes("block") ? "TASK_BLOCKED" : "TASK_FAILED";
+        progress(`🛑 ${mapped}: ${reason}`);
+        steps.push(`stop ${status}: ${reason}`);
+        return finish(mapped, { reason });
+      }
+
+      // Loop guard: the same action on the same page three times means it is not working.
+      // Scrolling and keys move through one URL, so for them the page is what the snapshot
+      // shows: reading a long list scroll by scroll is progress, the end of the page is not.
+      const where = kind === "scroll" || kind === "press" ? `|${fingerprint(snapshot)}` : "";
+      const key = `${kind}|${line ?? ref}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? ""}|${page.url ?? ""}${where}`;
+      const count = (repeats.get(key) ?? 0) + 1;
+      repeats.set(key, count);
+      if (count >= 3) {
+        steps.push(`${kind} ${describeElement(line, ref)} repeated without progress`);
+        return finish("TASK_STOPPED", { reason: "the same action kept repeating without changing the page" });
+      }
+      const repeatNote = count === 2 ? "This exact action was already tried on this page and did not reach the goal; if it fails again the task stops. " : "";
+
+      let command = "";
+      let label = "";
+      if (kind === "click") {
+        if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; steps.push(`click ${ref} → not on the page`); continue; }
+        const name = describeElement(line, ref);
+        if (IRREVERSIBLE.test(line) && !options.confirm) {
+          steps.push(`click ${name} → not taken (irreversible)`);
+          return finish("TASK_NEEDS_CONFIRM", { reason: `the next step is an irreversible action: ${name}. Ask the user; call again with confirm=true only if they agree.` });
+        }
+        if (ADD_TO_CART.test(line) && !/購物車|購物籃|cart|basket|bag|加入|下單|購買|buy/i.test(goal)) {
+          steps.push(`click ${name} → not taken (adds to cart)`);
+          return finish("TASK_NEEDS_CONFIRM", { reason: `the next step adds an item to the cart (${name}), which the goal did not ask for.` });
+        }
+        command = `click ${ref}`;
+        label = `🖱️ click ${name}`;
+      } else if (kind === "type" || kind === "fill") {
+        if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; steps.push(`type into ${ref} → not on the page`); continue; }
+        const text = String(action.text ?? action.value ?? "");
+        if (SECRET_FIELD.test(line) && text && !goal.includes(text)) {
+          steps.push(`type into ${describeElement(line, ref)} → not taken (secret not given in the goal)`);
+          return finish("TASK_NEEDS_INPUT", { reason: `the page asks for ${describeElement(line, ref)}; the goal does not give that value. Ask the user for it.` });
+        }
+        command = `type ${ref} ${quote(text)}${action.submit ? " --submit" : ""}`;
+        label = `⌨️ type ${quote(text)} into ${describeElement(line, ref)}${action.submit ? " + Enter" : ""}`;
+      } else if (kind === "select") {
+        if (!line) { lastError = `${ref || "(no ref)"} is not in the current snapshot`; continue; }
+        command = `select ${ref} ${quote(String(action.option ?? action.value ?? ""))}`;
+        label = `🔽 select ${quote(String(action.option ?? action.value ?? ""))} in ${describeElement(line, ref)}`;
+      } else if (kind === "press") {
+        command = `press ${quote(String(action.key ?? "Enter"))}`;
+        label = `⌨️ press ${action.key ?? "Enter"}`;
+      } else if (kind === "scroll") {
+        const direction = ["down", "up", "top", "bottom"].includes(String(action.direction)) ? String(action.direction) : "down";
+        command = `scroll ${direction}`;
+        label = `📜 scroll ${direction}`;
+      } else if (kind === "back") {
+        command = "back";
+        label = "⬅️ back";
+      } else if (kind === "google") {
+        const query = String(action.query ?? "").trim();
+        if (!query) { lastError = "google needs a query"; continue; }
+        command = `open ${quote(`https://www.google.com/search?hl=zh-TW&gl=tw&q=${encodeURIComponent(query)}`)}`;
+        label = `🔎 google ${quote(query)}`;
+      } else if (kind === "open") {
+        const url = String(action.url ?? "").trim();
+        if (!openAllowed(url, goal, options.url, snapshot)) {
+          lastError = `open does not take a guessed link on a site that is not in the goal or on this page (${url || "none given"}); open the site's home page, search, or click links instead`;
+          steps.push(`open ${url} → refused (guessed link)`);
+          continue;
+        }
+        command = `open ${quote(url)}`;
+        label = `🌐 open ${shortUrl(url)}`;
+      } else {
+        lastError = `unknown action ${kind}`;
+        continue;
+      }
+
+      progress(label);
+      try {
+        const before = page.url;
+        const shown = fingerprint(snapshot);
+        adopt(await browser(command));
+        // Say what changed: "same page" after a working scroll read as "scroll does nothing".
+        const moved = page.url && page.url !== before ? ` → ${page.title || shortUrl(page.url)}`
+          : fingerprint(snapshot) === shown ? " → no visible change"
+          : (kind === "scroll" || kind === "press") && scrollPosition(snapshot) ? ` → now at ${scrollPosition(snapshot)}`
+          : " → page updated";
+        steps.push(`${label.replace(/^\S+\s/, "")}${moved}`);
+        if (repeatNote) lastError = repeatNote + "Try something different or stop.";
+      } catch (error) {
+        lastError = String((error as Error).message || error).replace(/^\w+Error: /, "");
+        steps.push(`${label.replace(/^\S+\s/, "")} → failed: ${lastError.slice(0, 160)}`);
+        if (/STALE_REF|not on the page/.test(lastError)) {
+          try { adopt(await browser("snapshot")); } catch {}
+        }
       }
     }
+    return finish("TASK_STOPPED", {
+      reason: Date.now() > deadline ? "time budget used up before the goal was reached" : `stopped after ${maxSteps} steps without reaching the goal`,
+    });
+  } catch (error) {
+    // The tool's hard limit (a TimeoutError on the signal) ends the task like the budget
+    // does: report the steps so far, not an error with nothing in it. A cancel still throws.
+    if (signal?.aborted && (signal.reason as Error | undefined)?.name === "TimeoutError") {
+      return finish("TASK_STOPPED", { reason: "time limit reached before the goal; the steps show how far it got" });
+    }
+    throw error;
   }
-  return finish("TASK_STOPPED", {
-    reason: Date.now() > deadline ? "time budget used up before the goal was reached" : `stopped after ${maxSteps} steps without reaching the goal`,
-  });
 }

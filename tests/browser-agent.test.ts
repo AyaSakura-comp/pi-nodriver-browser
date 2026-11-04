@@ -179,3 +179,36 @@ test("scrolling through a long page is progress; the bottom of the page is not",
     globalThis.fetch = realFetch;
   }
 });
+
+test("the tool's hard time limit ends the task with its steps; a cancel still throws", async () => {
+  const page = PAGE('[e1] link "職缺"');
+  const worker = {
+    async request(command: string) {
+      if (command === "screenshot") return { path: "/tmp/shot.jpg" };
+      return { url: "https://shop.example/item", title: "Item", snapshot: page };
+    },
+  };
+  const realFetch = globalThis.fetch;
+  // A planner that never answers: the call ends only when its signal aborts.
+  globalThis.fetch = ((_url: string, init: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason));
+  })) as typeof fetch;
+  // AbortSignal.timeout does not keep Node's event loop alive (pi's own handles do).
+  const keepAlive = setTimeout(() => undefined, 10_000);
+  try {
+    const result = await runBrowserTask({ goal: "找職缺", url: "https://shop.example/item", session: "t", worker,
+      llm: { endpoint: "http://llm/chat", model: "m", local: true }, signal: AbortSignal.timeout(150) });
+    assert.equal(result.status, "TASK_STOPPED");
+    assert.match(result.reason ?? "", /time limit/);
+    assert.ok(result.steps[0].startsWith("open https://shop.example/item"));
+    assert.equal(result.screenshot, "/tmp/shot.jpg");
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 50);
+    await assert.rejects(runBrowserTask({ goal: "找職缺", url: "https://shop.example/item", session: "t", worker,
+      llm: { endpoint: "http://llm/chat", model: "m", local: true }, signal: cancel.signal }));
+  } finally {
+    clearTimeout(keepAlive);
+    globalThis.fetch = realFetch;
+  }
+});
+
