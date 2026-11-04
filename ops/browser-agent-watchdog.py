@@ -38,17 +38,10 @@ MAX_RESTARTS_PER_HOUR = 3
 UNHEALTHY_RESTART_AFTER = 3     # consecutive failed checks while the process is still running
 WORKER_REVIVE_AFTER = 2         # pi also auto-starts the worker on demand; don't race it
 
-# revive: "always" = start when dead, restart when hung; "failed-only" = only after a crash
-# (qwen-mtp is stopped on purpose when switching to Strata/Gemma, and a 3-4 min load looks "hung").
+# browser_intent needs only the worker: its autopilot calls the conversation's own model.
+# The worker also replaces a wedged Chrome by itself (page-level probe), so the watchdog
+# only revives a dead worker process.
 SERVICES = [
-    {"name": "laya-intent", "scope": "user", "unit": "laya-intent.service",
-     "health": "http://127.0.0.1:8011/health", "revive": "always", "ready_s": 40},
-    {"name": "omniparser", "scope": "user", "unit": "omniparser.service",
-     "health": "http://127.0.0.1:8012/health", "revive": "always", "ready_s": 40},
-    {"name": "laya", "scope": "user", "unit": "laya.service",
-     "health": "http://127.0.0.1:8000/health", "revive": "always", "ready_s": 90},
-    {"name": "qwen-planner", "scope": "system", "unit": "qwen-mtp.service",
-     "health": "http://127.0.0.1:8001/health", "revive": "failed-only", "ready_s": 0},
     {"name": "nodriver-worker", "scope": "user", "unit": None, "socket": str(WORKER_SOCKET),
      "revive": "always", "ready_s": 30},
 ]

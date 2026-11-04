@@ -1,16 +1,26 @@
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
-from tests import test_google_lens as lens_tests
+
+
+def run_node(self, source, suffix='.js'):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / ('fixture' + suffix)
+        path.write_text(source)
+        result = subprocess.run(['node', '--experimental-strip-types', str(path)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 ROOT=Path(__file__).resolve().parents[1]
 
 
 class ResearchExtensionTests(unittest.TestCase):
-    run_node=lens_tests.LensJavaScriptTests.run_node
+    run_node=run_node
 
     def test_real_transport_keeps_planner_frames_pending_and_disconnect_settles(self):
         source=(ROOT/'index.ts').read_text()
-        source=source[source.index('type WorkerResponse ='):source.index('function extractSearchResultUrls')]
+        source=source[source.index('type WorkerResponse ='):source.index('// Models (especially with little thinking)')]
         self.run_node('''
 import assert from 'node:assert/strict';
 import {Duplex} from 'node:stream';
@@ -46,12 +56,13 @@ assert.equal(await observed,'rejected');
 
     def test_committed_evidence_is_sent_as_cumulative_progress_updates(self):
         source=(ROOT/'index.ts').read_text()
-        source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
+        source=source[source.index('// Models (especially with little thinking)'):].replace('export default function','function register',1)
         self.run_node('''
 import assert from 'node:assert/strict';
 process.env.RESEARCH_ACTIVE_PREFILL = '0';
 const Type=new Proxy({}, {get:()=> (...args)=>args[0]});
 const readBrowserConfig=()=>({browserMode:'direct'});
+const registerBrowserIntent=()=>{};
 const DESCRIPTION='',VISION_FALLBACK_GUIDANCE='',SEARCH_FIRST_URL_RULE='';
 const DEFAULT_MAX_LINES=2000,DEFAULT_MAX_BYTES=50*1024;
 const randomUUID=()=> 'job';const hostClock=()=>({iso:'2026-01-01T00:00:00Z',timezone:'UTC'});
@@ -138,11 +149,12 @@ assert.equal(currentYearQuery('台南 2026 10月','明天台南',2026),'台南 2
 assert.equal(currentYearQuery('訂單 120251004','查訂單',2026),'訂單 120251004','digits inside a longer number are not a year');
 ''',suffix='.mts')
 
-    def test_tool_registers_only_typed_exact_sources_and_returns_evidence_once(self):
-        source=(ROOT/'index.ts').read_text(); source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
+    def test_tool_returns_evidence_once_and_switches_answer_mode(self):
+        source=(ROOT/'index.ts').read_text(); source=source[source.index('// Models (especially with little thinking)'):].replace('export default function','function register',1)
         self.run_node('''
 import assert from 'node:assert/strict';
 const readBrowserConfig = () => ({browserMode:"direct"});
+const registerBrowserIntent = () => {};
 const Type=new Proxy({}, {get:()=> (...args)=>args[0]});
 const DESCRIPTION='',VISION_FALLBACK_GUIDANCE='',SEARCH_FIRST_URL_RULE='';
 const DEFAULT_MAX_LINES=2000,DEFAULT_MAX_BYTES=50*1024;
@@ -169,14 +181,6 @@ const result=await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.equal(result.content[0].text,'Full evidence https://invented.example/ ignored');
 assert.equal(result.details.text,undefined);
 assert.deepEqual(result.details.plannerDiagnostics,{modelCalls:2,formatRepairs:1,formatFailures:1});
-const open=url=>handlers.get('tool_call')({toolName:'browser',input:{command:'open '+url}},ctx);
-assert.equal(open('https://www.example.com/path/?x=%2f#first'),undefined);
-assert.equal(open('https://WWW.EXAMPLE.COM/path/?x=%2f#second'),undefined);
-assert.equal(open('https://www.example.com/path/?x=%2f#second').block,true);
-assert.equal(open('https://www.example.com/path/?x=%2f#invented').block,true);
-assert.equal(open('https://www.example.com/path/?x=%2f').block,true);
-assert.equal(open('https://example.com/path/?x=%2f').block,true);
-assert.equal(open('https://invented.example/').block,true);
 assert.equal(actualParams.provider,'auto'); assert.equal(actualParams.searchConcurrency,4);
 assert.equal(actualParams.crawlWordBudget,20000); assert.equal(actualParams.rankBatchSize,4);
 packetBytes=60000;
@@ -213,12 +217,13 @@ assert.equal(actualParams.answer,'breadth','a pointer word with no earlier answe
 
     def test_active_prefill_drives_begin_append_end_and_reports_stats(self):
         source=(ROOT/'index.ts').read_text()
-        source=source[source.index('function extractSearchResultUrls'):].replace('export default function','function register',1)
+        source=source[source.index('// Models (especially with little thinking)'):].replace('export default function','function register',1)
         self.run_node('''
 import assert from 'node:assert/strict';
 process.env.RESEARCH_ACTIVE_PREFILL = '1';
 const Type=new Proxy({}, {get:()=> (...args)=>args[0]});
 const readBrowserConfig=()=>({browserMode:'direct'});
+const registerBrowserIntent=()=>{};
 const DESCRIPTION='',VISION_FALLBACK_GUIDANCE='',SEARCH_FIRST_URL_RULE='';
 const DEFAULT_MAX_LINES=2000,DEFAULT_MAX_BYTES=50*1024;
 const randomUUID=()=> 'job';const hostClock=()=>({iso:'2026-01-01T00:00:00Z',timezone:'UTC'});

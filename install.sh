@@ -9,17 +9,14 @@ PI_NODRIVER_SOCKET="${PI_NODRIVER_SOCKET:-$PI_AGENT_DIR/nodriver-browser.sock}"
 
 copy_runtime() {
   local target="$1"
-  mkdir -p "$target/research" "$target/intent"
-  install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$ROOT/worker-launch.ts" "$target/"
-  install -m 0644 "$ROOT/intent/"*.py "$ROOT/intent/"*.ts "$target/intent/"
+  mkdir -p "$target/research" "$target/pibrowser/js" "$target/ops"
+  install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$ROOT/worker-launch.ts" "$ROOT/research-model.ts" \
+    "$ROOT/browser-agent.ts" "$ROOT/browser-intent-tool.ts" "$ROOT/requirements.txt" "$target/"
   install -m 0755 "$ROOT/worker.py" "$target/worker.py"
-  install -m 0644 "$ROOT/browser_logic.py" "$ROOT/requirements.txt" "$target/"
+  install -m 0644 "$ROOT/pibrowser/"*.py "$target/pibrowser/"
+  install -m 0644 "$ROOT/pibrowser/js/"*.js "$target/pibrowser/js/"
   install -m 0644 "$ROOT/research/"*.py "$target/research/"
-  install -m 0644 "$ROOT/research-model.ts" "$target/"
-  if [[ -d "$ROOT/stealth-extension" ]]; then
-    mkdir -p "$target/stealth-extension"
-    cp -rf "$ROOT/stealth-extension/"* "$target/stealth-extension/"
-  fi
+  install -m 0755 "$ROOT/ops/browser-agent-watchdog.py" "$target/ops/"
 }
 
 # Staging copies only runtime files; it never probes/stops services, installs
@@ -38,19 +35,11 @@ if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
       exit 1
     fi
   done
-  for command in pdftotext pdfimages; do
+  for command in pdftotext; do
     if ! command -v "$command" >/dev/null 2>&1; then
       echo "Warning: $command was not found; PDF extraction requires Poppler (usually poppler-utils)." >&2
     fi
   done
-  if ! python3 - <<'PY'
-import sqlite3
-connection = sqlite3.connect(':memory:')
-connection.execute('CREATE VIRTUAL TABLE fts_check USING fts5(text)')
-PY
-  then
-    echo "Warning: Python's SQLite lacks FTS5; temporary large-PDF wiki search will be unavailable." >&2
-  fi
   if [[ -z "${PI_NODRIVER_CHROME:-}" ]] && \
      ! command -v google-chrome >/dev/null 2>&1 && \
      ! command -v google-chrome-stable >/dev/null 2>&1 && \
@@ -81,7 +70,7 @@ PY
 fi
 
 # Ensure any leftover nodriver workers and their chrome children are completely reset
-stale_workers=$(pgrep -u "$USER" -f '^/home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python .*worker.py' || true)
+stale_workers=$(pgrep -u "$USER" -f "^$TARGET/.venv/bin/python .*worker.py" || true)
 if [[ -n "$stale_workers" ]]; then
   kill $stale_workers 2>/dev/null || true
   sleep 0.5
@@ -99,9 +88,6 @@ copy_runtime "$TARGET"
 if [[ -e "$PI_AGENT_DIR/extensions/browser-intent.ts" || -L "$PI_AGENT_DIR/extensions/browser-intent.ts" ]]; then
   mkdir -p "$PI_AGENT_DIR/extension-backups"
   mv --backup=numbered "$PI_AGENT_DIR/extensions/browser-intent.ts" "$PI_AGENT_DIR/extension-backups/browser-intent.ts"
-fi
-if [[ ! -f "$PI_AGENT_DIR/browser-config.json" ]]; then
-  printf '{"browserMode":"direct"}\n' > "$PI_AGENT_DIR/browser-config.json"
 fi
 
 if [[ "${SKIP_PIP_INSTALL:-0}" != "1" ]]; then

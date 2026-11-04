@@ -30,6 +30,7 @@ test('midnight changes only appended date context, never the system prefix or pr
    assert.equal(tool.promptGuidelines,undefined,`${tool.name} guidance belongs in its description`);
   }
   assert.match(tools.get('research').description,/Usage rules:\n- research is the default tool/);
-  assert.match(tools.get('crawl').description,/MANDATORY URL PROVENANCE RULE/);
+  assert.match(tools.get('crawl').description,/never guess URLs/);
+  assert.match(tools.get('browser_intent').description,/Usage rules:\n- browser_intent takes \{url\?, goal\}/);
  } finally {globalThis.Date=OriginalDate;}
 });

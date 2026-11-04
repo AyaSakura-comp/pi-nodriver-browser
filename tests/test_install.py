@@ -1,3 +1,4 @@
+"""install.sh --stage copies exactly the runtime and nothing else happens."""
 import json
 import os
 import subprocess
@@ -8,335 +9,36 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class InstallerTests(unittest.TestCase):
+class InstallTests(unittest.TestCase):
     def test_stages_runtime_without_install_or_lifecycle_actions(self):
         with tempfile.TemporaryDirectory() as temp:
             agent_dir = Path(temp) / 'agent'
             agent_dir.mkdir()
-            settings = agent_dir / 'settings.json'
-            settings.write_text(json.dumps({
-                'packages': ['npm:pi-agent-browser', 'npm:pi-until-done'],
-            }))
-            installer_source = (ROOT / 'install.sh').read_text()
-            # Fail before executing an installer that lacks the staging-only guard.
-            self.assertIn('if [[ "${1:-}" == "--stage" ]]', installer_source)
-            self.assertLess(installer_source.index('if [[ "${1:-}" == "--stage" ]]'),
-                            installer_source.index('if [[ "${SKIP_SYSTEM_CHECKS'))
+            installer = (ROOT / 'install.sh').read_text()
+            # The staging-only branch must exit before any system check or service action.
+            self.assertLess(installer.index('if [[ "${1:-}" == "--stage" ]]'),
+                            installer.index('if [[ "${SKIP_SYSTEM_CHECKS'))
             extension = agent_dir / 'extensions/nodriver-browser'
             stubs = Path(temp) / 'bin'
             stubs.mkdir()
             lifecycle_log = Path(temp) / 'lifecycle.log'
-            for command in ('pgrep','find','python3','sleep'):
+            for command in ('pgrep', 'find', 'python3', 'sleep', 'systemctl'):
                 stub = stubs / command
                 stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "{command}" >> "{lifecycle_log}"\nexit 42\n')
                 stub.chmod(0o755)
-            subprocess.run([str(ROOT / 'install.sh'), '--stage', str(extension)],
-                           cwd=ROOT, env={**os.environ, 'PI_AGENT_DIR': str(agent_dir),
-                             'HOME':temp, 'PI_NODRIVER_SOCKET':str(Path(temp)/'absent.sock'),
-                             'PATH':f'{stubs}:/usr/bin:/bin'}, check=True)
+            subprocess.run([str(ROOT / 'install.sh'), '--stage', str(extension)], cwd=ROOT,
+                           env={**os.environ, 'PI_AGENT_DIR': str(agent_dir), 'HOME': temp,
+                                'PATH': f'{stubs}:/usr/bin:/bin'}, check=True)
             self.assertFalse(lifecycle_log.exists(), 'staging invoked a lifecycle command')
+            for name in ('index.ts', 'browser-agent.ts', 'browser-intent-tool.ts', 'worker.py',
+                         'pibrowser/cdp.py', 'pibrowser/chrome.py', 'pibrowser/page.py', 'pibrowser/fetch.py',
+                         'pibrowser/js/snapshot.js', 'pibrowser/js/google_results.js',
+                         'pibrowser/js/image_candidates.js', 'research/jobs.py', 'ops/browser-agent-watchdog.py'):
+                self.assertTrue((extension / name).is_file(), name)
+            for gone in ('intent', 'stealth-extension', 'browser_logic.py'):
+                self.assertFalse((extension / gone).exists(), gone)
             subprocess.run([str(ROOT / '.venv/bin/python'), '-B', '-c',
                             'import research.jobs, research.crawl_jobs, worker'], cwd=extension, check=True)
-            self.assertTrue((extension / 'research/controller.py').is_file())
-            self.assertTrue((extension / 'research-model.ts').is_file())
-            self.assertFalse((extension / 'research/__pycache__').exists())
-            self.assertIn('PI_NODRIVER_SOCKET', installer_source)
-            self.assertIn("'command': 'shutdown'", installer_source)
-            extension = agent_dir / 'extensions/nodriver-browser'
-            self.assertTrue((extension / 'index.ts').is_file())
-            self.assertTrue((extension / 'worker-launch.ts').is_file(), 'index.ts imports worker-launch.ts')
-            self.assertTrue((extension / 'worker.py').is_file())
-            self.assertTrue((extension / 'browser_logic.py').is_file())
-            extension_source = (extension / 'index.ts').read_text()
-            self.assertIn('createConnection', extension_source)
-            # The worker is started in server mode by the staged launcher module.
-            self.assertIn('launchWorker', extension_source)
-            self.assertIn('--server', (extension / 'worker-launch.ts').read_text())
-            self.assertIn('worker.disconnect()', extension_source)
-            self.assertIn('ctx.sessionManager.getSessionId()', extension_source)
-            self.assertIn('sessionId', extension_source)
-            self.assertIn('PI_NODRIVER_SCREEN', extension_source)
-            self.assertIn('500x1000x24', extension_source)
-            self.assertIn('if (response.screenshotPath)', extension_source)
-            self.assertIn('name: "fetch_image"', extension_source)
-            self.assertIn('fetch-image ${JSON.stringify(params.url)}', extension_source)
-            self.assertIn('response.imagePath', extension_source)
-            self.assertIn('[[image: ${response.imagePath}]]', extension_source)
-            self.assertIn('vision-mark <x> <y>', extension_source)
-            self.assertIn('vision-click', extension_source)
-            self.assertIn('vision-mark-drag <start_x>', extension_source)
-            self.assertIn('vision-drag', extension_source)
-            self.assertIn('long-press @e16', extension_source)
-            self.assertIn('vision-long-press', extension_source)
-            self.assertIn('close', extension_source)
-            self.assertIn('shutdown', extension_source)
-            worker_source = (extension / 'worker.py').read_text()
-            self.assertIn('PI_NODRIVER_WINDOW_SIZE', worker_source)
-            self.assertIn('500,1000', worker_source)
-            self.assertIn('--start-maximized', worker_source)
-            self.assertIn('--window-position=0,0', worker_source)
-            self.assertIn('--ozone-platform=x11', worker_source)
-            self.assertIn('--disable-features=Translate', worker_source)
-            self.assertIn('--disable-session-crashed-bubble', worker_source)
-            self.assertIn('--hide-crash-restore-bubble', worker_source)
-            self.assertIn('--simulate-outdated-no-au', worker_source)
-            self.assertIn('--check-for-update-interval', worker_source)
-            self.assertIn('--password-store=basic', worker_source)
-            self.assertIn('--disable-save-password-bubble', worker_source)
-            self.assertIn('--deny-permission-prompts', worker_source)
-            self.assertIn('ensure_profile_preferences', worker_source)
-            native_click = worker_source.split('    async def native_click', 1)[1].split('    async def execute', 1)[0]
-            self.assertIn('minimum_settle_seconds = 0.1', native_click)
-            self.assertIn('maximum_settle_seconds = 0.5', native_click)
-            self.assertIn('new_tab_timeout_seconds = 2.0', native_click)
-            self.assertNotIn('page.sleep(1)', native_click)
-            updated = json.loads(settings.read_text())
-            self.assertEqual(updated['packages'], ['npm:pi-agent-browser', 'npm:pi-until-done'])
-            self.assertFalse((agent_dir / 'settings.json.pi-nodriver-browser.bak').exists())
-            self.assertIn("item != 'npm:pi-agent-browser'", installer_source)
-
-    def test_browser_mode_switch_is_exposed_and_documented(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        self.assertIn('browser-mode-switch [auto|android|linux]', extension_source)
-        self.assertIn("'browser-mode-switch'", worker_source)
-        self.assertIn('`browser-mode-switch`', readme_source)
-        self.assertIn('session-scoped', readme_source)
-        self.assertIn('pins only that origin', extension_source)
-        self.assertIn('Unexpected post-click login gates', readme_source)
-        self.assertIn('origin_linux_routes', worker_source)
-
-    def test_identity_profiles_keep_android_mobile_and_make_linux_desktop_fit(self):
-        browser_logic_source = (ROOT / 'browser_logic.py').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        stealth_source = (ROOT / 'stealth-extension/stealth.js').read_text()
-        open_action = worker_source.split("        if action == 'open':", 1)[1].split("        if action == 'mobile':", 1)[0]
-
-        self.assertIn("platform='Android'", worker_source)
-        self.assertIn('user_agent_metadata=metadata', worker_source)
-        self.assertIn('set_user_agent_override', worker_source)
-        self.assertIn('apply_android_user_agent(page)', open_action)
-        self.assertIn("identity_viewport_metrics(identity)", worker_source)
-        self.assertIn("apply_identity_viewport(page, identity_used)", worker_source)
-        self.assertIn("'mobile': True", browser_logic_source)
-        self.assertIn("'touch': True", browser_logic_source)
-        self.assertIn("'mobile': False", browser_logic_source)
-        self.assertIn("'touch': False", browser_logic_source)
-        self.assertNotIn('iPhone OS', open_action)
-        self.assertNotIn('Safari/604.1', open_action)
-        self.assertNotIn('NVIDIA GeForce RTX 4070', stealth_source)
-        self.assertNotIn('fakePlugins', stealth_source)
-
-    def test_agent_guidance_and_runtime_exclude_relative_vertical_scrolling(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        self.assertNotIn('scroll down', extension_source.lower())
-        self.assertNotIn('scroll up', extension_source.lower())
-        self.assertNotIn('scroll <down|up', extension_source.lower())
-        self.assertNotIn('scroll <down|up', readme_source.lower())
-        self.assertNotIn("direction === 'down'", worker_source)
-        self.assertNotIn("direction === 'up'", worker_source)
-        self.assertIn('scroll to @ref', extension_source)
-        self.assertIn('snapshot -i --full', extension_source)
-
-    def test_ref_guidance_uses_literal_examples_and_never_teaches_angle_wrapped_refs(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        self.assertIn('REF SYNTAX IS LITERAL', extension_source)
-        self.assertIn("activate @e16", extension_source)
-        self.assertNotIn("  click @e16 -", extension_source)
-        self.assertIn("vision-click <x> <y>", extension_source)
-        self.assertIn("fill @e6", extension_source)
-        self.assertIn('never wrap refs in', extension_source)
-        self.assertNotIn('<@ref>', extension_source)
-        self.assertNotIn('<@ref>', readme_source)
-        self.assertNotIn('usage: click <@ref>', worker_source)
-        self.assertIn('usage: activate @e1', worker_source)
-        self.assertIn('do not include < or >', worker_source)
-        self.assertIn('To enter text, use fill or type with a literal ref', extension_source)
-        self.assertNotIn('Press Enter, Tab, Space, Backspace, or text', extension_source)
-
-    def test_vision_guidance_allows_direct_marking_without_failure_unlocks(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        for source in (extension_source, worker_source, readme_source):
-            self.assertNotIn('3 consecutive legitimate semantic', source)
-            self.assertNotIn('three consecutive legitimate semantic', source)
-            self.assertNotIn('VISION_FALLBACK_LOCKED', source)
-        self.assertIn('vision-mark <x> <y>', extension_source)
-        self.assertIn('without deliberately failing semantic actions', extension_source)
-
-    def test_default_visual_fallback_is_configurable_and_prefers_omni(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        self.assertIn('PI_NODRIVER_VISION_FALLBACK', extension_source)
-        self.assertIn('const DEFAULT_VISION_FALLBACK = "omni"', extension_source)
-        self.assertIn('CDP/DOM semantic actions first', extension_source)
-        self.assertIn('manual', extension_source)
-        self.assertIn('PI_NODRIVER_VISION_FALLBACK', readme_source)
-        self.assertIn('`omni` (default)', readme_source)
-
-    def test_vision_gesture_guidance_prefers_xvfb_mouse_input(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-
-        self.assertIn('Vision click, long press, and drag prefer trusted Xvfb mouse input', extension_source)
-        self.assertGreaterEqual(worker_source.count("'backend': 'xvfb-or-cdp'"), 3)
-
-    def test_form_safety_and_navigation_guidance_matches_runtime_guards(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-
-        self.assertIn('Never fill or type into a <label> ref', extension_source)
-        self.assertIn('checked="true|false"', extension_source)
-        self.assertIn('same origin', extension_source)
-        self.assertIn('different-origin', extension_source)
-        self.assertIn('authoritative and may be used immediately', worker_source)
-        self.assertIn('same origin', readme_source)
-        self.assertNotIn('run snapshot -i once to unlock ref commands', extension_source)
-
-    def test_documents_two_attempt_no_progress_guard(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        for source in (extension_source, worker_source, readme_source):
-            self.assertIn('NO_PROGRESS_GUARD', source)
-        self.assertIn('NO_PROGRESS_LIMIT = 2', worker_source)
-        self.assertIn('page content', extension_source.lower())
-
-    def test_enforces_url_provenance_for_browser_open(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-
-        self.assertIn('URL_PROVENANCE_GUARD', extension_source)
-        self.assertIn('pi.on("tool_call"', extension_source)
-        self.assertIn('pi.on("tool_result"', extension_source)
-        self.assertIn('pi.on("input"', extension_source)
-        self.assertIn('google_search', extension_source)
-        self.assertIn('web_search', extension_source)
-        self.assertIn('Only URLs supplied verbatim by the user or returned by successful', extension_source)
-
-    def test_injects_url_provenance_rule_into_system_prompt(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-
-        self.assertIn('pi.on("before_agent_start"', extension_source)
-        self.assertIn('MANDATORY URL PROVENANCE RULE', extension_source)
-        self.assertIn('If the user supplied an exact HTTP(S) URL', extension_source)
-        self.assertIn('If search returns no usable parent URL, stop', extension_source)
-        self.assertIn('navigate through visible links', extension_source)
-
-    def test_registers_temporary_pdf_wiki_query_tool(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-
-        self.assertIn('name: "pdf_query"', extension_source)
-        self.assertIn('pdf-query ${JSON.stringify', extension_source)
-        self.assertIn('full PDF text is withheld', extension_source)
-        self.assertIn('query the temporary PDF wiki', extension_source)
-
-    def test_documents_pdf_crawl_text_and_embedded_image_extraction(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        for source in (extension_source, readme_source):
-            self.assertIn('PDF', source)
-            self.assertIn('embedded images', source)
-        self.assertIn('crawl supports direct PDF URLs', extension_source)
-        self.assertIn('get text extracts the open PDF', extension_source)
-
-    def test_installer_and_docs_diagnose_pdf_runtime_dependencies(self):
-        installer_source = (ROOT / 'install.sh').read_text()
-        readme_source = (ROOT / 'README.md').read_text()
-
-        for dependency in ('pdftotext', 'pdfimages', 'FTS5'):
-            self.assertIn(dependency, installer_source)
-            self.assertIn(dependency, readme_source)
-        self.assertIn('poppler-utils', installer_source)
-        self.assertIn('without blocking non-PDF installation', readme_source)
-        self.assertIn('await worker.cleanupSession(', (ROOT / 'index.ts').read_text())
-
-    def test_pdf_query_limit_schema_is_integer(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        pdf_tool = extension_source.split('name: "pdf_query"', 1)[1].split(
-            'name: "crawl"', 1
-        )[0]
-
-        self.assertIn('Type.Integer', pdf_tool)
-        self.assertNotIn('Type.Number', pdf_tool)
-
-    def test_installs_parallel_image_delivery_and_incidental_crawl_image_guidance(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-
-        self.assertIn('name: "fetch_images"', extension_source)
-        self.assertIn('Promise.allSettled', extension_source)
-        self.assertGreaterEqual(extension_source.count('throw new Error("fetch_images cancelled")'), 2)
-        self.assertIn('Type.Array(Type.String', extension_source)
-        self.assertIn('MAX_BATCH_IMAGE_BYTES', extension_source)
-        self.assertIn('attachmentBytes', extension_source)
-        batch_tool = extension_source.split('name: "fetch_images"', 1)[1].split('name: "crawl"', 1)[0]
-        self.assertNotIn('type: "image"', batch_tool)
-        self.assertIn('without injecting image bytes into the next model turn', batch_tool)
-        self.assertIn('concrete products, people, places, animals, or events', extension_source)
-        self.assertIn('even when the user did not explicitly ask for images', extension_source)
-        self.assertIn('Do not finalize a concrete-subject answer', extension_source)
-        self.assertIn('clean page text plus ranked image candidates', extension_source)
-        self.assertIn('get text|images|url|title', extension_source)
-        self.assertIn("extract_image_candidate_result(tab)", worker_source)
-        self.assertIn("'imageCandidates': image_candidates", worker_source)
-        self.assertIn("'imageCount':", worker_source)
-
-    def test_registers_directional_google_search_with_deduplication_guidance(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        worker_source = (ROOT / 'worker.py').read_text()
-
-        self.assertIn('name: "google_search"', extension_source)
-        self.assertIn('minItems: 1', extension_source)
-        self.assertIn('maxItems: 4', extension_source)
-        self.assertIn('official or primary sources', extension_source)
-        self.assertIn('independent reviews or community experience', extension_source)
-        self.assertIn('alternatives, risks, or counter-evidence', extension_source)
-        self.assertIn('google-search ${JSON.stringify(searches)}', extension_source)
-        self.assertIn('TIME_SENSITIVE_SEARCH_PATTERN', extension_source)
-        self.assertIn('currentTime: Type.Optional', extension_source)
-        self.assertIn('requires a fresh gettime(action: "now") result', extension_source)
-        self.assertIn('[Current time confirmed:', extension_source)
-        self.assertIn("if action == 'google-search':", worker_source)
-        self.assertIn('select_diverse_search_results', worker_source)
-        google_worker = worker_source.split("if action == 'google-search':", 1)[1].split("if action == 'crawl':", 1)[0]
-        self.assertIn('self.search_one(search, i, session_id, search_slots)', google_worker)
-        google_operation = worker_source.split('async def _search_one(', 1)[1].split('async def crawl_one(', 1)[0]
-        self.assertIn('width=1920', google_operation)
-        self.assertIn('mobile=False', google_operation)
-
-    def test_google_search_extracts_the_description_sibling_outside_the_heading_block(self):
-        worker_source = (ROOT / 'worker.py').read_text()
-        google_js = worker_source.split("GOOGLE_RESULTS_JS =", 1)[1].split("IMAGE_NAT64_WELL_KNOWN", 1)[0]
-
-        self.assertIn("anchor.closest('[data-snhf]')?.parentElement", google_js)
-        self.assertIn("[data-sncf=\"1\"], .VwiC3b, [data-snf=\"nke7rc\"]", google_js)
-        self.assertIn("snippetElement?.innerText", google_js)
-
-    def test_fetch_image_metadata_does_not_force_implicit_visual_intent(self):
-        extension_source = (ROOT / 'index.ts').read_text()
-        self.assertIn(
-            'Use fetch_image after web_search, crawl, or browser when the user asks to see',
-            extension_source,
-        )
-        self.assertNotIn('Treat visual-appearance questions', extension_source)
-        self.assertNotIn('「X 長怎樣？」', extension_source)
-        self.assertNotIn('what does X look like?', extension_source)
-        self.assertNotIn('visually depictable real-world subject', extension_source)
-        self.assertNotIn('explicit or implicit visual-delivery requests', extension_source)
 
 
 if __name__ == '__main__':

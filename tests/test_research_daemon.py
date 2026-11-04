@@ -20,7 +20,7 @@ class ResearchDaemonTests(unittest.IsolatedAsyncioTestCase):
             async def search(self,task): return [SearchResult('Fixture','https://example.com/','Complete answer')]
             async def close(self): pass
         async def judge(req): return Judgment(req.view.revision,tuple(SourceAction(s.source_id,'use_snippet',('answer',)) for s in req.sources))
-        engine=SimpleNamespace(close=AsyncMock(),cleanup_research_owner=AsyncMock(side_effect=lambda owner: cleanup.set()),research_cleanup_tasks=set())
+        engine=SimpleNamespace(close=AsyncMock(),health_loop=AsyncMock(),cleanup_research_owner=AsyncMock(side_effect=lambda owner: cleanup.set()),research_cleanup_tasks=set())
         async def command(engine,request):
             if request['command']=='hold': held.set(); await release.wait()
             return dict(id=request['id'],ok=True,text='fixture',action=request['command'])
@@ -29,7 +29,7 @@ class ResearchDaemonTests(unittest.IsolatedAsyncioTestCase):
             server=await actual_start(*args,**kwargs); started.set(); return server
         def connection(*args,**kwargs): return ResearchConnection(*args,**kwargs,fourget_factory=Provider,judge=judge)
         loop=asyncio.get_running_loop()
-        with tempfile.TemporaryDirectory() as root, patch.object(worker,'BrowserWorker',return_value=engine), \
+        with tempfile.TemporaryDirectory() as root, patch.object(worker,'BrowserService',return_value=engine), \
              patch.object(worker,'execute_request',side_effect=command), patch('research.jobs.ResearchConnection',side_effect=connection), \
              patch.object(asyncio,'start_unix_server',side_effect=start), patch.object(loop,'add_signal_handler'):
             socket_path=str(Path(root)/'daemon.sock')

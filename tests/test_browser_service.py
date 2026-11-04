@@ -1,0 +1,273 @@
+"""BrowserService with a fake Chrome: tab hygiene, research engine API, self-healing."""
+import asyncio
+import json
+import time
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import worker
+from pibrowser.cdp import CDPTimeout
+
+
+class FakeTab:
+    def __init__(self, chrome, target_id):
+        self.chrome = chrome
+        self.target_id = target_id
+        self.created = time.monotonic()
+        self.dialogs = []
+        self.world = None
+        self.url = 'about:blank'
+
+    async def send(self, method, params=None, *, timeout=10.0):
+        return {}
+
+    async def goto(self, url, *, timeout=20.0):
+        self.url = url
+        await self.chrome.navigate_hook(self, url)
+
+    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0):
+        return True
+
+    async def eval(self, expression, *, timeout=10.0, await_promise=False):
+        return self.chrome.eval_hook(self, expression)
+
+    async def http_status(self):
+        return self.chrome.status
+
+    async def snapshot(self, *, max_chars=14000, from_viewport=False, timeout=10.0):
+        return {'url': self.url, 'title': 'T', 'text': f'page {self.url}', 'elements': 0}
+
+    async def close(self):
+        await self.chrome.close_target(self.target_id)
+
+
+class FakeChrome:
+    made = []
+
+    def __init__(self, profile, log_path=None):
+        self.targets = {}
+        self.closed = []
+        self.probe_ok = True
+        self.alive_flag = True
+        self.stopped = False
+        self.proc = SimpleNamespace(pid=4242)
+        self.port = 9222
+        self.counter = 0
+        self.body = 'Readable body text that is long enough to count as content.'
+        self.status = 200
+        self.navigate_hook = self._navigate
+        FakeChrome.made.append(self)
+
+    async def _navigate(self, tab, url):
+        return None
+
+    def eval_hook(self, tab, expression):
+        if expression == 'document.title':
+            return 'Fixture title'
+        if expression == 'document.contentType':
+            return 'text/html'
+        if 'sourceChars' in expression or 'capturedChars' in expression:
+            return json.dumps({'text': self.body, 'sourceChars': len(self.body), 'capturedChars': len(self.body),
+                               'captureLimit': 1000, 'captureUnits': 'codepoints'})
+        if expression is worker.IMAGE_CANDIDATES_JS:
+            return '[]'
+        if expression is worker.GOOGLE_RESULTS_JS:
+            return json.dumps([{'title': 'Result', 'url': 'https://example.com/a', 'snippet': 's' * 600,
+                                'truncated': True}])
+        if 'innerText' in expression:
+            return self.body
+        return None
+
+    async def start(self):
+        return None
+
+    def alive(self):
+        return self.alive_flag
+
+    async def probe(self, timeout=5.0):
+        return self.probe_ok
+
+    async def new_tab(self, url='about:blank', *, background=True, new_window=False, timeout=10.0):
+        self.counter += 1
+        target_id = f't{self.counter}'
+        self.targets[target_id] = {'targetId': target_id, 'type': 'page', '_seen': time.monotonic()}
+        return FakeTab(self, target_id)
+
+    async def close_target(self, target_id, timeout=3.0):
+        self.targets.pop(target_id, None)
+        self.closed.append(target_id)
+
+    def pages(self):
+        return list(self.targets.values())
+
+    async def stop(self):
+        self.stopped = True
+        self.alive_flag = False
+
+
+class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        FakeChrome.made.clear()
+        self.patches = [mock.patch.object(worker, 'Chrome', FakeChrome),
+                        mock.patch.object(worker, 'log_event', lambda *a, **k: None)]
+        for patch in self.patches:
+            patch.start()
+        self.service = worker.BrowserService()
+        await self.service.ensure_browser()
+        self.chrome = self.service.chrome
+
+    async def asyncTearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    async def test_research_crawl_returns_capture_metadata_and_closes_its_tab(self):
+        result = await self.service.crawl_one('https://example.com/', 0, 'owner', asyncio.Semaphore(1),
+                                              max_text_units=1000, fetch_timeout=3.0)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['title'], 'Fixture title')
+        self.assertEqual(result['captureUnits'], 'codepoints')
+        self.assertEqual(result['sourceChars'], len(self.chrome.body))
+        self.assertEqual(self.chrome.targets, {})
+        self.assertEqual(self.service.temp_tabs, {})
+
+    async def test_cancelled_crawl_closes_tab_and_releases_slots(self):
+        entered = asyncio.Event()
+
+        async def hang(tab, url):
+            entered.set()
+            await asyncio.sleep(3600)
+        self.chrome.navigate_hook = hang
+        slots = asyncio.Semaphore(1)
+        task = asyncio.create_task(self.service.crawl_one('https://slow.example/', 0, 'owner', slots,
+                                                          max_text_units=1000, fetch_timeout=3.0))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.chrome.targets, {})
+        self.assertFalse(slots.locked())
+        self.assertEqual(self.service.crawl_slots._value, worker.CRAWL_TABS)
+
+    async def test_slow_page_times_out_as_browser_suspect(self):
+        async def hang(tab, url):
+            await asyncio.sleep(3600)
+        self.chrome.navigate_hook = hang
+        with mock.patch.dict('os.environ', {'RESEARCH_PARTIAL_ON_TIMEOUT': '0'}):
+            result = await self.service.crawl_one('https://slow.example/', 0, 'owner', asyncio.Semaphore(1),
+                                                  max_text_units=1000, fetch_timeout=1.0)
+        self.assertFalse(result['ok'])
+        self.assertTrue(result['browserSuspect'])
+        self.assertEqual(self.chrome.targets, {})
+
+    async def test_challenge_page_is_reported_not_returned_as_content(self):
+        self.chrome.body = 'Just a moment... Verify you are human by completing the action below.'
+        result = await self.service.crawl_one('https://cf.example/', 0, 'owner', asyncio.Semaphore(1))
+        self.assertFalse(result['ok'])
+        self.assertIn('challenge', result['error'])
+
+    async def test_error_status_pages_are_failures(self):
+        self.chrome.status = 404
+        result = await self.service.crawl_one('https://x.example/missing', 0, 'owner', asyncio.Semaphore(1))
+        self.assertFalse(result['ok'])
+        self.assertIn('HTTP 404', result['error'])
+
+    async def test_google_search_parses_results_and_keeps_truncation_flag(self):
+        result = await self.service.search_one({'query': 'q', 'direction': 'official'}, 0, 'owner',
+                                               asyncio.Semaphore(1), research=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['results'][0]['url'], 'https://example.com/a')
+        self.assertTrue(result['results'][0]['truncated'])
+        self.assertEqual(self.chrome.targets, {})
+
+    async def test_owner_cleanup_closes_only_that_owners_temp_tabs(self):
+        mine = await self.service._temp_tab('job-a')
+        other = await self.service._temp_tab('job-b')
+        await self.service.cleanup_research_owner('job-a')
+        self.assertNotIn(mine.target_id, self.chrome.targets)
+        self.assertIn(other.target_id, self.chrome.targets)
+
+    async def test_failed_probe_replaces_the_browser(self):
+        first = self.service.browser
+        first.probe_ok = False
+        await self.service.ensure_browser()
+        self.assertTrue(first.stopped)
+        self.assertIsNot(self.service.browser, first)
+        self.assertEqual(self.service.restarts, 1)
+
+    async def test_recent_probe_is_reused_within_max_age(self):
+        with mock.patch.object(FakeChrome, 'probe', side_effect=AssertionError('probed')):
+            await self.service.ensure_browser(max_age=60)
+
+    async def test_idle_health_check_replaces_a_wedged_browser(self):
+        wedged = self.service.browser
+        wedged.probe_ok = False
+        self.service.last_activity -= 60
+        with mock.patch.object(worker, 'HEALTH_INTERVAL', 0.01), \
+             mock.patch.object(worker, 'IDLE_PROBE_AGE', 0.0):
+            loop = asyncio.create_task(self.service.health_loop())
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if self.service.browser is not wedged:
+                    break
+            loop.cancel()
+        self.assertIsNot(self.service.browser, wedged)
+
+    async def test_open_retries_once_on_a_fresh_browser_after_a_page_timeout(self):
+        first = self.service.browser
+
+        async def wedge(tab, url):
+            first.probe_ok = False
+            raise CDPTimeout('Page.navigate timed out after 20s')
+        first.navigate_hook = wedge
+        result = await self.service.execute('open https://example.com/', 's1')
+        self.assertEqual(result['action'], 'open')
+        self.assertIsNot(self.service.browser, first)
+
+    async def test_session_reuses_its_tab_and_cleanup_closes_it(self):
+        await self.service.execute('open https://a.example/', 's1')
+        await self.service.execute('open https://b.example/', 's1')
+        self.assertEqual(len(self.chrome.targets), 1)
+        await self.service.execute('session-cleanup', 's1')
+        self.assertEqual(self.chrome.targets, {})
+
+    async def test_idle_session_tabs_are_closed(self):
+        await self.service.execute('open https://a.example/', 's1')
+        self.service.sessions['s1'].last_used -= worker.IDLE_TAB_SECONDS + 1
+        await self.service.close_idle_tabs()
+        self.assertEqual(self.chrome.targets, {})
+
+    async def test_session_tab_cap_evicts_least_recently_used_session(self):
+        with mock.patch.object(worker, 'MAX_SESSION_TABS', 2):
+            for session in ('s1', 's2', 's3'):
+                await self.service.execute('open https://a.example/', session)
+                self.service.sessions[session].last_used = time.monotonic()
+                await asyncio.sleep(0.01)
+        self.assertEqual(len(self.chrome.targets), 2)
+        self.assertEqual(self.service.sessions['s1'].stack, [])
+
+    async def test_page_comes_back_after_its_tab_died(self):
+        await self.service.execute('open https://a.example/', 's1')
+        self.chrome.targets.clear()  # e.g. browser restart or the page closed itself
+        result = await self.service.execute('snapshot', 's1')
+        self.assertIn('https://a.example/', result['text'])
+
+
+class HelperTests(unittest.TestCase):
+    def test_parse_ref_accepts_both_spellings(self):
+        self.assertEqual(worker.parse_ref('e12'), 'e12')
+        self.assertEqual(worker.parse_ref('@E3'), 'e3')
+        with self.assertRaises(ValueError):
+            worker.parse_ref('button')
+
+    def test_snapshot_header_flags_error_pages_and_dialogs(self):
+        text = worker.format_snapshot({'url': 'https://x/', 'title': 'Missing', 'text': 'Not found',
+                                       'scrollHeight': 900, 'scrollY': 0, 'viewportHeight': 600},
+                                      status=404, dialogs=['alert: hi'])
+        self.assertIn('HTTP status: 404', text)
+        self.assertIn('Dialog closed automatically: alert: hi', text)
+        self.assertTrue(text.endswith('Not found'))
+
+
+if __name__ == '__main__':
+    unittest.main()

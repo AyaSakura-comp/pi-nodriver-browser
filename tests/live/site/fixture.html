@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Live fixture</title></head>
+<body>
+<h1>Live fixture</h1>
+<form action="/results.html" method="get"><input name="q" placeholder="Search products"><button>Search</button></form>
+<label for="station">出發</label>
+<select id="station"><option value="">請選擇出發車站</option><option>BR01 動物園</option><option>R10 台北車站</option><option>R28 淡水</option></select>
+<div style="position:relative;width:200px">
+  <button id="covered" onclick="document.getElementById('status').textContent='covered clicked'">Covered button</button>
+  <div style="position:absolute;inset:0;background:rgba(0,0,0,.05)"></div>
+</div>
+<button onclick="alert('Saved!'); document.getElementById('status').textContent='after alert'">Save with alert</button>
+<p id="status">idle</p>
+<a href="/newtab.html" target="_blank">Open report in new tab</a>
+<iframe src="/inner.html" title="inner frame" width="320" height="60"></iframe>
+<ul id="lazy"></ul>
+<script>
+requestAnimationFrame(() => {
+  for (let i = 1; i <= 3; i++) {
+    const li = document.createElement('li');
+    li.textContent = `Lazy item ${i} $${i * 100}`;
+    document.getElementById('lazy').appendChild(li);
+  }
+});
+</script>
+<div style="height:30px;overflow:hidden">
+  <a href="#visible">Visible link</a>
+  <div style="height:300px"></div>
+  <a href="#clipped">Clipped hidden link</a>
+</div>
+</body></html>

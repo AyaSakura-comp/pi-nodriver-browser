@@ -25,9 +25,9 @@ class ResearchProtocolTests(unittest.TestCase):
         source=(ROOT/'worker.py').read_text().split('async def server_main',1)[1]
         self.assertIn('ResearchConnection(',source)
         self.assertIn("request.get('type') == 'planner_reply'",source)
-        dispatch=source.split('async def process_request',1)[1]
-        self.assertLess(dispatch.index("if action == 'research':"),dispatch.index('async with session_lock:'))
+        dispatch=source.split('async def process(',1)[1]
+        # Research jobs must not queue behind a session's interactive commands.
+        self.assertLess(dispatch.index("if action == 'research':"),dispatch.index('async with lock:'))
         self.assertIn('await research.close()',source)
-        # Existing ordinary interactive serialization must not be removed.
-        self.assertIn('async with session_lock:',source)
-        self.assertIn('async with browser_structure_lock:',source)
+        # Commands of one Pi session stay serialized.
+        self.assertIn('session_locks.setdefault(session_id, asyncio.Lock())',source)
