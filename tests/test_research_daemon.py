@@ -31,7 +31,8 @@ class ResearchDaemonTests(unittest.IsolatedAsyncioTestCase):
         loop=asyncio.get_running_loop()
         with tempfile.TemporaryDirectory() as root, patch.object(worker,'BrowserService',return_value=engine), \
              patch.object(worker,'execute_request',side_effect=command), patch('research.jobs.ResearchConnection',side_effect=connection), \
-             patch.object(asyncio,'start_unix_server',side_effect=start), patch.object(loop,'add_signal_handler'):
+             patch.object(asyncio,'start_unix_server',side_effect=start), patch.object(loop,'add_signal_handler'), \
+             patch.object(worker,'log_event',lambda *args,**kwargs: None):
             socket_path=str(Path(root)/'daemon.sock')
             server_task=asyncio.create_task(worker.server_main(socket_path))
             await asyncio.wait_for(started.wait(),1)

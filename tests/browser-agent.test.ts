@@ -85,3 +85,50 @@ test("open only accepts URLs written in the goal", async () => {
   await h.run("看看");
   assert.ok(!h.sent.some((c) => c.includes("guessed.example")));
 });
+
+test("select on a link is treated as a click", async () => {
+  const page = PAGE('[e4] link "行動電源"\n[e5] select "排序" selected="推薦" options: 推薦 | 價格');
+  const next = PAGE("搜尋結果 行動電源 $599");
+  const h = harness(['{"action":"select","ref":"e4"}', '{"action":"done","answer":"$599","evidence":["行動電源 $599"]}'],
+    { 'open "https://shop.example/item"': page, "click e4": next });
+  const result = await h.run("find power banks");
+  assert.ok(h.sent.includes("click e4"));
+  assert.equal(result.status, "TASK_DONE");
+});
+
+test("parseAction repairs raw line breaks inside strings and skips prose objects", () => {
+  const raw = '{"action":"done","answer":"1. A $1\n2. B $2","evidence":["A $1"]}';
+  assert.equal(_test.parseAction(raw).answer, "1. A $1\n2. B $2");
+  assert.equal(_test.parseAction('Note {not json} then {"action":"scroll","direction":"down"}').action, "scroll");
+});
+
+test("a planner that cannot produce actions hands the task to the fallback planner", async () => {
+  const page = PAGE('[e1] link "行動電源"\n$599');
+  const sent: string[] = [];
+  const worker = {
+    async request(command: string) {
+      sent.push(command);
+      if (command === "screenshot") return { path: "/tmp/none.jpg" };
+      if (command === "get text") return { text: page };
+      return { url: "https://shop.example/item", title: "Item", snapshot: page };
+    },
+  };
+  const realFetch = globalThis.fetch;
+  const asked: string[] = [];
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    const model = JSON.parse(init.body).model;
+    asked.push(model);
+    const content = model === "tiny" ? "<tool_call> <function=click> </tool_call>" : '{"action":"done","answer":"$599","evidence":["$599"]}';
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }));
+  }) as typeof fetch;
+  try {
+    const result = await runBrowserTask({ goal: "價格", url: "https://shop.example/item", session: "t", worker,
+      llm: { endpoint: "http://llm/chat", model: "tiny", local: true },
+      fallbackLlm: { endpoint: "http://llm/chat", model: "good", local: true } });
+    assert.equal(result.status, "TASK_DONE");
+    assert.equal(result.planner_switched, "tiny → good");
+    assert.deepEqual(asked, ["tiny", "tiny", "good"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

@@ -27,6 +27,8 @@ export interface TaskOptions {
   session: string;
   worker: WorkerLike;
   llm: LlmConfig;
+  /** Used for the rest of the task when `llm` twice fails to give a valid action (e.g. a tiny model). */
+  fallbackLlm?: LlmConfig;
   signal?: AbortSignal;
   onProgress?: (line: string) => void;
   maxSteps?: number;
@@ -50,6 +52,7 @@ export interface TaskResult {
   elapsed_ms: number;
   llm_ms: number;
   browser_ms: number;
+  planner_switched?: string;
 }
 
 const SYSTEM_PROMPT = `You operate a real Chrome browser to complete the user's goal. Each turn you get the goal, the steps taken so far and a snapshot of the current page. Interactive elements appear as [eN] role "name"; the other lines are the page's text in page order (a price usually follows its product).
@@ -61,13 +64,14 @@ Reply with exactly one JSON object and nothing else. Actions:
 {"action":"press","key":"Enter"}  (Enter, Escape, Tab, ArrowDown, PageDown)
 {"action":"scroll","direction":"down"}  (down, up, top, bottom)
 {"action":"back"}
-{"action":"search","query":"keywords"}  (Google search: to find a site, or when this site is wrong or broken)
+{"action":"google","query":"keywords"}  (Google search: only to find a site, or when this site is wrong or broken)
 {"action":"open","url":"https://..."}  (only a URL that is written in the goal)
 {"action":"done","answer":"the result the goal asks for, with exact names, prices, dates, numbers","evidence":["short quote copied exactly from the page"]}
 {"action":"stop","status":"needs_input|needs_confirm|blocked|failed","reason":"why, and what is needed"}
 
 Rules:
 - Use only refs from the latest snapshot. If what you need is not listed, scroll or use the site's search box.
+- select is only for [eN] select dropdowns; use click for links, buttons, tabs and options.
 - To find an item on a site, type into the site's search box with "submit":true in one step.
 - Among similar options (suggestions, stations, products), choose the one whose name equals what the goal names; an option with extra words ("-環島", "Pro", "2入組") is a different item.
 - Reply done as soon as the page shows what the goal asks for; do not keep browsing. For a list, give the top items with their prices or key facts.
@@ -76,7 +80,7 @@ Rules:
 - Never buy, pay, check out, place or submit an order, delete, unsubscribe or log out unless the goal asks for it and says it is confirmed; otherwise stop with needs_confirm. Add to cart only when the goal asks for it.
 - CAPTCHA, "unusual traffic" or app-only pages: stop with blocked.
 - If an action leads to a login, verification or error page, do not go back and retry it: stop (needs_input or blocked) and say what the page shows.
-- If the page is an error page or the wrong site, use search.
+- If the page is an error page or the wrong site, use google.
 - Do not repeat an action that did not change the page; try something else.
 - Write answer and reason in the language of the goal.`;
 
@@ -85,27 +89,50 @@ const ADD_TO_CART = /加入購物車|放入購物車|加入購物籃|add to (car
 const SECRET_FIELD = /type=password|密碼|password|passcode|驗證碼|otp|one-time|一次性|卡號|card number|cvv|cvc|安全碼/i;
 const MAX_SNAPSHOT_CHARS = 11000;
 
+/** Escape raw newlines/tabs inside JSON strings: models often write a multi-line answer literally. */
+function escapeControlInStrings(json: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (inString) {
+      if (ch === "\\") { out += ch + (json[i + 1] ?? ""); i++; continue; }
+      if (ch === '"') inString = false;
+      else if (ch === "\n") { out += "\\n"; continue; }
+      else if (ch === "\r") { continue; }
+      else if (ch === "\t") { out += "\\t"; continue; }
+    } else if (ch === '"') {
+      inString = true;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function parseAction(text: string): Record<string, any> | undefined {
   const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/```(?:json)?/g, "");
-  const start = cleaned.indexOf("{");
-  if (start < 0) return undefined;
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (inString) {
-      if (ch === "\\") i++;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}" && --depth === 0) {
-      try {
-        const value = JSON.parse(cleaned.slice(start, i + 1));
-        return value && typeof value === "object" && typeof value.action === "string" ? value : undefined;
-      } catch {
-        return undefined;
+  // The action may follow some prose; try every object start until one parses.
+  for (let start = cleaned.indexOf("{"); start >= 0; start = cleaned.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      if (inString) {
+        if (ch === "\\") i++;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}" && --depth === 0) {
+        const candidate = cleaned.slice(start, i + 1);
+        for (const attempt of [candidate, escapeControlInStrings(candidate)]) {
+          try {
+            const value = JSON.parse(attempt);
+            if (value && typeof value === "object" && typeof value.action === "string") return value;
+          } catch {}
+        }
+        break;
       }
     }
   }
@@ -141,7 +168,7 @@ function shortUrl(url: string | undefined): string {
 }
 
 async function chat(llm: LlmConfig, messages: { role: string; content: string }[], signal?: AbortSignal): Promise<string> {
-  const body: Record<string, unknown> = { model: llm.model, messages, max_tokens: 1200 };
+  const body: Record<string, unknown> = { model: llm.model, messages, max_tokens: 2000 };
   if (llm.local) {
     body.temperature = 0;
     body.chat_template_kwargs = { enable_thinking: false };
@@ -162,7 +189,9 @@ async function chat(llm: LlmConfig, messages: { role: string; content: string }[
 }
 
 export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> {
-  const { goal, worker, session, llm, signal } = options;
+  const { goal, worker, session, signal } = options;
+  let llm = options.llm;
+  let switched: string | undefined;
   const maxSteps = options.maxSteps ?? 20;
   const deadline = Date.now() + (options.timeBudgetMs ?? 150_000);
   const started = Date.now();
@@ -198,6 +227,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     const body = snapshot.split("\n---\n").slice(1).join("\n---\n");
     return {
       status, answer: "", evidence: [], steps, url: page.url, title: page.title, screenshot,
+      ...(switched ? { planner_switched: switched } : {}),
       page_excerpt: body.slice(0, 1500), elapsed_ms: Date.now() - started, llm_ms: llmMs, browser_ms: browserMs,
       ...extra,
     };
@@ -229,28 +259,45 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
       (lastError ? `Last action failed: ${lastError}\n` : "") +
       `\nCurrent page:\n${view}\n\nReply with one JSON object.`;
     let action: Record<string, any> | undefined;
+    let lastReply = "";
+    let callError = "";
     for (let attempt = 0; attempt < 2 && !action; attempt++) {
       const t = Date.now();
       const messages = [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: user }];
-      if (attempt) messages.push({ role: "user", content: "Your reply was not one valid JSON action. Reply with ONLY one JSON object from the action list." });
+      if (attempt) messages.push({ role: "user", content: `Your reply was not one valid JSON action (it began: ${JSON.stringify(lastReply.slice(0, 160))}). Reply with ONLY one JSON object from the action list; write line breaks inside strings as \\n.` });
       let reply = "";
       try {
         reply = await chat(llm, messages, signal);
       } catch (error) {
         signal?.throwIfAborted();
         llmMs += Date.now() - t;
-        return finish("TASK_FAILED", { reason: `browser planner model failed: ${(error as Error).message}` });
+        callError = `browser planner model failed: ${(error as Error).message}`;
+        break;
       }
       llmMs += Date.now() - t;
+      lastReply = reply;
       action = parseAction(reply);
+      if (process.env.PI_BROWSER_AGENT_TRACE) progress(`· model: ${reply.replace(/\s+/g, " ").slice(0, 300)}`);
+    }
+    if (!action && options.fallbackLlm && options.fallbackLlm.model !== llm.model && !switched) {
+      // The conversation's model cannot drive the browser (seen: a 1.7B model answering with
+      // <tool_call> markup): continue the task on the known-good planner.
+      switched = `${llm.model} → ${options.fallbackLlm.model}`;
+      llm = options.fallbackLlm;
+      progress(`🔁 planner ${switched}`);
+      step--;
+      continue;
     }
     if (!action) {
-      return finish("TASK_FAILED", { reason: "the planner model did not return a valid action twice in a row" });
+      return finish("TASK_FAILED", { reason: callError || "the planner model did not return a valid action twice in a row" });
     }
     lastError = "";
-    const kind = String(action.action).toLowerCase();
+    let kind = String(action.action).toLowerCase();
     const ref = typeof action.ref === "string" ? action.ref.replace(/^@/, "").toLowerCase() : "";
     const line = ref ? elementLine(snapshot, ref) : undefined;
+    // Models say "select" for "choose this result": on anything but a dropdown that is a click.
+    if (kind === "select" && line && !/^\[e\d+\] select /.test(line)) kind = "click";
+    if (kind === "search") kind = "google";
 
     if (kind === "done") {
       const answer = String(action.answer ?? "").trim();
@@ -329,11 +376,11 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     } else if (kind === "back") {
       command = "back";
       label = "⬅️ back";
-    } else if (kind === "search") {
+    } else if (kind === "google") {
       const query = String(action.query ?? "").trim();
-      if (!query) { lastError = "search needs a query"; continue; }
+      if (!query) { lastError = "google needs a query"; continue; }
       command = `open ${quote(`https://www.google.com/search?hl=zh-TW&gl=tw&q=${encodeURIComponent(query)}`)}`;
-      label = `🔎 search ${quote(query)}`;
+      label = `🔎 google ${quote(query)}`;
     } else if (kind === "open") {
       const url = String(action.url ?? "").trim();
       const allowed = url && (goal.includes(url) || url === options.url || /^https:\/\/www\.google\.[a-z.]+\/search\?/.test(url));

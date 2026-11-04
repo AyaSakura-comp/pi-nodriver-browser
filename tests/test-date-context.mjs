@@ -31,6 +31,6 @@ test('midnight changes only appended date context, never the system prefix or pr
   }
   assert.match(tools.get('research').description,/Usage rules:\n- research is the default tool/);
   assert.match(tools.get('crawl').description,/never guess URLs/);
-  assert.match(tools.get('browser_intent').description,/Usage rules:\n- browser_intent takes \{url\?, goal\}/);
+  assert.match(tools.get('browser_intent').description,/Usage rules:\n(?:- .*\n)*- browser_intent takes \{url\?, goal\}/);
  } finally {globalThis.Date=OriginalDate;}
 });

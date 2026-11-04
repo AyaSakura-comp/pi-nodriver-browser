@@ -59,6 +59,7 @@ const DESCRIPTION = `Live browser autopilot on the shared, logged-in Chrome. Giv
 A screenshot of where it ended is attached.`;
 
 const GUIDELINES = [
+  "When the user asks to use the browser or to act on a website (用瀏覽器、打開網站、幫我點/登入/填表/操作), call browser_intent, not research.",
   "browser_intent takes {url?, goal}: put what to find or do and every constraint in the goal (e.g. \"price of the single unit, not a bundle; do not add to cart\"). The autopilot does the clicking; one call per user goal.",
   "url can be any start page: the exact page when you have it, otherwise the site's home page or a Google search URL. Omit url to continue on the page this conversation's last browser task ended on (follow-ups, screenshots).",
   "When the user gives login details or a one-time code for a page the previous call stopped at, call again without url and put them in the goal; they are typed only into the fields that ask for them.",
@@ -87,6 +88,8 @@ function summary(result: TaskResult, goal: string, planner: string): string {
 }
 
 export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLike & { cleanupSession?(id: string): Promise<void> }) {
+  // One tab per Pi session: parallel calls would drive the same page at once, so they queue.
+  const queues = new Map<string, Promise<unknown>>();
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
       await worker.cleanupSession?.(`intent-${ctx.sessionManager.getSessionId()}`);
@@ -109,6 +112,7 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
       if (!goal) throw new Error("browser_intent needs a goal");
       const url = typeof params.url === "string" && params.url.trim() ? params.url.trim() : undefined;
       const { llm, note } = await plannerFor(ctx);
+      const fallbackLlm: LlmConfig = { endpoint: DEFAULT_ENDPOINT, model: DEFAULT_MODEL, local: isLocal(DEFAULT_ENDPOINT) };
       const started = Date.now();
       const lines = [`🎯 瀏覽任務：${goal}`];
       // piweb shows one progress row per update from details.message (transport/web.ts).
@@ -117,17 +121,27 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
         details: { message },
       });
       show(lines[0]);
+      const session = `intent-${ctx.sessionManager.getSessionId()}`;
+      const previous = queues.get(session) ?? Promise.resolve();
+      let release = () => {};
+      const mine = new Promise<void>((resolve) => { release = resolve; });
+      const chained = previous.then(() => mine);
+      queues.set(session, chained);
+      await previous.catch(() => undefined);
       const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(170_000)]);
       const result = await runBrowserTask({
-        goal, url, confirm: params.confirm === true, session: `intent-${ctx.sessionManager.getSessionId()}`,
-        worker, llm, signal: bounded,
+        goal, url, confirm: params.confirm === true, session,
+        worker, llm, fallbackLlm, signal: bounded,
         onProgress: (line) => {
           const stamped = `${((Date.now() - started) / 1000).toFixed(1)}s ${line}`;
           lines.push(stamped);
           show(stamped);
         },
+      }).finally(() => {
+        release();
+        if (queues.get(session) === chained) queues.delete(session);
       });
-      const details = { ...result, planner: note };
+      const details = { ...result, planner: result.planner_switched ? `${note} → ${DEFAULT_MODEL} (fallback)` : note };
       const content: any[] = [{ type: "text" as const, text: `${summary(result, goal, note)}\n\n\`\`\`json\n${JSON.stringify(details, null, 1)}\n\`\`\`` }];
       if (result.screenshot) {
         try {

@@ -54,8 +54,8 @@ and `~/.pi/agent/nodriver-browser-events.jsonl`; Chrome's own log is
 `{url?, goal, confirm?}`. One LLM (the conversation's model when it speaks
 `/chat/completions`, otherwise `PI_BROWSER_AGENT_URL`/`PI_BROWSER_AGENT_MODEL`, default
 local `qwen3.8-flash` on :8090) reads a page snapshot and answers with one JSON action
-per step: `click`, `type` (+submit), `select`, `press`, `scroll`, `back`, `search`
-(Google), `open` (only URLs written in the goal), `done`, `stop`. At most 20 steps /
+per step: `click`, `type` (+submit), `select` (dropdowns; on anything else it is a click), `press`, `scroll`, `back`,
+`google` (Google search), `open` (only URLs written in the goal), `done`, `stop`. At most 20 steps /
 150 s. The snapshot lists visible text in page order with interactive elements inline
 as `[eN] role "name"`, so a price sits next to its product link.
 
