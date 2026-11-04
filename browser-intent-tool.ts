@@ -54,7 +54,7 @@ const DESCRIPTION = `Live browser autopilot on the shared, logged-in Chrome. Giv
 - TASK_UNVERIFIED: an answer whose quotes were not all found on the page; check it before relying on it.
 - TASK_NEEDS_INPUT: a login or verification step needs values the goal does not give; reason lists the fields. Ask the user; never invent credentials.
 - TASK_NEEDS_CONFIRM: the next step is irreversible (buy, pay, submit an order, delete, log out, or add to cart when not asked). Ask the user; call again with confirm=true only if they agree.
-- TASK_BLOCKED: CAPTCHA, anti-bot or app-only wall. Tell the user; do not retry right away.
+- TASK_BLOCKED: CAPTCHA, anti-bot or app-only wall. Tell the user; do not retry it or work around it (no verification clicks, curl, site APIs or proxies).
 - TASK_STOPPED / TASK_FAILED: not reached; steps show how far it got.
 A screenshot of where it ended is attached.`;
 
@@ -66,6 +66,15 @@ const GUIDELINES = [
   "TASK_DONE answers are already checked against the page: answer from them right away instead of calling again to re-check.",
   "To send the final screenshot to the user, include the returned [[image: <path>]] marker in your reply.",
 ];
+
+// What the conversation's model should do with each stop, said where it reads the result
+// (seen: after TASK_BLOCKED on Dcard, Qwen asked the autopilot to click the Cloudflare box,
+// then tried curl with a browser User-Agent and a reader proxy).
+const NEXT: Record<string, string> = {
+  TASK_BLOCKED: "Next: tell the user this site blocks automated browsing. Do not ask to click its verification, call browser_intent on it again, or fetch it another way (curl, its API, proxies or reader services).",
+  TASK_NEEDS_INPUT: "Next: ask the user for the fields above. Never guess or invent credentials or codes.",
+  TASK_NEEDS_CONFIRM: "Next: ask the user. Call again with confirm=true only after they agree to this exact step.",
+};
 
 function summary(result: TaskResult, goal: string, planner: string): string {
   const head: Record<string, string> = {
@@ -80,6 +89,7 @@ function summary(result: TaskResult, goal: string, planner: string): string {
   const lines = [`${head[result.status] ?? result.status}：${goal}`];
   if (result.answer) lines.push("", result.answer);
   if (result.reason) lines.push("", `原因：${result.reason}`);
+  if (NEXT[result.status]) lines.push("", NEXT[result.status]);
   if (result.steps.length) lines.push("", "步驟：", ...result.steps.map((s, i) => `${i + 1}. ${s}`));
   if (result.url) lines.push("", `目前頁面：${result.title || ""} ${result.url}`);
   if (result.screenshot) lines.push(`截圖：[[image: ${result.screenshot}]]`);

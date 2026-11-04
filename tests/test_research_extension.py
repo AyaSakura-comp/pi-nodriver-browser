@@ -272,3 +272,19 @@ assert.ok(tools.has('browser_intent'));
 await handlers.get('session_shutdown')?.({type:'session_shutdown',reason:'quit'},{sessionManager:{getSessionId:()=> 's1'}});
 assert.deepEqual(cleaned,[]);
 ''',suffix='.mts')
+
+    def test_a_blocked_result_tells_the_model_not_to_work_around_the_wall(self):
+        source=(ROOT/'browser-intent-tool.ts').read_text()
+        source=source.replace('import { Type } from "typebox";','const Type=new Proxy({}, {get:()=> (...args)=>args[0]});',1)
+        source=source.replace('import { runBrowserTask, type LlmConfig, type TaskResult, type WorkerLike } from "./browser-agent.ts";',
+            'const runBrowserTask = async () => ({status:"TASK_BLOCKED",answer:"",reason:"Cloudflare 驗證頁",steps:["open https://www.dcard.tw/popular → Just a moment..."],elapsed_ms:1200});',1)
+        source=source.replace('export default function registerBrowserIntent','function registerBrowserIntent',1)
+        self.run_node(source+'''
+import assert from 'node:assert/strict';
+const tools=new Map();
+registerBrowserIntent({on(){},registerTool:t=>tools.set(t.name,t)},{async request(){return {};}});
+const ctx={model:undefined,sessionManager:{getSessionId:()=> 's1'}};
+const result=await tools.get('browser_intent').execute('c1',{url:'https://www.dcard.tw/popular',goal:'熱門文章'},undefined,undefined,ctx);
+assert.match(result.content[0].text,/Next: tell the user this site blocks automated browsing\. Do not ask to click its verification/);
+''',suffix='.mts')
+
