@@ -69,6 +69,7 @@ Reply with exactly one JSON object and nothing else. Actions:
 Rules:
 - Use only refs from the latest snapshot. If what you need is not listed, scroll or use the site's search box.
 - To find an item on a site, type into the site's search box with "submit":true in one step.
+- Among similar options (suggestions, stations, products), choose the one whose name equals what the goal names; an option with extra words ("-環島", "Pro", "2入組") is a different item.
 - Reply done as soon as the page shows what the goal asks for; do not keep browsing. For a list, give the top items with their prices or key facts.
 - evidence: 1-3 short quotes copied character for character from the current page.
 - Never type passwords, OTP/verification codes, card numbers or personal data unless the goal gives them. At a login or verification wall the goal cannot pass, stop with needs_input and list the fields the page asks for.
