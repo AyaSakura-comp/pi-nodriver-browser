@@ -87,14 +87,10 @@ function summary(result: TaskResult, goal: string, planner: string): string {
   return lines.join("\n");
 }
 
-export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLike & { cleanupSession?(id: string): Promise<void> }) {
-  // One tab per Pi session: parallel calls would drive the same page at once, so they queue.
+export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLike) {
+  // One window per conversation: parallel calls would drive the same page at once, so they
+  // queue. The window outlives the Pi process (see session_shutdown in index.ts).
   const queues = new Map<string, Promise<unknown>>();
-  pi.on("session_shutdown", async (_event, ctx) => {
-    try {
-      await worker.cleanupSession?.(`intent-${ctx.sessionManager.getSessionId()}`);
-    } catch {}
-  });
 
   pi.registerTool({
     name: "browser_intent",

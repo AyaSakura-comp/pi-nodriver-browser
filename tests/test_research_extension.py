@@ -169,7 +169,7 @@ class NodriverWorker {
       {url:'https://www.example.com/path/?x=%2f#first',discoveries:[{provider:'4get',taskId:'q1'}]},
       {url:'https://WWW.EXAMPLE.COM/path/?x=%2f#second',discoveries:[{provider:'google',taskId:'q2'}]}
     ]};}
-  async cleanupSession() {} disconnect() {}
+  async cleanupSession(id) { (globalThis.cleaned ??= []).push(id); } disconnect() {}
  async prefetch(q,i,sid) { (globalThis.prefetched ??= []).push([q,i,sid]); }
 }
 ''' + source + '''
@@ -213,6 +213,8 @@ assert.equal(actualParams.answer,'depth','asking for detail in so many words is 
 await handlers.get('input')({text:'[Web user: web]\\n這個是什麼'},ctx);
 await tool.execute('call',{q1:'fixture'},undefined,undefined,ctx);
 assert.equal(actualParams.answer,'breadth','a pointer word with no earlier answer is not a pick');
+await handlers.get('session_shutdown')({type:'session_shutdown',reason:'quit'},ctx);
+assert.deepEqual(globalThis.cleaned,['owner'],'research tabs close with the process; the browser_intent window (intent-owner) stays for the next turn');
 ''',suffix='.mts')
 
     def test_active_prefill_drives_begin_append_end_and_reports_stats(self):
@@ -253,3 +255,20 @@ assert.deepEqual(log,[['begin','call-1'],['append','stable'],['append',' prefix'
 assert.deepEqual(result.details.prefill,{state:'ended',warmedChars:13});
 ''',suffix='.mts')
 
+
+    def test_browser_intent_window_outlives_the_pi_process(self):
+        # piweb ends Pi after each Life turn or 10 idle minutes; the next turn of the same
+        # conversation (a login code, "open the first result") must find its page.
+        source=(ROOT/'browser-intent-tool.ts').read_text()
+        source=source.replace('import { Type } from "typebox";','const Type=new Proxy({}, {get:()=> (...args)=>args[0]});',1)
+        source=source.replace('from "./browser-agent.ts"',f'from "{(ROOT/"browser-agent.ts").as_uri()}"',1)
+        source=source.replace('export default function registerBrowserIntent','function registerBrowserIntent',1)
+        self.run_node(source+'''
+import assert from 'node:assert/strict';
+const tools=new Map(),handlers=new Map(),cleaned=[];
+registerBrowserIntent({on:(n,h)=>handlers.set(n,h),registerTool:t=>tools.set(t.name,t)},
+  {async request(){return {};},async cleanupSession(id){cleaned.push(id);}});
+assert.ok(tools.has('browser_intent'));
+await handlers.get('session_shutdown')?.({type:'session_shutdown',reason:'quit'},{sessionManager:{getSessionId:()=> 's1'}});
+assert.deepEqual(cleaned,[]);
+''',suffix='.mts')

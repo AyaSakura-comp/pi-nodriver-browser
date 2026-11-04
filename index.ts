@@ -974,11 +974,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // browser_intent's window (session `intent-<id>`) is deliberately left open: piweb and
+  // piscord end the Pi process after each Life turn or 10 idle minutes, and the next turn
+  // of the same conversation (a login code, "open the first result") must find its page.
+  // The worker closes windows idle for 30 minutes.
   pi.on("session_shutdown", async (_event, ctx) => {
     const currentSessionId = ctx.sessionManager.getSessionId();
     try {
       await worker.cleanupSession(currentSessionId);
-      await worker.cleanupSession(`intent-${currentSessionId}`);
     } finally {
       worker.disconnect();
     }

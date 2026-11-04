@@ -38,8 +38,10 @@ worker was restarted by hand. Now:
 - when idle, Chrome is probed every 5 minutes (`PI_BROWSER_IDLE_PROBE_SECONDS`) and a
   command arriving after 30 s idle is probed first, so a browser that wedged while
   nobody used it is replaced before or at the next request;
-- one window per Pi session (a background tab pauses `requestAnimationFrame`, which
-  left virtual lists half rendered), session tabs close after 30 idle minutes, crawl
+- one window per Pi conversation (a background tab pauses `requestAnimationFrame`, which
+  left virtual lists half rendered); it stays open when the Pi process exits, so the next
+  turn of the same conversation continues on its page (piweb ends Pi after each Life turn
+  or 10 idle minutes), and closes after 30 idle minutes (`PI_BROWSER_IDLE_TAB_SECONDS`); crawl
   and search tabs are temporary and always closed, and more than 40 foreign tabs
   (left by other scripts) are trimmed;
 - JavaScript dialogs are answered automatically (an open `alert` blocks the page);
