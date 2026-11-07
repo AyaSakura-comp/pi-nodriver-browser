@@ -77,10 +77,15 @@ function lastAssistantText(ctx: ExtensionContext): string {
   return "";
 }
 
-/** `"crawlGuards": false` in browser-config.json exempts crawl from RESEARCH_FIRST and RESEARCH_DONE_GUARD. */
+/** `"crawlGuards": false` in browser-config.json exempts crawl from RESEARCH_FIRST and RESEARCH_DONE_GUARD.
+ * A missing or unreadable file keeps the guards on. */
 function crawlGuardsSetting(): boolean {
   const path = join(process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent"), "browser-config.json");
-  return !existsSync(path) || JSON.parse(readFileSync(path, "utf8")).crawlGuards !== false;
+  try {
+    return !existsSync(path) || JSON.parse(readFileSync(path, "utf8")).crawlGuards !== false;
+  } catch {
+    return true;
+  }
 }
 
 function truncated(text: string): { output: string; truncated: boolean } {

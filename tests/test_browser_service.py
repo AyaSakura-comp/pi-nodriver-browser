@@ -81,7 +81,7 @@ class FakeChrome:
         if expression is worker.IMAGE_CANDIDATES_JS:
             return []
         if expression is worker.GOOGLE_RESULTS_JS:
-            return [{'title': 'Result', 'url': 'https://example.com/a', 'snippet': 's' * 600, 'truncated': True}]
+            return [{'title': 'Result', 'url': 'https://example.com/a', 'snippet': 's' * 600}]
         if 'innerText' in expression:
             return self.body
         return None
@@ -178,12 +178,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['ok'])
         self.assertIn('HTTP 404', result['error'])
 
-    async def test_google_search_parses_results_and_keeps_truncation_flag(self):
+    async def test_google_search_parses_results_and_closes_its_tab(self):
         result = await self.service.search_one({'query': 'q', 'direction': 'official'}, 0, 'owner',
-                                               asyncio.Semaphore(1), research=True)
+                                               asyncio.Semaphore(1))
         self.assertTrue(result['ok'])
         self.assertEqual(result['results'][0]['url'], 'https://example.com/a')
-        self.assertTrue(result['results'][0]['truncated'])
         self.assertEqual(self.chrome.targets, {})
 
     async def test_owner_cleanup_closes_only_that_owners_temp_tabs(self):

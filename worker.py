@@ -458,7 +458,7 @@ class BrowserService:
             if tab_owner == owner:
                 await self._close_temp(target_id)
 
-    async def search_one(self, search, idx, session_id, search_slots, *, research=False):
+    async def search_one(self, search, idx, session_id, search_slots):
         started = time.monotonic()
         result = {'index': idx + 1, 'direction': search.get('direction', ''), 'query': search['query'],
                   'results': [], 'ok': False, 'error': None}
@@ -476,8 +476,8 @@ class BrowserService:
                 if any(marker in f'{title}\n{body}'.lower() for marker in GOOGLE_BLOCK_MARKERS):
                     raise PageError('Google anti-bot or consent challenge detected')
                 result['results'] = [
-                    {'title': row['title'].strip(), 'url': row['url'].strip(), 'snippet': row['snippet'].strip(),
-                     **({'truncated': row['truncated']} if research else {})} for row in rows]
+                    {'title': row['title'].strip(), 'url': row['url'].strip(), 'snippet': row['snippet'].strip()}
+                    for row in rows]
                 result['ok'] = bool(result['results'])
                 if not result['ok']:
                     result['error'] = 'No Google result links extracted'
@@ -673,8 +673,8 @@ async def server_main(socket_path):
             except Exception as error:
                 message = f'{type(error).__name__}: {error}'
                 if action == 'research':  # research reports a code, not the exception
-                    message = ('research_cleanup_incomplete' if str(error) in
-                               ('research_cleanup_incomplete', 'crawl_cleanup_incomplete') else 'research_failed')
+                    message = ('research_cleanup_incomplete' if str(error) == 'research_cleanup_incomplete'
+                               else 'research_failed')
                 response = {**base, 'ok': False, 'error': message}
             finally:
                 active.pop(request_id, None)

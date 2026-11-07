@@ -14,8 +14,7 @@
       .map(line => line.trim())
       .filter(line => line && line !== title && !/^https?:\/\//i.test(line));
     const snippet = explicitSnippet || lines.slice(0, 4).join(' ');
-    rows.push({ title, url, snippet: snippet.slice(0, 600),
-      truncated: snippet.length > 600 || (!explicitSnippet && lines.length > 4) });
+    rows.push({ title, url, snippet: snippet.slice(0, 600) });
   }
   return rows.slice(0, 20);
 })()
