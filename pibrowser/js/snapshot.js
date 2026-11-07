@@ -3,11 +3,11 @@
 // Walks the DOM in document order and emits visible text lines with interactive
 // elements inline as "[eN] role "name"", so prices stay next to their product link.
 // Refs are kept in window.__pi.refs until the next snapshot.
-((opts) => {
-  const MAX_CHARS = opts.maxChars || 14000;
-  const MAX_ELEMENTS = opts.maxElements || 600;
-  const TIME_BUDGET_MS = opts.timeBudgetMs || 1500;
-  const FROM_VIEWPORT = !!opts.fromViewport;
+// fromViewport: leave out blocks scrolled above the viewport (after a scroll).
+((fromViewport) => {
+  const MAX_CHARS = 14000;
+  const MAX_ELEMENTS = 600;
+  const TIME_BUDGET_MS = 1500;
   const started = performance.now();
   const state = window.__pi || (window.__pi = {});
   const refs = state.refs = new Map();
@@ -211,7 +211,7 @@
     const sized = rect.width > 0 || rect.height > 0;
     if (s.position === 'fixed') clip = null;
     if (clip && sized && !intersects(rect, clip)) return;
-    if (FROM_VIEWPORT && block && rect.bottom < -20 && s.position !== 'fixed' && s.position !== 'sticky') return;
+    if (fromViewport && block && rect.bottom < -20 && s.position !== 'fixed' && s.position !== 'sticky') return;
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
       flush();
       let doc = null;
@@ -296,6 +296,5 @@
     scrollY: Math.round(window.scrollY),
     scrollHeight: Math.round(scroller ? scroller.scrollHeight : 0),
     viewportHeight: vh,
-    ms: Math.round(performance.now() - started),
   };
 })

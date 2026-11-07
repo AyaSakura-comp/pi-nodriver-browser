@@ -24,19 +24,17 @@ class CDPClosed(CDPError):
 
 
 class Connection:
-    def __init__(self, ws_url):
-        self.ws_url = ws_url
+    def __init__(self):
         self._ws = None
         self._ids = itertools.count(1)
         self._pending = {}
-        self._listeners = []
+        self._listeners = []  # (method, session or None for browser-level events, callback)
         self._reader = None
         self.closed = False
 
-    async def connect(self, timeout=10.0):
+    async def connect(self, ws_url, timeout=10.0):
         self._ws = await asyncio.wait_for(
-            websockets.connect(self.ws_url, max_size=None, ping_interval=None,
-                               open_timeout=timeout, close_timeout=1),
+            websockets.connect(ws_url, max_size=None, ping_interval=None, open_timeout=timeout, close_timeout=1),
             timeout)
         self._reader = asyncio.create_task(self._read(), name='cdp-reader')
 
@@ -54,16 +52,13 @@ class Connection:
                     else:
                         future.set_result(message.get('result', {}))
                     continue
-                method = message.get('method')
-                session = message.get('sessionId')
-                params = message.get('params', {})
-                for wanted_method, wanted_session, callback in tuple(self._listeners):
-                    if wanted_method not in (None, method) or wanted_session not in (None, session):
-                        continue
-                    try:
-                        callback(method, params, session)
-                    except Exception:
-                        pass
+                method, session = message.get('method'), message.get('sessionId')
+                for wanted, wanted_session, callback in tuple(self._listeners):
+                    if wanted == method and wanted_session in (None, session):
+                        try:
+                            callback(message.get('params', {}))
+                        except Exception:
+                            pass
         except Exception:
             pass
         finally:
@@ -74,16 +69,8 @@ class Connection:
             self._pending.clear()
 
     def on(self, method, callback, session=None):
-        """Call callback(method, params, sessionId) for matching events; returns an unsubscribe function."""
-        entry = (method, session, callback)
-        self._listeners.append(entry)
-
-        def remove():
-            try:
-                self._listeners.remove(entry)
-            except ValueError:
-                pass
-        return remove
+        """Call callback(params) for every `method` event (of one tab session, if given)."""
+        self._listeners.append((method, session, callback))
 
     def drop_session(self, session):
         self._listeners = [entry for entry in self._listeners if entry[1] != session]

@@ -1,4 +1,4 @@
-JSON.stringify((() => {
+(() => {
   const rows = [];
   for (const anchor of document.querySelectorAll('a')) {
     const heading = anchor.querySelector('h3');
@@ -18,4 +18,4 @@ JSON.stringify((() => {
       truncated: snippet.length > 600 || (!explicitSnippet && lines.length > 4) });
   }
   return rows.slice(0, 20);
-})())
+})()

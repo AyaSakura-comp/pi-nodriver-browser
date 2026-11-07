@@ -1,256 +1,158 @@
-JSON.stringify((() => {
-  const MAX_CANDIDATES = 8;
-  const MAX_CANDIDATE_POOL = 64;
-  const MAX_JSON_LD_BYTES = 1000000;
+// Image candidates of a crawled page, best first (at most 8): Open Graph / Twitter card
+// images, JSON-LD images, <img> (lazy-loading attributes too) and video posters. Logos,
+// icons, tracking pixels and images under 128 px are dropped.
+(() => {
   const candidates = new Map();
-  const short = (value, limit = 240) => String(value || '').slice(0, limit * 4)
-    .replace(/\s+/g, ' ').trim().slice(0, limit);
-  const number = value => {
+  const short = (value, limit = 240) => String(value || '').slice(0, limit * 4).replace(/\s+/g, ' ').trim().slice(0, limit);
+  const number = (value) => {
     if (value && typeof value === 'object') value = value.value;
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 && parsed <= 100000 ? Math.round(parsed) : 0;
   };
-  const resolveUrl = value => {
-    const input = String(value || '');
-    if (!input || input.length > 4096) return '';
-    const raw = input.trim();
-    if (!raw || /^(?:data|blob|javascript):/i.test(raw)) return '';
+  const resolveUrl = (value) => {
+    const raw = String(value || '');
+    if (raw.length > 4096 || !raw.trim() || /^(?:data|blob|javascript):/i.test(raw.trim())) return '';
     try {
-      const parsed = new URL(raw, document.baseURI);
-      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port === '0') return '';
-      parsed.hash = '';
-      return parsed.href.length <= 4096 ? parsed.href : '';
+      const url = new URL(raw.trim(), document.baseURI);
+      url.hash = '';
+      // "[[" or "]]" would read as an [[image: …]] marker in the crawl text.
+      return /^https?:$/.test(url.protocol) && !url.username && !url.password && url.port !== '0' &&
+        url.href.length <= 4096 && !/\[\[|\]\]/.test(url.href) ? url.href : '';
     } catch (_) { return ''; }
   };
-  const utilityPattern = /(?:^|[\s_\-/.])(logo|icon|avatar|sprite|emoji|tracking|pixel|spinner|placeholder|badge|favicon|blank|transparent|spacer)(?:[\s_\-/.]|$)/i;
-  const add = candidate => {
-    const url = resolveUrl(candidate.url);
+  const UTILITY = /(?:^|[\s_\-/.])(logo|icon|avatar|sprite|emoji|tracking|pixel|spinner|placeholder|badge|favicon|blank|transparent|spacer)(?:[\s_\-/.]|$)/i;
+  const add = (c) => {
+    const url = resolveUrl(c.url);
     if (!url) return false;
-    const normalized = {
-      url,
-      source: short(candidate.source, 80) || 'unknown',
-      role: ['representative', 'content', 'gallery', 'thumbnail'].includes(candidate.role)
-        ? candidate.role : 'content',
-      width: number(candidate.width),
-      height: number(candidate.height),
-      alt: short(candidate.alt),
-      caption: short(candidate.caption),
-      score: number(candidate.score) || 1
+    const item = {
+      url, source: short(c.source, 80) || 'unknown',
+      role: ['representative', 'content', 'gallery', 'thumbnail'].includes(c.role) ? c.role : 'content',
+      width: number(c.width), height: number(c.height), alt: short(c.alt), caption: short(c.caption),
+      score: number(c.score) || 1,
     };
-    const utilityContext = `${normalized.url} ${normalized.alt} ${normalized.caption}`;
-    if (
-      utilityPattern.test(utilityContext)
-      || (normalized.width && normalized.height && Math.max(normalized.width, normalized.height) < 128)
-    ) return false;
-
-    const existing = candidates.get(url);
-    if (existing) {
-      const preferred = normalized.score >= existing.score ? normalized : existing;
-      const fallback = preferred === normalized ? existing : normalized;
-      candidates.set(url, {
-        ...preferred,
-        width: preferred.width || fallback.width,
-        height: preferred.height || fallback.height,
-        alt: preferred.alt || fallback.alt,
-        caption: preferred.caption || fallback.caption,
-        score: Math.max(preferred.score, fallback.score)
-      });
+    if (UTILITY.test(`${url} ${item.alt} ${item.caption}`) ||
+        (item.width && item.height && Math.max(item.width, item.height) < 128)) return false;
+    const old = candidates.get(url);
+    if (old) {  // the same image found twice: keep the better entry, fill its gaps from the other
+      const [best, other] = item.score >= old.score ? [item, old] : [old, item];
+      candidates.set(url, {...best, width: best.width || other.width, height: best.height || other.height,
+        alt: best.alt || other.alt, caption: best.caption || other.caption, score: Math.max(best.score, other.score)});
       return true;
     }
-    if (candidates.size >= MAX_CANDIDATE_POOL) {
-      let weakestKey = '';
-      let weakestScore = Infinity;
-      for (const [key, value] of candidates) {
-        if (value.score < weakestScore) {
-          weakestKey = key;
-          weakestScore = value.score;
-        }
-      }
-      if (normalized.score <= weakestScore) return false;
-      candidates.delete(weakestKey);
+    if (candidates.size >= 64) {  // bounded pool: a new entry must beat the weakest
+      let weakest = null;
+      for (const entry of candidates) if (!weakest || entry[1].score < weakest[1].score) weakest = entry;
+      if (item.score <= weakest[1].score) return false;
+      candidates.delete(weakest[0]);
     }
-    candidates.set(url, normalized);
+    candidates.set(url, item);
     return true;
   };
 
+  // Open Graph: og:image starts a block that og:image:* fields describe.
+  const metas = [...document.getElementsByTagName('meta')].slice(0, 200);
+  const metaKey = (meta, first, second) => short(meta.getAttribute(first) || meta.getAttribute(second), 100).toLowerCase();
   const ogBlocks = [];
-  let currentOg = null;
-  const finishOg = () => {
-    if (currentOg) ogBlocks.push(currentOg);
-    currentOg = null;
-  };
-  const metas = document.getElementsByTagName('meta');
-  for (let index = 0; index < Math.min(metas.length, 200); index++) {
-    const meta = metas[index];
-    const key = short(meta.getAttribute('property') || meta.getAttribute('name'), 100).toLowerCase();
+  let og = null;
+  for (const meta of metas) {
+    const key = metaKey(meta, 'property', 'name');
     const content = meta.getAttribute('content') || '';
-    if (key === 'og:image') {
-      finishOg();
-      currentOg = { url: content, secureUrl: '', width: 0, height: 0, alt: '' };
-    } else if (key === 'og:image:url') {
-      const currentUrl = currentOg ? resolveUrl(currentOg.url) : '';
-      const aliasUrl = resolveUrl(content);
-      if (currentOg && currentUrl && currentUrl === aliasUrl) {
-        currentOg.url = content;
-      } else {
-        finishOg();
-        currentOg = { url: content, secureUrl: '', width: 0, height: 0, alt: '' };
-      }
-    } else if (currentOg && key === 'og:image:secure_url') {
-      currentOg.secureUrl = content;
-    } else if (currentOg && key === 'og:image:width') {
-      currentOg.width = content;
-    } else if (currentOg && key === 'og:image:height') {
-      currentOg.height = content;
-    } else if (currentOg && key === 'og:image:alt') {
-      currentOg.alt = content;
-    } else if (currentOg && key.startsWith('og:') && !key.startsWith('og:image:')) {
-      finishOg();
-    }
+    if (key === 'og:image' ||
+        (key === 'og:image:url' && !(og && resolveUrl(og.url) && resolveUrl(og.url) === resolveUrl(content)))) {
+      og = {url: content, secureUrl: '', width: 0, height: 0, alt: ''};
+      ogBlocks.push(og);
+    } else if (key === 'og:image:url') og.url = content;
+    else if (og && key === 'og:image:secure_url') og.secureUrl = content;
+    else if (og && key === 'og:image:width') og.width = content;
+    else if (og && key === 'og:image:height') og.height = content;
+    else if (og && key === 'og:image:alt') og.alt = content;
+    else if (og && key.startsWith('og:') && !key.startsWith('og:image:')) og = null;
   }
-  finishOg();
   let acceptedOg = 0;
-  for (let index = 0; index < ogBlocks.length; index++) {
-    const block = ogBlocks[index];
-    const score = Math.max(100, 120 - index);
-    let accepted = false;
-    if (block.secureUrl) {
-      accepted = add({
-        url: block.secureUrl,
-        source: 'og:image:secure_url',
-        role: 'representative',
-        width: block.width,
-        height: block.height,
-        alt: block.alt,
-        score
-      });
-    }
-    if (!accepted) {
-      accepted = add({
-        url: block.url,
-        source: 'og:image',
-        role: 'representative',
-        width: block.width,
-        height: block.height,
-        alt: block.alt,
-        score
-      });
-    }
-    if (accepted) acceptedOg++;
-  }
-  if (acceptedOg === 0) {
-    let twitterAlt = '';
-    for (let index = 0; index < Math.min(metas.length, 200); index++) {
-      const meta = metas[index];
-      const key = short(meta.getAttribute('name') || meta.getAttribute('property'), 100).toLowerCase();
-      if (key === 'twitter:image:alt') twitterAlt = short(meta.getAttribute('content'));
-    }
-    for (let index = 0; index < Math.min(metas.length, 200); index++) {
-      const meta = metas[index];
-      const key = short(meta.getAttribute('name') || meta.getAttribute('property'), 100).toLowerCase();
-      if (!['twitter:image', 'twitter:image:src'].includes(key)) continue;
-      add({
-        url: meta.getAttribute('content') || '',
-        source: key,
-        role: 'representative',
-        alt: twitterAlt,
-        score: 110
-      });
+  ogBlocks.forEach((block, index) => {
+    const base = {source: 'og:image', role: 'representative', width: block.width, height: block.height,
+                  alt: block.alt, score: Math.max(100, 120 - index)};
+    if ((block.secureUrl && add({...base, url: block.secureUrl, source: 'og:image:secure_url'})) ||
+        add({...base, url: block.url})) acceptedOg++;
+  });
+  if (!acceptedOg) {
+    let alt = '';
+    for (const meta of metas) if (metaKey(meta, 'name', 'property') === 'twitter:image:alt') alt = short(meta.getAttribute('content'));
+    for (const meta of metas) {
+      const key = metaKey(meta, 'name', 'property');
+      if (key === 'twitter:image' || key === 'twitter:image:src') {
+        add({url: meta.getAttribute('content') || '', source: key, role: 'representative', alt, score: 110});
+      }
     }
   }
 
-  const imageKeys = new Set([
-    'image', 'images', 'contenturl', 'thumbnail', 'thumbnailurl',
-    'primaryimageofpage', 'photo', 'photos', 'screenshot'
-  ]);
+  // JSON-LD: image-like keys anywhere in the structured data (bounded walk, logos skipped).
+  const IMAGE_KEYS = new Set(['image', 'images', 'contenturl', 'thumbnail', 'thumbnailurl',
+    'primaryimageofpage', 'photo', 'photos', 'screenshot']);
   let jsonNodes = 0;
-  let jsonBytes = 0;
-  const extractJsonImage = (value, key, depth) => {
+  const fromJson = (value, key, depth) => {
     if (depth > 8 || jsonNodes++ > 5000 || value == null) return;
-    const safeKey = String(key || '').slice(0, 80);
-    const normalizedKey = safeKey.replace(/[-_]/g, '').toLowerCase();
-    if (imageKeys.has(normalizedKey)) {
-      const values = Array.isArray(value) ? value : [value];
-      for (const item of values.slice(0, 20)) {
+    const name = String(key || '').slice(0, 80);
+    const normalized = name.replace(/[-_]/g, '').toLowerCase();
+    if (IMAGE_KEYS.has(normalized)) {
+      const thumbnail = normalized.includes('thumbnail');
+      for (const item of (Array.isArray(value) ? value : [value]).slice(0, 20)) {
         if (typeof item === 'string') {
-          add({ url: item, source: `jsonld:${safeKey}`, role: 'representative', score: 115 });
+          add({url: item, source: `jsonld:${name}`, role: 'representative', score: 115});
         } else if (item && typeof item === 'object') {
-          const imageUrl = item.contentUrl || item.thumbnailUrl || item.url || item['@id'];
-          add({
-            url: imageUrl,
-            source: `jsonld:${safeKey}`,
-            role: normalizedKey.includes('thumbnail') ? 'thumbnail' : 'representative',
-            width: item.width,
-            height: item.height,
-            alt: item.caption || item.name || item.description,
-            caption: item.caption,
-            score: normalizedKey.includes('thumbnail') ? 95 : 116
-          });
+          add({url: item.contentUrl || item.thumbnailUrl || item.url || item['@id'], source: `jsonld:${name}`,
+               role: thumbnail ? 'thumbnail' : 'representative', width: item.width, height: item.height,
+               alt: item.caption || item.name || item.description, caption: item.caption, score: thumbnail ? 95 : 116});
         }
       }
     }
     if (Array.isArray(value)) {
-      for (let index = 0; index < Math.min(value.length, 100); index++) {
-        extractJsonImage(value[index], key, depth + 1);
-      }
-    } else if (value && typeof value === 'object') {
+      value.slice(0, 100).forEach((child) => fromJson(child, key, depth + 1));
+    } else if (typeof value === 'object') {
       let count = 0;
       for (const childKey in value) {
         if (!Object.prototype.hasOwnProperty.call(value, childKey)) continue;
         if (count++ >= 100) break;
-        if (String(childKey).slice(0, 80).toLowerCase() === 'logo') continue;
-        extractJsonImage(value[childKey], childKey, depth + 1);
+        if (String(childKey).slice(0, 80).toLowerCase() !== 'logo') fromJson(value[childKey], childKey, depth + 1);
       }
     }
   };
-  const allScripts = document.getElementsByTagName('script');
-  let jsonScriptCount = 0;
-  for (let index = 0; index < Math.min(allScripts.length, 1000) && jsonScriptCount < 20; index++) {
-    const script = allScripts[index];
+  const scripts = document.getElementsByTagName('script');
+  let jsonBytes = 0;
+  for (let index = 0, jsonScripts = 0; index < Math.min(scripts.length, 1000) && jsonScripts < 20; index++) {
+    const script = scripts[index];
     if (short(script.getAttribute('type'), 80).toLowerCase() !== 'application/ld+json') continue;
-    jsonScriptCount++;
-    const childNodes = script.childNodes;
-    if (childNodes.length > 100) continue;
-    let payloadLength = 0;
-    let plainTextOnly = true;
-    for (let childIndex = 0; childIndex < childNodes.length; childIndex++) {
-      const child = childNodes[childIndex];
-      if (![3, 4].includes(child.nodeType)) {
-        plainTextOnly = false;
-        break;
-      }
-      payloadLength += Number(child.length || 0);
-      if (jsonBytes + payloadLength > MAX_JSON_LD_BYTES) break;
-    }
-    if (!plainTextOnly || !payloadLength || jsonBytes + payloadLength > MAX_JSON_LD_BYTES) continue;
+    jsonScripts++;
+    // Plain text only, at most 1 MB of JSON-LD per page.
+    const nodes = [...script.childNodes];
+    const size = nodes.reduce((sum, node) => sum + (node.length || 0), 0);
+    if (nodes.length > 100 || nodes.some((node) => node.nodeType !== 3 && node.nodeType !== 4) || !size ||
+        jsonBytes + size > 1000000) continue;
     const payload = script.textContent || '';
     jsonBytes += payload.length;
-    try { extractJsonImage(JSON.parse(payload), '', 0); } catch (_) {}
+    try { fromJson(JSON.parse(payload), '', 0); } catch (_) {}
   }
 
-  const srcsetUrl = value => {
+  // <img>: the loaded source, else a lazy-loading attribute; figures and main content rank higher.
+  const srcsetUrl = (value) => {
     let best = null;
-    const parts = String(value || '').slice(0, 16384).split(',', 50);
-    for (const part of parts) {
+    for (const part of String(value || '').slice(0, 16384).split(',', 50)) {
       const match = part.trim().match(/^(\S+)(?:\s+(\d+(?:\.\d+)?)(w|x))?$/);
       if (!match) continue;
       const weight = Number(match[2] || 1) * (match[3] === 'x' ? 10000 : 1);
-      if (!best || weight > best.weight) best = { url: match[1], weight };
+      if (!best || weight > best.weight) best = {url: match[1], weight};
     }
-    return best?.url || '';
+    return best ? best.url : '';
   };
-  const boundedText = (element, limit = 240) => {
-    if (!element) return '';
-    const childNodes = element.childNodes;
-    let output = '';
-    for (let index = 0; index < Math.min(childNodes.length, 20) && output.length < limit * 4; index++) {
-      const node = childNodes[index];
-      if (![3, 4].includes(node.nodeType)) continue;
-      output += ` ${node.substringData(0, Math.max(0, limit * 4 - output.length))}`;
+  const ownText = (element) => {
+    let text = '';
+    for (const node of [...(element?.childNodes || [])].slice(0, 20)) {
+      if (text.length >= 960) break;
+      if (node.nodeType === 3 || node.nodeType === 4) text += ` ${node.substringData(0, 960 - text.length)}`;
     }
-    return short(output, limit);
+    return short(text);
   };
-  const visible = element => {
+  const visible = (element) => {
     try {
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -258,90 +160,54 @@ JSON.stringify((() => {
         rect.width > 0 && rect.height > 0;
     } catch (_) { return false; }
   };
-  const unwanted = (element, url, alt) => {
-    const context = `${short(url, 4096)} ${short(alt)} ${short(element.id, 120)} ` +
-      `${short(element.className, 200)} ${short(element.parentElement?.id, 120)} ` +
-      `${short(element.parentElement?.className, 200)}`;
-    return utilityPattern.test(context);
-  };
-  const boundedAncestor = (element, predicate) => {
-    let current = element?.parentElement || null;
-    for (let depth = 0; current && depth < 12; depth++, current = current.parentElement) {
-      if (predicate(current)) return current;
+  const ancestor = (element, test) => {
+    for (let node = element.parentElement, depth = 0; node && depth < 12; node = node.parentElement, depth++) {
+      if (test(node)) return node;
     }
     return null;
   };
   const images = document.images;
-  for (let imageIndex = 0; imageIndex < Math.min(images.length, 1000); imageIndex++) {
-    const image = images[imageIndex];
+  for (let index = 0; index < Math.min(images.length, 1000); index++) {
+    const image = images[index];
+    const alt = short(image.getAttribute('alt') || image.getAttribute('aria-label') || image.getAttribute('title') || '');
     const choices = [
-      ['img.currentSrc', image.currentSrc],
-      ['img.src', image.getAttribute('src')],
-      ['img.srcset', srcsetUrl(image.getAttribute('srcset'))],
-      ['img.data-src', image.getAttribute('data-src')],
+      ['img.currentSrc', image.currentSrc], ['img.src', image.getAttribute('src')],
+      ['img.srcset', srcsetUrl(image.getAttribute('srcset'))], ['img.data-src', image.getAttribute('data-src')],
       ['img.data-srcset', srcsetUrl(image.getAttribute('data-srcset'))],
-      ['img.data-original', image.getAttribute('data-original')],
-      ['img.data-lazy-src', image.getAttribute('data-lazy-src')]
+      ['img.data-original', image.getAttribute('data-original')], ['img.data-lazy-src', image.getAttribute('data-lazy-src')],
     ];
-    const alt = short(
-      image.getAttribute('alt') || image.getAttribute('aria-label') || image.getAttribute('title') || ''
-    );
-    const hasLazyAlternative = choices.slice(3).some(([, value]) =>
-      resolveUrl(value) && !unwanted(image, value, alt)
-    );
-    const selected = choices.find(([source, value]) => {
-      if (!resolveUrl(value) || unwanted(image, value, alt)) return false;
-      const usesLoadedSource = source === 'img.currentSrc' || source === 'img.src';
-      if (!usesLoadedSource || !hasLazyAlternative) return true;
-      return Boolean(
-        image.naturalWidth
-        && image.naturalHeight
-        && Math.max(image.naturalWidth, image.naturalHeight) >= 128
-      );
-    });
+    const usable = ([, value]) => resolveUrl(value) && !UTILITY.test(
+      `${short(value, 4096)} ${short(alt)} ${short(image.id, 120)} ${short(image.className, 200)} ` +
+      `${short(image.parentElement?.id, 120)} ${short(image.parentElement?.className, 200)}`);
+    // A loaded source next to a lazy-loading one counts only when it is a real image (not a placeholder).
+    const lazy = choices.slice(3).some(usable);
+    const real = image.naturalWidth && image.naturalHeight && Math.max(image.naturalWidth, image.naturalHeight) >= 128;
+    const selected = choices.find((choice, choiceIndex) => usable(choice) && (choiceIndex > 1 || !lazy || real));
     if (!selected) continue;
-    const [source, rawUrl] = selected;
-    const usesLoadedSource = source === 'img.currentSrc' || source === 'img.src';
-    const width = number((usesLoadedSource && image.naturalWidth) || image.getAttribute('width'));
-    const height = number((usesLoadedSource && image.naturalHeight) || image.getAttribute('height'));
+    const loaded = selected[0] === 'img.currentSrc' || selected[0] === 'img.src';
+    const width = number((loaded && image.naturalWidth) || image.getAttribute('width'));
+    const height = number((loaded && image.naturalHeight) || image.getAttribute('height'));
     if (width && height && Math.max(width, height) < 128) continue;
-    const figure = boundedAncestor(image, element => element.tagName === 'FIGURE');
-    const inMain = Boolean(boundedAncestor(image, element =>
-      ['MAIN', 'ARTICLE'].includes(element.tagName) || element.getAttribute('role') === 'main'
-    ));
-    const isVisible = visible(image);
-    const caption = figure?.getElementsByTagName('figcaption')[0] || null;
-    add({
-      url: rawUrl,
-      source,
-      role: figure ? 'gallery' : 'content',
-      width,
-      height,
-      alt,
-      caption: boundedText(caption),
-      score: 55 + (figure ? 20 : 0) + (inMain ? 10 : 0) + (isVisible ? 8 : 0) +
-        (width * height >= 480000 ? 5 : 0)
-    });
+    const figure = ancestor(image, (element) => element.tagName === 'FIGURE');
+    const inMain = ancestor(image, (element) => ['MAIN', 'ARTICLE'].includes(element.tagName) ||
+      element.getAttribute('role') === 'main');
+    add({url: selected[1], source: selected[0], role: figure ? 'gallery' : 'content', width, height, alt,
+         caption: ownText(figure?.getElementsByTagName('figcaption')[0]),
+         score: 55 + (figure ? 20 : 0) + (inMain ? 10 : 0) + (visible(image) ? 8 : 0) + (width * height >= 480000 ? 5 : 0)});
   }
   const videos = document.getElementsByTagName('video');
-  let videoCount = 0;
-  for (let videoIndex = 0; videoIndex < Math.min(videos.length, 1000) && videoCount < 100; videoIndex++) {
-    const video = videos[videoIndex];
+  for (let index = 0, posters = 0; index < Math.min(videos.length, 1000) && posters < 100; index++) {
+    const video = videos[index];
     if (!video.getAttribute('poster')) continue;
-    videoCount++;
-    add({
-      url: video.getAttribute('poster'),
-      source: 'video.poster',
-      role: 'thumbnail',
-      width: video.videoWidth || video.getAttribute('width'),
-      height: video.videoHeight || video.getAttribute('height'),
-      alt: video.getAttribute('aria-label') || video.getAttribute('title') || '',
-      score: 50
-    });
+    posters++;
+    add({url: video.getAttribute('poster'), source: 'video.poster', role: 'thumbnail',
+         width: video.videoWidth || video.getAttribute('width'), height: video.videoHeight || video.getAttribute('height'),
+         alt: video.getAttribute('aria-label') || video.getAttribute('title') || '', score: 50});
   }
 
-  return Array.from(candidates.values())
-    .sort((a, b) => b.score - a.score || (b.width * b.height) - (a.width * a.height))
-    .slice(0, MAX_CANDIDATES)
-    .map((candidate, index) => ({ id: `img-${index + 1}`, ...candidate }));
-})())
+  const cut = (text) => Array.from(text).slice(0, 200).join('');
+  return [...candidates.values()]
+    .sort((a, b) => b.score - a.score || b.width * b.height - a.width * a.height)
+    .slice(0, 8)
+    .map((candidate, index) => ({id: `img-${index + 1}`, ...candidate, alt: cut(candidate.alt), caption: cut(candidate.caption)}));
+})()

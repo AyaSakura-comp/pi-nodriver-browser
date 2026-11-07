@@ -59,12 +59,10 @@ def check_url(url):
     return url
 
 
-async def download(url, *, max_bytes, timeout=15.0, accept='*/*', referer=None):
-    """GET url (redirects followed, each hop re-resolved publicly). Returns (bytes, final_url, content_type)."""
+async def download(url, *, max_bytes, timeout, accept):
+    """GET url (redirects followed, each hop re-resolved publicly). Returns (bytes, final_url)."""
     check_url(url)
     headers = {'User-Agent': USER_AGENT, 'Accept': accept}
-    if referer:
-        headers['Referer'] = referer
     connector = aiohttp.TCPConnector(resolver=PublicResolver(), limit=4)
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as http:
@@ -81,7 +79,7 @@ async def download(url, *, max_bytes, timeout=15.0, accept='*/*', referer=None):
                     if size > max_bytes:
                         raise FetchError(f'response exceeds {max_bytes} bytes')
                     chunks.append(chunk)
-                return b''.join(chunks), str(response.url), response.headers.get('Content-Type', '')
+                return b''.join(chunks), str(response.url)
     except FetchError:
         raise
     except asyncio.TimeoutError:
@@ -120,9 +118,9 @@ def safe_name(text, limit=48):
     return stem or 'file'
 
 
-async def fetch_image(url, directory, *, timeout=15.0):
-    data, final_url, _type = await download(url, max_bytes=IMAGE_MAX_BYTES, timeout=timeout,
-                                            accept='image/avif,image/webp,image/png,image/*;q=0.8,*/*;q=0.5')
+async def fetch_image(url, directory):
+    data, final_url = await download(url, max_bytes=IMAGE_MAX_BYTES, timeout=15.0,
+                                     accept='image/avif,image/webp,image/png,image/*;q=0.8,*/*;q=0.5')
     data, mime, suffix, width, height = await asyncio.to_thread(normalize_image, data)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -133,9 +131,9 @@ async def fetch_image(url, directory, *, timeout=15.0):
     return path, mime, width, height, final_url
 
 
-async def pdf_text(url, *, timeout=20.0):
-    data, final_url, _type = await download(url, max_bytes=PDF_MAX_BYTES, timeout=timeout,
-                                            accept='application/pdf,*/*;q=0.5')
+async def pdf_text(url, timeout=20.0):
+    data, _final_url = await download(url, max_bytes=PDF_MAX_BYTES, timeout=timeout,
+                                      accept='application/pdf,*/*;q=0.5')
     if not data.startswith(b'%PDF'):
         raise FetchError('not a PDF')
     process = await asyncio.create_subprocess_exec(
@@ -148,5 +146,4 @@ async def pdf_text(url, *, timeout=20.0):
         raise FetchError('pdftotext timed out') from None
     text = out.decode('utf-8', 'replace')
     text = re.sub(r'[ \t]+\n', '\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    return text, final_url
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
