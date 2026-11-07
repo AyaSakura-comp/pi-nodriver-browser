@@ -1,6 +1,3 @@
-# CDP over one websocket (pibrowser/cdp.py)
 websockets>=13
-Pillow==12.3.0
-idna==3.10
-# Bounded async HTTP for research providers (no Chrome needed for 4get).
 aiohttp>=3.9,<4
+Pillow==12.3.0

@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Watchdog for the services browser_intent depends on.
+"""Watchdog for the shared browser worker; browser-agent-watchdog.timer runs `check` every minute.
 
-Run once per minute (browser-agent-watchdog.timer). Each run health-checks every service,
-revives the dead ones, and appends incidents to events.jsonl so outages can be analysed later:
-
-    browser-agent-watchdog.py            # one check pass (what the timer runs)
-    browser-agent-watchdog.py status     # current health, no actions
-    browser-agent-watchdog.py report [--days 7]
-
-The death time comes from systemd/journal (when the process actually exited), not from when
-this check noticed, so a 60 s check interval does not blur the timeline. Stdlib only.
+A check asks the worker for `browser-health`: a page-level Chrome probe that relaunches a wedged
+Chrome by itself and does not start Chrome for an idle worker. A worker whose socket refuses is
+started again on the 2nd consecutive failed check (Pi also starts one on demand, so one miss may
+be a restart in progress); a worker that answers but keeps failing is replaced on the 3rd. At most
+3 revivals per hour. Outages with their cause (earlyoom, the kernel OOM killer, the exit status in
+the journal), revivals and recoveries go to ~/.local/state/browser-agent-watchdog/events.jsonl.
+Stdlib only: the unit runs it with /usr/bin/python3.
 """
-from __future__ import annotations
-
-import argparse
-import collections
+import contextlib
 import datetime as dt
 import json
 import os
@@ -23,366 +18,215 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
-STATE_DIR = Path(os.environ.get("BROWSER_WATCHDOG_DIR", HOME / ".local/state/browser-agent-watchdog"))
-EVENTS = STATE_DIR / "events.jsonl"
-STATE = STATE_DIR / "state.json"
-EXT = HOME / ".pi/agent/extensions/nodriver-browser"
-WORKER_SOCKET = Path(os.environ.get("PI_NODRIVER_SOCKET", HOME / ".pi/agent/nodriver-browser.sock"))
-WORKER_PREFIX = "pi-nodriver-browser-"
-
-MAX_RESTARTS_PER_HOUR = 3
-UNHEALTHY_RESTART_AFTER = 3     # consecutive failed checks while the process is still running
-WORKER_REVIVE_AFTER = 2         # pi also auto-starts the worker on demand; don't race it
-
-# browser_intent needs only the worker: its autopilot calls the conversation's own model.
-# The worker also replaces a wedged Chrome by itself (page-level probe), so the watchdog
-# only revives a dead worker process.
-SERVICES = [
-    {"name": "nodriver-worker", "scope": "user", "unit": None, "socket": str(WORKER_SOCKET),
-     "revive": "always", "ready_s": 30},
-]
+EXT = HOME / '.pi/agent/extensions/nodriver-browser'
+SOCKET = Path(os.environ.get('PI_NODRIVER_SOCKET', HOME / '.pi/agent/nodriver-browser.sock'))
+STATE_DIR = HOME / '.local/state/browser-agent-watchdog'
+EVENTS = STATE_DIR / 'events.jsonl'
+STATE = STATE_DIR / 'state.json'
+UNIT_PREFIX = 'pi-nodriver-browser-'
+NAME = 'nodriver-worker'  # "service" of every event, key of the state file
+MARKER = b'__PI_NODRIVER__'
+MAX_REVIVES_PER_HOUR = 3
 
 
-def now() -> float:
-    return time.time()
+def iso(ts):
+    return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec='seconds') if ts else None
 
 
-def iso(ts: float | None) -> str | None:
-    return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds") if ts else None
-
-
-def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess:
+def run(*cmd, timeout=30):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def systemctl(scope: str, *args: str, sudo: bool = False) -> subprocess.CompletedProcess:
-    cmd = (["sudo", "-n"] if sudo else []) + ["systemctl"] + (["--user"] if scope == "user" else []) + list(args)
-    return run(cmd, timeout=30)
+def log(event, **fields):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    record = json.dumps({'ts': iso(time.time()), 'service': NAME, 'event': event, **fields}, ensure_ascii=False)
+    with EVENTS.open('a') as handle:
+        handle.write(record + '\n')
+    print(record)
 
 
-def unit_props(scope: str, unit: str) -> dict:
-    keys = "ActiveState,SubState,Result,MainPID,ExecMainPID,ExecMainCode,ExecMainStatus,InvocationID," \
-           "InactiveEnterTimestamp,ActiveEnterTimestamp,NRestarts,LoadState"
-    out = systemctl(scope, "show", unit, "-p", keys, "--timestamp=unix").stdout
-    props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
-    for k in ("InactiveEnterTimestamp", "ActiveEnterTimestamp"):
-        v = props.get(k, "").lstrip("@")
-        props[k] = float(v) if v.replace(".", "").isdigit() and float(v) > 0 else None
-    return props
+def memory():
+    info = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+    return {'mem_available_mb': int(info['MemAvailable'].split()[0]) // 1024,
+            'swap_free_mb': int(info['SwapFree'].split()[0]) // 1024}
 
 
-def http_ok(url: str, timeout: float = 5) -> tuple[bool, str]:
+def health(timeout=60):
+    """('ok' | 'unhealthy' | 'dead', detail). A socket that accepts is not enough: on 2026-10-20
+    the worker answered while every command failed with "Failed to connect to browser"."""
+    request_id = int.from_bytes(os.urandom(3), 'big')
+    client = socket.socket(socket.AF_UNIX)
+    client.settimeout(2)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            body = r.read(400).decode("utf-8", "replace")
-            return r.status == 200, f"HTTP {r.status} {body[:120]}"
-    except Exception as exc:  # refused, timeout, 503 while loading, ...
-        return False, f"{type(exc).__name__}: {str(exc)[:120]}"
+        client.connect(str(SOCKET))
+    except OSError as error:
+        client.close()
+        return 'dead', f'{type(error).__name__}: {error}'[:160]
+    with client, client.makefile('rb') as lines:
+        try:
+            client.settimeout(timeout)
+            client.sendall(json.dumps({'id': request_id, 'command': 'browser-health',
+                                       'sessionId': '__watchdog__'}).encode() + b'\n')
+            reply = next((reply for reply in (json.loads(line[len(MARKER):]) for line in lines
+                                              if line.startswith(MARKER)) if reply.get('id') == request_id), None)
+        except (OSError, ValueError) as error:
+            return 'unhealthy', f'{type(error).__name__}: {error}'[:160]
+    if reply is None:
+        return 'unhealthy', 'worker closed the connection'
+    if not reply.get('ok'):
+        return 'unhealthy', f"browser-health: {reply.get('error')}"[:160]
+    detail = f"browser {reply.get('browser')}"
+    if reply.get('probeMs') is not None:
+        detail += f" ({reply['probeMs']} ms, {reply.get('tabs')} tabs)"
+    return 'ok', detail
 
 
-def socket_ok(path: str, timeout: float = 2) -> tuple[bool, str]:
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(path)
-        return True, "socket accepts"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:120]}"
-
-
-def browser_ok(path: str, timeout: float = 60) -> tuple[bool, str]:
-    """The socket accepting is not enough: on 2026-10-20 the worker answered while every command failed
-    with "Failed to connect to browser". browser-health probes Chrome (relaunching a dead one) without
-    opening a tab, and reports "not started" instead of launching Chrome for an idle worker."""
-    marker, rid = "__PI_NODRIVER__", int.from_bytes(os.urandom(3), "big")
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(path)
-            s.sendall((json.dumps({"id": rid, "command": "browser-health", "sessionId": "__watchdog__"}) + "\n").encode())
-            buf = b""
-            while True:
-                chunk = s.recv(65536)
-                if not chunk:
-                    return False, "worker closed the connection"
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    text = line.decode("utf-8", "replace")
-                    if text.startswith(marker):
-                        resp = json.loads(text[len(marker):])
-                        if resp.get("id") == rid:
-                            if resp.get("ok"):
-                                return True, f"browser {resp.get('browser')}" + (
-                                    f" ({resp.get('probeMs')} ms, {resp.get('tabs')} tabs)" if resp.get("probeMs") is not None else "")
-                            if "unsupported browser command" in str(resp.get("error")):
-                                return True, "socket accepts (worker predates browser-health)"
-                            return False, f"browser-health: {str(resp.get('error'))[:160]}"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:120]}"
-
-
-def worker_units() -> list[str]:
-    out = systemctl("user", "list-units", f"{WORKER_PREFIX}*", "--all", "--plain", "--no-legend").stdout
+def worker_units():
+    out = run('systemctl', '--user', 'list-units', f'{UNIT_PREFIX}*', '--all', '--plain', '--no-legend').stdout
     return [line.split()[0] for line in out.splitlines() if line.strip()]
 
 
-def memory() -> dict:
-    info = {}
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        k, v = line.split(":", 1)
-        if k in ("MemAvailable", "SwapFree"):
-            info[k] = int(v.split()[0]) // 1024
-    return {"mem_available_mb": info.get("MemAvailable"), "swap_free_mb": info.get("SwapFree")}
+def main_pid(unit):
+    pid = run('systemctl', '--user', 'show', unit, '-p', 'MainPID', '--value').stdout.strip() if unit else ''
+    return pid if pid not in ('', '0') else None
 
 
-def journal(args: list[str], since: float) -> list[str]:
+def journal(since, *args):
+    """[(unix time, message)] of journal entries since `since`."""
     try:
-        return run(["journalctl", "--no-pager", "-o", "short-iso", "--since", f"@{int(since)}", *args]).stdout.splitlines()
+        out = run('journalctl', '--no-pager', '-o', 'json', '--since', f'@{int(since)}', *args, timeout=15).stdout
     except Exception:
         return []
-
-
-def find_cause(pid: str | None, since: float, props: dict | None, unit: str | None, scope: str) -> tuple[str, list[str]]:
-    """Who killed it: earlyoom, the kernel OOM killer, a crash, or a clean stop."""
-    evidence: list[str] = []
-    if pid and pid != "0":
-        hits = [l for l in journal(["-u", "earlyoom"], since) if re.search(rf"process {pid}\b", l)]
-        if hits:
-            sig = re.search(r"sending (SIG\w+)", " ".join(hits))
-            return f"earlyoom-{sig.group(1) if sig else 'kill'}", hits[:3]
-        hits = [l for l in journal(["-k"], since) if re.search(rf"Killed process {pid}\b", l)]
-        if hits:
-            return "kernel-oom", hits[:3]
-    if unit:
-        evidence = [l for l in journal((["--user"] if scope == "user" else []) + ["-u", unit], since)
-                    if re.search(r"exited|Failed|Killed|killed|Stopping|Stopped|Deactivated|core|signal|Traceback|Error", l)][-6:]
-    exited = next((m for m in (re.search(r"Main process exited, code=(\w+), status=([\w/]+)", l) for l in evidence) if m), None)
-    if exited:
-        return (f"signal-{exited.group(2).split('/')[-1]}" if exited.group(1) in ("killed", "dumped")
-                else f"exit-{exited.group(2)}"), evidence
-    if props:
-        code, status, result = props.get("ExecMainCode", ""), props.get("ExecMainStatus", ""), props.get("Result", "")
-        if result not in ("", "success"):
-            return f"{result} (code={code} status={status})", evidence
-        if props.get("ActiveState") == "inactive":
-            return "clean-exit (manual stop, or SIGTERM handled as success)", evidence
-    return "unknown", evidence
-
-
-def death_time(props: dict | None, unit: str | None, scope: str, since: float) -> float | None:
-    if props and props.get("InactiveEnterTimestamp") and props["InactiveEnterTimestamp"] >= since - 1:
-        return props["InactiveEnterTimestamp"]
-    if unit:  # transient units are garbage-collected; the journal still has the stop line
+    entries = []
+    for line in out.splitlines():
         try:
-            out = run(["journalctl", "--no-pager", "-o", "json", "--since", f"@{int(since)}"]
-                      + (["--user"] if scope == "user" else []) + ["-u", unit]).stdout.splitlines()
-            for line in out:  # the first stop after the last healthy check is the death
-                rec = json.loads(line)
-                msg = rec.get("MESSAGE")
-                if isinstance(msg, str) and re.search(
-                        r"Deactivated|Failed with result|Main process exited|Stopped|Consumed .* CPU time", msg):
-                    return int(rec["__REALTIME_TIMESTAMP"]) / 1e6
-        except Exception:
+            record = json.loads(line)
+            if isinstance(record.get('MESSAGE'), str):
+                entries.append((int(record['__REALTIME_TIMESTAMP']) / 1e6, record['MESSAGE']))
+        except (ValueError, KeyError):
             pass
-    return None
+    return entries
 
 
-def log_event(service: str, event: str, **fields) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    rec = {"ts": iso(now()), "service": service, "event": event, **fields}
-    with EVENTS.open("a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print(json.dumps(rec, ensure_ascii=False))
+def outage(pid, unit, since):
+    """(death time or None, cause, evidence) for a worker that stopped after `since`. The death
+    time comes from the journal, so the 60 s check interval does not blur the timeline."""
+    entries = journal(since, '--user', '-u', unit) if unit else []
+    died = next((ts for ts, message in entries if re.search(
+        r'Deactivated|Failed with result|Main process exited|Stopped|Consumed .* CPU time', message)), None)
+    evidence = [f'{iso(ts)} {message}' for ts, message in entries if re.search(
+        r'exited|Failed|Killed|killed|Stopping|Stopped|Deactivated|core|signal|Traceback|Error', message)][-6:]
+    if pid:
+        hits = [f'{iso(ts)} {message}' for ts, message in journal(since, '-u', 'earlyoom')
+                if re.search(rf'process {pid}\b', message)]
+        if hits:
+            sent = re.search(r'sending (SIG\w+)', ' '.join(hits))
+            return died, f"earlyoom-{sent.group(1) if sent else 'kill'}", hits[:3]
+        hits = [f'{iso(ts)} {message}' for ts, message in journal(since, '-k')
+                if re.search(rf'Killed process {pid}\b', message)]
+        if hits:
+            return died, 'kernel-oom', hits[:3]
+    for line in evidence:
+        exited = re.search(r'Main process exited, code=(\w+), status=([\w/]+)', line)
+        if exited:
+            code, status = exited.groups()
+            return died, (f"signal-{status.split('/')[-1]}" if code in ('killed', 'dumped') else f'exit-{status}'), evidence
+    return died, 'unknown', evidence
 
 
-def start_worker() -> tuple[bool, str]:
-    """Same launch as worker-launch.ts: its own transient unit, so it outlives this run."""
-    unit = f"{WORKER_PREFIX}{os.urandom(6).hex()}"
-    try:
-        WORKER_SOCKET.unlink(missing_ok=True)
-    except OSError:
-        pass
-    r = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
-             "--description=Pi nodriver browser (Xvfb, worker and Chrome; outlives the Pi process that started it)",
-             f"--working-directory={EXT}", "--property=TimeoutStopSec=20", "--",
-             "xvfb-run", "-a", "-s", "-screen 0 1366x768x24",
-             str(EXT / ".venv/bin/python"), str(EXT / "worker.py"), "--server", str(WORKER_SOCKET)], timeout=20)
-    return r.returncode == 0, unit if r.returncode == 0 else (r.stderr or r.stdout)[:200]
+def revive():
+    """Stop every worker unit (a broken worker still holds the socket path and the profile),
+    then start one the way worker-launch.ts does: in its own unit, so it outlives this run."""
+    for unit in worker_units():
+        run('systemctl', '--user', 'stop', unit)
+    with contextlib.suppress(OSError):
+        SOCKET.unlink(missing_ok=True)
+    unit = f'{UNIT_PREFIX}{os.urandom(6).hex()}'
+    result = run('systemd-run', '--user', '--collect', '--quiet', f'--unit={unit}',
+                 '--description=Pi nodriver browser (Xvfb, worker and Chrome; outlives the Pi process that started it)',
+                 f'--working-directory={EXT}', '--property=TimeoutStopSec=20', '--',
+                 'xvfb-run', '-a', '-s', '-screen 0 1366x768x24',
+                 str(EXT / '.venv/bin/python'), str(EXT / 'worker.py'), '--server', str(SOCKET), timeout=20)
+    return result.returncode == 0, unit if result.returncode == 0 else (result.stderr or result.stdout)[:200]
 
 
-def main_pid(props: dict | None, unit: str | None) -> str | None:
-    if props is None and unit:  # the worker's transient unit
-        props = {"MainPID": systemctl("user", "show", unit, "-p", "MainPID", "--value").stdout.strip()}
-    pid = (props or {}).get("MainPID")
-    return pid if pid and pid != "0" else None
-
-
-def check(svc: dict) -> tuple[bool, str, dict | None, str | None]:
-    if svc["unit"] is None:
-        units = worker_units()
-        ok, detail = socket_ok(svc["socket"])
-        if ok:
-            ok, detail = browser_ok(svc["socket"])
-        return ok, detail, None, (units[0] if units else None)
-    props = unit_props(svc["scope"], svc["unit"])
-    if props.get("ActiveState") != "active":
-        return False, f"unit {props.get('ActiveState')}/{props.get('SubState')}", props, svc["unit"]
-    ok, detail = http_ok(svc["health"])
-    return ok, detail, props, svc["unit"]
-
-
-def revive(svc: dict, props: dict | None) -> tuple[bool, str]:
-    if svc["unit"] is None:
-        # A running worker with a broken browser must go first: two workers would share the socket path
-        # and the profile, and the new Chrome cannot take a profile the old one still holds.
-        for unit in worker_units():
-            systemctl("user", "stop", unit)
-        return start_worker()
-    sudo = svc["scope"] == "system"
-    if props and props.get("ActiveState") == "failed":
-        systemctl(svc["scope"], "reset-failed", svc["unit"], sudo=sudo)
-    r = systemctl(svc["scope"], "restart", svc["unit"], sudo=sudo)
-    return r.returncode == 0, (r.stderr or "restart issued").strip()[:200]
-
-
-def wait_healthy(svc: dict) -> bool:
-    deadline = now() + svc["ready_s"]
-    while now() < deadline:
+def wait_healthy(seconds=30):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
         time.sleep(2)
-        if check(svc)[0]:
+        if health()[0] == 'ok':
             return True
     return False
 
 
-def pass_once(states: dict) -> None:
-    t = now()
-    for svc in SERVICES:
-        name = svc["name"]
-        st = states.setdefault(name, {})
-        last_check = st.get("last_check", t - 120)
-        ok, detail, props, unit = check(svc)
-
-        # systemd's own Restart= revived it between two checks: still an outage worth recording.
-        inv = props.get("InvocationID") if props else unit
-        if ok and st.get("invocation") and inv != st["invocation"] and not st.get("down_since"):
-            cause, evidence = find_cause(st.get("pid"), last_check, None, svc["unit"] or st.get("unit"), svc["scope"])
-            died = death_time(None, svc["unit"] or st.get("unit"), svc["scope"], last_check)
-            back = props.get("ActiveEnterTimestamp") if props else None
-            log_event(name, "restarted_outside_watchdog", previous_pid=st.get("pid"), cause=cause, died_at=iso(died),
-                      came_back_at=iso(back), downtime_s=round(back - died) if died and back else None, evidence=evidence)
-
-        if ok and detail.startswith("browser relaunched"):
+def check(state):
+    """One check; returns the new state."""
+    now = time.time()
+    unit = (worker_units() or [None])[0]
+    status, detail = health()
+    if status == 'ok':
+        if state.get('unit') and unit != state['unit'] and not state.get('down_since'):
+            # Replaced between two checks (Pi starts a worker on demand): still an outage.
+            died, cause, evidence = outage(state.get('pid'), state['unit'], state.get('last_check', now - 120))
+            log('restarted_outside_watchdog', previous_pid=state.get('pid'), cause=cause, died_at=iso(died),
+                evidence=evidence)
+        if detail.startswith('browser relaunched'):
             # The worker survived but its Chrome did not answer and was replaced: every tab was lost.
-            log_event(name, "browser_relaunched", unit=unit, detail=detail, **memory())
-        if ok:
-            if st.get("down_since"):
-                log_event(name, "recovered", died_at=iso(st["down_since"]), detected_at=iso(st["detected_at"]),
-                          downtime_s=round(t - st["down_since"]), by=st.get("revived_by", "itself"))
-            states[name] = {"last_ok": t, "last_check": t, "invocation": inv, "unit": unit,
-                            "pid": main_pid(props, unit), "restarts": st.get("restarts", [])}
-            continue
+            log('browser_relaunched', unit=unit, detail=detail, **memory())
+        if state.get('down_since'):
+            log('recovered', died_at=iso(state['down_since']), detected_at=iso(state['detected_at']),
+                downtime_s=round(now - state['down_since']), by=state.get('revived_by', 'itself'))
+        return {'last_ok': now, 'last_check': now, 'unit': unit, 'pid': main_pid(unit),
+                'restarts': state.get('restarts', [])}
 
-        st["last_check"] = t
-        st["fails"] = st.get("fails", 0) + 1
-        # The worker's process is gone only when its socket refuses; a failed browser probe is a hang.
-        dead = (not socket_ok(svc["socket"])[0]) if svc["unit"] is None else (props or {}).get("ActiveState") != "active"
-        if not st.get("down_since"):
-            since = st.get("last_ok", t - 3600)
-            died = death_time(props, svc["unit"] or st.get("unit"), svc["scope"], since) if dead else None
-            cause, evidence = (find_cause(st.get("pid"), since, props, svc["unit"] or st.get("unit"), svc["scope"])
-                               if dead else ("unhealthy (process running, health check failing)", []))
-            st.update(down_since=died or t, detected_at=t, cause=cause)
-            log_event(name, "down", died_at=iso(died or t), died_at_source="systemd/journal" if died else "detected",
-                      detected_at=iso(t), last_ok=iso(st.get("last_ok")), cause=cause, health=detail,
-                      unit_state=f"{props.get('ActiveState')}/{props.get('SubState')}" if props else None,
-                      result=(props or {}).get("Result"), exit=f"{(props or {}).get('ExecMainCode')}/{(props or {}).get('ExecMainStatus')}" if props else None,
-                      pid=st.get("pid"), **memory(), evidence=evidence)
-
-        if svc["revive"] == "failed-only" and (props or {}).get("ActiveState") != "failed":
-            continue  # stopped on purpose or still loading: record only
-        if not dead and st["fails"] < UNHEALTHY_RESTART_AFTER:
-            continue
-        if svc["unit"] is None and st["fails"] < WORKER_REVIVE_AFTER:
-            continue
-        recent = [r for r in st.get("restarts", []) if r > t - 3600]
-        if len(recent) >= MAX_RESTARTS_PER_HOUR:
-            if not st.get("gave_up"):
-                st["gave_up"] = True
-                log_event(name, "giveup", restarts_last_hour=len(recent), **memory(),
-                          hint="restart budget spent; likely memory pressure (earlyoom) or a crash loop")
-            continue
-        okr, msg = revive(svc, props)
-        st["restarts"] = recent + [t]
-        st["revived_by"] = "watchdog"
-        healthy = okr and wait_healthy(svc)
-        log_event(name, "revive", ok=okr, healthy=healthy, detail=msg, **memory())
-        if healthy:
-            _, _, props2, unit2 = check(svc)
-            log_event(name, "recovered", died_at=iso(st["down_since"]), detected_at=iso(st["detected_at"]),
-                      downtime_s=round(now() - st["down_since"]), by="watchdog")
-            states[name] = {"last_ok": now(), "last_check": now(), "unit": unit2, "pid": main_pid(props2, unit2),
-                            "invocation": props2.get("InvocationID") if props2 else unit2,
-                            "restarts": st["restarts"]}
+    dead = status == 'dead'
+    state.update(last_check=now, fails=state.get('fails', 0) + 1)
+    if not state.get('down_since'):
+        if dead:
+            died, cause, evidence = outage(state.get('pid'), state.get('unit'), state.get('last_ok', now - 3600))
+        else:
+            died, cause, evidence = None, 'unhealthy (process running, health check failing)', []
+        state.update(down_since=died or now, detected_at=now, cause=cause)
+        log('down', died_at=iso(died or now), died_at_source='systemd/journal' if died else 'detected',
+            detected_at=iso(now), last_ok=iso(state.get('last_ok')), cause=cause, health=detail,
+            pid=state.get('pid'), **memory(), evidence=evidence)
+    if state['fails'] < (2 if dead else 3):
+        return state
+    recent = [t for t in state.get('restarts', []) if t > now - 3600]
+    if len(recent) >= MAX_REVIVES_PER_HOUR:
+        if not state.get('gave_up'):
+            state['gave_up'] = True
+            log('giveup', restarts_last_hour=len(recent), **memory(),
+                hint='restart budget spent; likely memory pressure (earlyoom) or a crash loop')
+        return state
+    started, message = revive()
+    state.update(restarts=recent + [now], revived_by='watchdog')
+    healthy = started and wait_healthy()
+    log('revive', ok=started, healthy=healthy, detail=message, **memory())
+    if not healthy:
+        return state
+    now = time.time()
+    log('recovered', died_at=iso(state['down_since']), detected_at=iso(state['detected_at']),
+        downtime_s=round(now - state['down_since']), by='watchdog')
+    unit = (worker_units() or [None])[0]
+    return {'last_ok': now, 'last_check': now, 'unit': unit, 'pid': main_pid(unit), 'restarts': state['restarts']}
 
 
-def status() -> None:
-    for svc in SERVICES:
-        ok, detail, props, unit = check(svc)
-        print(f"{'OK  ' if ok else 'DOWN'} {svc['name']:16} {unit or '-':40} {detail}")
-
-
-def report(days: float) -> None:
-    if not EVENTS.exists():
-        print("no events yet")
-        return
-    cutoff = now() - days * 86400
-    rows = [json.loads(l) for l in EVENTS.read_text().splitlines() if l.strip()]
-    rows = [r for r in rows if dt.datetime.fromisoformat(r["ts"]).timestamp() >= cutoff]
-    by = collections.defaultdict(list)
-    for r in rows:
-        by[r["service"]].append(r)
-    print(f"Browser-agent outages, last {days:g} day(s)")
-    for name in [s["name"] for s in SERVICES]:
-        ev = by.get(name, [])
-        downs = [e for e in ev if e["event"] == "down"]
-        outside = [e for e in ev if e["event"] in ("restarted_outside_watchdog", "browser_relaunched")]
-        rec = [e for e in ev if e["event"] == "recovered"]
-        causes = collections.Counter(e.get("cause", "?").split(" (")[0] for e in downs + outside)
-        total = sum(e.get("downtime_s") or 0 for e in rec + outside)
-        print(f"\n{name}: {len(downs)} outage(s), {len(outside)} restart(s) outside the watchdog, downtime {total}s"
-              + (f"; causes: {dict(causes)}" if causes else ""))
-        for e in (downs + outside)[-10:]:
-            print(f"  {e.get('died_at') or e.get('came_back_at') or e['ts']}  {e['event']:27} {e.get('cause', '')}")
-    hours = collections.Counter(dt.datetime.fromisoformat(r.get("died_at") or r["ts"]).hour
-                                for r in rows if r["event"] in ("down", "restarted_outside_watchdog", "browser_relaunched"))
-    if hours:
-        print("\nby hour of day: " + "  ".join(f"{h:02d}h:{n}" for h, n in sorted(hours.items())))
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs="?", default="check", choices=["check", "status", "report"])
-    ap.add_argument("--days", type=float, default=7)
-    a = ap.parse_args()
-    if a.cmd == "status":
-        return status()
-    if a.cmd == "report":
-        return report(a.days)
+def main():
+    if sys.argv[1:] not in ([], ['check']):
+        sys.exit('usage: browser-agent-watchdog.py [check]')
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        states = json.loads(STATE.read_text())
-    except (OSError, ValueError):
-        states = {}
-    pass_once(states)
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(states, indent=1))
-    tmp.replace(STATE)
+        state = json.loads(STATE.read_text()).get(NAME, {})
+    except (OSError, ValueError, AttributeError):
+        state = {}
+    temporary = STATE.with_suffix('.tmp')
+    temporary.write_text(json.dumps({NAME: check(state)}, indent=1))
+    temporary.replace(STATE)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()

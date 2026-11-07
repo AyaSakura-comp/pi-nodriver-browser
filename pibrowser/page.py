@@ -5,6 +5,7 @@ them, and the Runtime domain is never enabled (a common automation tell).
 """
 import asyncio
 import base64
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ READY_JS = ("[document.readyState, document.body ? document.body.innerText.lengt
 
 # Resolve a snapshot ref to viewport coordinates for a real mouse click.
 TARGET_JS = r'''((ref) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el) return {error: 'stale'};
   if (!el.isConnected) return {error: 'detached'};
   el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
@@ -42,14 +43,14 @@ TARGET_JS = r'''((ref) => {
 })'''
 
 JS_CLICK = r'''((ref) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el || !el.isConnected) return false;
   el.click();
   return true;
 })'''
 
 FOCUS_JS = r'''((ref) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el || !el.isConnected) return {error: 'stale'};
   el.scrollIntoView({block: 'center', behavior: 'instant'});
   el.focus();
@@ -64,14 +65,14 @@ FOCUS_JS = r'''((ref) => {
 })'''
 
 VALUE_JS = r'''((ref) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el) return null;
   return el.isContentEditable ? el.innerText : (el.value ?? null);
 })'''
 
 # Fallback for inputs that ignore inserted text: React-style native setter + events.
 SET_VALUE_JS = r'''((ref, value) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el) return false;
   const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
@@ -82,7 +83,7 @@ SET_VALUE_JS = r'''((ref, value) => {
 })'''
 
 SELECT_JS = r'''((ref, wanted) => {
-  const el = window.__pi && window.__pi.refs && window.__pi.refs.get(ref);
+  const el = window.__pi?.refs?.get(ref);
   if (!el || !el.isConnected) return {error: 'stale'};
   if (el.tagName !== 'SELECT') return {error: 'not a <select>; click it, then click the option'};
   const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -123,7 +124,6 @@ SCROLL_JS = r'''((where) => {
     }
   }
   best.scrollTo({top: where === 'top' ? 0 : best.scrollHeight, behavior: 'instant'});
-  return Math.round(best.scrollTop);
 })'''
 
 KEYS = {
@@ -160,7 +160,6 @@ class Tab:
         self.session = session
         self.world = None
         self.dialogs = []
-        self.last_used = time.monotonic()
         self.created = time.monotonic()
 
     @classmethod
@@ -172,7 +171,7 @@ class Tab:
         await tab.send('Page.enable', timeout=timeout)
         return tab
 
-    def _on_dialog(self, _method, params, _session):
+    def _on_dialog(self, params):
         # An open alert/confirm blocks the renderer and every later call would hang.
         # Alerts and leave-page prompts are accepted; confirm/prompt are dismissed (safe default).
         kind = params.get('type', 'alert')
@@ -182,13 +181,10 @@ class Tab:
         asyncio.get_running_loop().create_task(self._answer_dialog(accept))
 
     async def _answer_dialog(self, accept):
-        try:
+        with contextlib.suppress(CDPError):
             await self.send('Page.handleJavaScriptDialog', {'accept': accept}, timeout=5)
-        except CDPError:
-            pass
 
     async def send(self, method, params=None, *, timeout=10.0):
-        self.last_used = time.monotonic()
         return await self.chrome.conn.send(method, params, session=self.session, timeout=timeout)
 
     async def _new_world(self, timeout):
@@ -198,14 +194,14 @@ class Tab:
             'frameId': frame_id, 'worldName': 'pi', 'grantUniveralAccess': True}, timeout=timeout)
         return result['executionContextId']
 
-    async def eval(self, expression, *, timeout=10.0, await_promise=False):
+    async def eval(self, expression, *, timeout=10.0):
         for attempt in (1, 2, 3):
             if self.world is None:
                 self.world = await self._new_world(timeout)
             try:
                 result = await self.send('Runtime.evaluate', {
                     'expression': expression, 'contextId': self.world,
-                    'returnByValue': True, 'awaitPromise': await_promise}, timeout=timeout)
+                    'returnByValue': True}, timeout=timeout)
             except CDPError as error:
                 # The isolated world dies with its document; make a new one.
                 if 'context' in str(error).lower() and attempt < 3 and not isinstance(error, CDPTimeout):
@@ -230,7 +226,6 @@ class Tab:
         error = result.get('errorText')
         if error and error != 'net::ERR_ABORTED':
             raise PageError(f'{error} while loading {url}')
-        return result
 
     async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True):
         """Wait until the document is parsed and its text and element count stop changing
@@ -265,14 +260,11 @@ class Tab:
         try:
             return await self.eval("(performance.getEntriesByType('navigation')[0] || {}).responseStatus || 0",
                                    timeout=3)
-        except CDPError:
-            return 0
-        except PageError:
+        except (CDPError, PageError):
             return 0
 
-    async def snapshot(self, *, max_chars=14000, from_viewport=False, timeout=10.0):
-        options = {'maxChars': max_chars, 'fromViewport': from_viewport}
-        return await self.call(SNAPSHOT_JS, options, timeout=timeout)
+    async def snapshot(self, *, from_viewport=False):
+        return await self.call(SNAPSHOT_JS, from_viewport)
 
     async def click_ref(self, ref):
         target = await self.call(TARGET_JS, ref)
@@ -309,9 +301,7 @@ class Tab:
 
     async def select_ref(self, ref, option):
         result = await self.call(SELECT_JS, ref, option)
-        if not result:
-            raise StaleRef(f'{ref} is not on the page any more; take a new snapshot')
-        if result.get('error') == 'stale':
+        if not result or result.get('error') == 'stale':
             raise StaleRef(f'{ref} is not on the page any more; take a new snapshot')
         if result.get('error'):
             options = result.get('options')
@@ -339,7 +329,8 @@ class Tab:
     async def scroll(self, direction):
         direction = direction.lower()
         if direction in ('top', 'bottom'):
-            return await self.call(SCROLL_JS, direction)
+            await self.call(SCROLL_JS, direction)
+            return
         size = await self.eval('[innerWidth, innerHeight]', timeout=5) or [1280, 640]
         delta = size[1] * 0.8 * (-1 if direction == 'up' else 1)
         # A wheel event at the centre scrolls whatever scroller is there (inner panes too)
@@ -347,22 +338,20 @@ class Tab:
         await self.send('Input.dispatchMouseEvent', {
             'type': 'mouseWheel', 'x': size[0] / 2, 'y': size[1] / 2, 'deltaX': 0, 'deltaY': delta}, timeout=5)
         await asyncio.sleep(0.3)
-        return await self.eval('Math.round(scrollY)', timeout=5)
 
-    async def history(self, step):
+    async def back(self):
+        """Go back one history entry; False when this is the tab's first page."""
         history = await self.send('Page.getNavigationHistory', timeout=5)
-        index = history['currentIndex'] + step
-        entries = history['entries']
-        if not 0 <= index < len(entries):
+        index = history['currentIndex'] - 1
+        if index < 0:
             return False
         self.world = None
-        await self.send('Page.navigateToHistoryEntry', {'entryId': entries[index]['id']}, timeout=10)
+        await self.send('Page.navigateToHistoryEntry', {'entryId': history['entries'][index]['id']}, timeout=10)
         return True
 
-    async def screenshot(self, path, *, quality=70, timeout=15.0):
+    async def screenshot(self, path):
         await self.send('Page.bringToFront', timeout=5)
-        result = await self.send('Page.captureScreenshot', {'format': 'jpeg', 'quality': quality},
-                                 timeout=timeout)
+        result = await self.send('Page.captureScreenshot', {'format': 'jpeg', 'quality': 70}, timeout=15)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(base64.b64decode(result['data']))

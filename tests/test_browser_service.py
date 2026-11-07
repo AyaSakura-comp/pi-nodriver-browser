@@ -1,6 +1,5 @@
 """BrowserService with a fake Chrome: tab hygiene, research engine API, self-healing."""
 import asyncio
-import json
 import time
 import unittest
 from types import SimpleNamespace
@@ -29,23 +28,32 @@ class FakeTab:
     async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True):
         return True
 
-    async def eval(self, expression, *, timeout=10.0, await_promise=False):
+    async def eval(self, expression, *, timeout=10.0):
         return self.chrome.eval_hook(self, expression)
 
     async def http_status(self):
         return self.chrome.status
 
-    async def snapshot(self, *, max_chars=14000, from_viewport=False, timeout=10.0):
+    async def snapshot(self, *, from_viewport=False):
         return {'url': self.url, 'title': 'T', 'text': f'page {self.url}', 'elements': 0}
+
+    async def back(self):
+        return False  # the tab's first page
 
     async def close(self):
         await self.chrome.close_target(self.target_id)
 
 
+class FakeConn:
+    async def send(self, method, params=None, *, session=None, timeout=10.0):
+        return {}
+
+
 class FakeChrome:
     made = []
 
-    def __init__(self, profile, log_path=None):
+    def __init__(self, profile, log_path):
+        self.conn = FakeConn()
         self.targets = {}
         self.closed = []
         self.probe_ok = True
@@ -68,13 +76,12 @@ class FakeChrome:
         if expression == 'document.contentType':
             return 'text/html'
         if 'sourceChars' in expression or 'capturedChars' in expression:
-            return json.dumps({'text': self.body, 'sourceChars': len(self.body), 'capturedChars': len(self.body),
-                               'captureLimit': 1000, 'captureUnits': 'codepoints'})
+            return {'text': self.body, 'sourceChars': len(self.body), 'capturedChars': len(self.body),
+                    'captureLimit': 1000, 'captureUnits': 'codepoints'}
         if expression is worker.IMAGE_CANDIDATES_JS:
-            return '[]'
+            return []
         if expression is worker.GOOGLE_RESULTS_JS:
-            return json.dumps([{'title': 'Result', 'url': 'https://example.com/a', 'snippet': 's' * 600,
-                                'truncated': True}])
+            return [{'title': 'Result', 'url': 'https://example.com/a', 'snippet': 's' * 600, 'truncated': True}]
         if 'innerText' in expression:
             return self.body
         return None
@@ -88,7 +95,7 @@ class FakeChrome:
     async def probe(self, timeout=5.0):
         return self.probe_ok
 
-    async def new_tab(self, url='about:blank', *, background=True, new_window=False, timeout=10.0):
+    async def new_tab(self, *, new_window=False):
         self.counter += 1
         target_id = f't{self.counter}'
         self.targets[target_id] = {'targetId': target_id, 'type': 'page', '_seen': time.monotonic()}
@@ -115,7 +122,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.start()
         self.service = worker.BrowserService()
         await self.service.ensure_browser()
-        self.chrome = self.service.chrome
+        self.chrome = self.service.browser
 
     async def asyncTearDown(self):
         for patch in self.patches:
@@ -153,9 +160,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         async def hang(tab, url):
             await asyncio.sleep(3600)
         self.chrome.navigate_hook = hang
-        with mock.patch.dict('os.environ', {'RESEARCH_PARTIAL_ON_TIMEOUT': '0'}):
-            result = await self.service.crawl_one('https://slow.example/', 0, 'owner', asyncio.Semaphore(1),
-                                                  max_text_units=1000, fetch_timeout=1.0)
+        result = await self.service.crawl_one('https://slow.example/', 0, 'owner', asyncio.Semaphore(1),
+                                              max_text_units=1000, fetch_timeout=1.0)
         self.assertFalse(result['ok'])
         self.assertTrue(result['browserSuspect'])
         self.assertEqual(self.chrome.targets, {})
@@ -277,14 +283,40 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.execute('snapshot', 's1')
         self.assertIn('https://a.example/', result['text'])
 
+    async def test_back_on_a_popups_first_page_closes_it_and_returns_to_its_opener(self):
+        await self.service.execute('open https://a.example/', 's1')
+        state = self.service.sessions['s1']
+        opener = state.stack[-1]
+        popup = await self.chrome.new_tab()  # adopted as a click's popup
+        state.stack.append(popup)
+        result = await self.service.execute('back', 's1')
+        self.assertIn('back on the previous one', result['text'])
+        self.assertEqual(state.stack, [opener])
+        self.assertNotIn(popup.target_id, self.chrome.targets)
+
+    async def test_unknown_command_is_refused_without_starting_chrome(self):
+        service = worker.BrowserService()
+        with self.assertRaisesRegex(ValueError, 'unsupported browser command: forward'):
+            await service.execute('forward', 's1')
+        self.assertIsNone(service.browser)
+
+
+class RequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_deadline_is_reported_and_inner_timeouts_are_errors(self):
+        class Service:
+            async def execute(self, command, session_id):
+                if command == 'hang':
+                    await asyncio.sleep(3600)
+                raise TimeoutError('inner wait')
+        with mock.patch.object(worker, 'COMMAND_TIMEOUT', 0.05), mock.patch.object(worker, 'log_event'):
+            hung = await worker.execute_request(Service(), {'id': 1, 'command': 'hang', 'sessionId': 's'})
+            inner = await worker.execute_request(Service(), {'id': 2, 'command': 'other', 'sessionId': 's'})
+        self.assertEqual(hung, {'id': 1, 'sessionId': 's', 'ok': False,
+                                'error': 'Browser command timed out after 0.05 seconds'})
+        self.assertEqual(inner['error'], 'TimeoutError: inner wait')
+
 
 class HelperTests(unittest.TestCase):
-    def test_parse_ref_accepts_both_spellings(self):
-        self.assertEqual(worker.parse_ref('e12'), 'e12')
-        self.assertEqual(worker.parse_ref('@E3'), 'e3')
-        with self.assertRaises(ValueError):
-            worker.parse_ref('button')
-
     def test_snapshot_header_flags_error_pages_and_dialogs(self):
         text = worker.format_snapshot({'url': 'https://x/', 'title': 'Missing', 'text': 'Not found',
                                        'scrollHeight': 900, 'scrollY': 0, 'viewportHeight': 600},

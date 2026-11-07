@@ -6,6 +6,7 @@ after an OOM kill of Chrome's GPU process the browser endpoint kept answering
 while every tab hung (2026-11-04), and a browser-level probe called that healthy.
 """
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -31,16 +32,14 @@ FLAGS = [
     '--ozone-platform=x11', '--window-position=0,0', '--window-size=1280,720',
     '--remote-allow-origins=*', '--remote-debugging-host=127.0.0.1',
 ]
-LOCK_FILES = ('SingletonLock', 'SingletonSocket', 'SingletonCookie')
 
 
 def find_chrome():
-    for candidate in (os.environ.get('PI_NODRIVER_CHROME'), os.environ.get('PI_BROWSER_CHROME'), '/opt/google/chrome/chrome',
-                      shutil.which('google-chrome'), shutil.which('google-chrome-stable'),
-                      shutil.which('chromium'), shutil.which('chromium-browser')):
+    for candidate in ('/opt/google/chrome/chrome',
+                      *map(shutil.which, ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'))):
         if candidate and os.access(candidate, os.X_OK):
             return candidate
-    raise RuntimeError('Chrome not found; set PI_BROWSER_CHROME')
+    raise RuntimeError('Chrome not found; install google-chrome or chromium')
 
 
 def free_port():
@@ -79,30 +78,25 @@ def pid_alive(pid):
 async def kill_pids(pids, grace=3.0):
     pids = [pid for pid in pids if pid_alive(pid)]
     for pid in pids:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline and any(pid_alive(pid) for pid in pids):
         await asyncio.sleep(0.1)
     for pid in pids:
         if pid_alive(pid):
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
 
 
 class Chrome:
-    def __init__(self, profile, *, log_path=None):
+    def __init__(self, profile, log_path):
         self.profile = Path(profile)
-        self.log_path = Path(log_path) if log_path else None
+        self.log_path = log_path
         self.proc = None
         self.port = None
         self.conn = None
         self.targets = {}
-        self.started_at = None
 
     async def start(self, timeout=30.0):
         binary = find_chrome()
@@ -110,59 +104,43 @@ class Chrome:
         # A Chrome left over from an earlier worker holds the profile lock; a new launch
         # would hand its arguments to that one and exit.
         await kill_pids(profile_pids(self.profile))
-        for name in LOCK_FILES:
-            try:
+        for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
+            with contextlib.suppress(OSError):
                 (self.profile / name).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
         self.port = free_port()
-        args = [binary, *FLAGS, f'--user-data-dir={self.profile}', f'--remote-debugging-port={self.port}',
-                'about:blank']
-        log = open(self.log_path, 'wb') if self.log_path else asyncio.subprocess.DEVNULL
-        try:
+        with open(self.log_path, 'wb') as log:
             self.proc = await asyncio.create_subprocess_exec(
-                *args, stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-        finally:
-            if self.log_path:
-                log.close()
+                binary, *FLAGS, f'--user-data-dir={self.profile}', f'--remote-debugging-port={self.port}',
+                'about:blank', stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         deadline = time.monotonic() + timeout
-        ws_url = None
-        while time.monotonic() < deadline:
+        while True:
             if self.proc.returncode is not None:
                 raise RuntimeError(f'Chrome exited during startup (code {self.proc.returncode})')
             try:
-                info = await asyncio.to_thread(self._http_json, '/json/version')
-                ws_url = info['webSocketDebuggerUrl']
+                ws_url = (await asyncio.to_thread(self._version))['webSocketDebuggerUrl']
                 break
             except Exception:
+                if time.monotonic() > deadline:
+                    await self.stop()
+                    raise RuntimeError(f'Chrome did not open its DevTools port within {timeout:g}s') from None
                 await asyncio.sleep(0.2)
-        if not ws_url:
-            await self.stop()
-            raise RuntimeError(f'Chrome did not open its DevTools port within {timeout:g}s')
-        self.conn = Connection(ws_url)
-        await self.conn.connect()
+        self.conn = Connection()
+        await self.conn.connect(ws_url)
         self.conn.on('Target.targetCreated', self._on_target)
         self.conn.on('Target.targetInfoChanged', self._on_target)
-        self.conn.on('Target.targetDestroyed', self._on_target_gone)
+        self.conn.on('Target.targetDestroyed', lambda params: self.targets.pop(params.get('targetId'), None))
         await self.conn.send('Target.setDiscoverTargets', {'discover': True})
-        self.started_at = time.monotonic()
 
-    def _http_json(self, path):
-        with urllib.request.urlopen(f'http://127.0.0.1:{self.port}{path}', timeout=2) as response:
+    def _version(self):
+        with urllib.request.urlopen(f'http://127.0.0.1:{self.port}/json/version', timeout=2) as response:
             return json.load(response)
 
-    def _on_target(self, _method, params, _session):
+    def _on_target(self, params):
         info = params.get('targetInfo') or {}
         target_id = info.get('targetId')
         if target_id:
-            known = self.targets.get(target_id)
-            info['_seen'] = known['_seen'] if known else time.monotonic()
+            info['_seen'] = self.targets.get(target_id, {}).get('_seen', time.monotonic())
             self.targets[target_id] = info
-
-    def _on_target_gone(self, _method, params, _session):
-        self.targets.pop(params.get('targetId'), None)
 
     def alive(self):
         return (self.proc is not None and self.proc.returncode is None
@@ -171,37 +149,32 @@ class Chrome:
     def pages(self):
         return [info for info in self.targets.values() if info.get('type') == 'page']
 
-    async def new_tab(self, url='about:blank', *, background=True, new_window=False, timeout=10.0):
-        params = {'url': url, 'background': background}
+    async def new_tab(self, *, new_window=False):
+        """A blank background tab, or with new_window a tab in a window of its own: only a
+        window's front tab is visible, and hidden tabs pause requestAnimationFrame, which
+        leaves virtual lists and lazy content half rendered. Each Pi session therefore gets
+        its own window, so every session's page stays visible."""
+        params = {'url': 'about:blank', 'background': not new_window}
         if new_window:
-            # Only a window's front tab is visible; hidden tabs pause requestAnimationFrame,
-            # which leaves virtual lists and lazy content half rendered. Each Pi session
-            # therefore gets its own window, so every session's page stays visible.
-            params.update(newWindow=True, background=False)
-        result = await self.conn.send('Target.createTarget', params, timeout=timeout)
-        target_id = result['targetId']
+            params['newWindow'] = True
+        target_id = (await self.conn.send('Target.createTarget', params))['targetId']
         self.targets.setdefault(target_id, {'targetId': target_id, 'type': 'page', '_seen': time.monotonic()})
         try:
             if new_window:
-                try:
-                    window = await self.conn.send('Browser.getWindowForTarget', {'targetId': target_id}, timeout=timeout)
+                with contextlib.suppress(CDPError):
+                    window = await self.conn.send('Browser.getWindowForTarget', {'targetId': target_id})
                     await self.conn.send('Browser.setWindowBounds', {
                         'windowId': window['windowId'],
-                        'bounds': {'left': 0, 'top': 0, 'width': 1280, 'height': 720, 'windowState': 'normal'}},
-                        timeout=timeout)
-                except CDPError:
-                    pass
-            return await Tab.attach(self, target_id, timeout=timeout)
+                        'bounds': {'left': 0, 'top': 0, 'width': 1280, 'height': 720, 'windowState': 'normal'}})
+            return await Tab.attach(self, target_id, timeout=10.0)
         except BaseException:
             await self.close_target(target_id)
             raise
 
     async def close_target(self, target_id, timeout=3.0):
         # Through the browser connection: works even when the tab's renderer is hung.
-        try:
+        with contextlib.suppress(CDPError):
             await self.conn.send('Target.closeTarget', {'targetId': target_id}, timeout=timeout)
-        except CDPError:
-            pass
         self.targets.pop(target_id, None)
 
     async def probe(self, timeout=5.0):
@@ -224,28 +197,17 @@ class Chrome:
             if target_id is not None:
                 await self.close_target(target_id)
 
-    def helper_pids(self):
+    async def stop(self):
+        if self.conn is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.conn.send('Browser.close', timeout=2), 3)
+            await self.conn.close()
         pids = set(profile_pids(self.profile))
         if self.proc is not None and self.proc.returncode is None:
             pids.add(self.proc.pid)
-        return pids
-
-    async def stop(self):
-        if self.conn is not None:
-            try:
-                await asyncio.wait_for(self.conn.send('Browser.close', timeout=2), 3)
-            except Exception:
-                pass
-            await self.conn.close()
-        pids = self.helper_pids()
-        if self.proc is not None and self.proc.returncode is None:
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(self.proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
         await kill_pids(pids)
         if self.proc is not None:
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.proc.wait(), 3)
-            except asyncio.TimeoutError:
-                pass
