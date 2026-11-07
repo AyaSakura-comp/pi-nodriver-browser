@@ -1,19 +1,24 @@
-"""Local HTTP fixture tests; never send a live web search."""
+"""The search engines against local fixtures; never a live web search."""
 import asyncio
+from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
+import urllib.error
+
 from aiohttp import web
-from research.contracts import SearchTask
+
+from research import providers
+from research.providers import ProviderError, fourget, google, resolve_google_redirect, web_url
 
 
 class FourgetTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        from research.providers import FourgetProvider, SearchBatch
-        self.Provider, self.Batch = FourgetProvider, SearchBatch
         self.calls = []
-        self.handler = lambda req: web.json_response({'web': []})
-        async def handle(req):
-            self.calls.append(dict(req.query))
-            response = self.handler(req)
+        self.handler = lambda request: web.json_response({'web': []})
+
+        async def handle(request):
+            self.calls.append(dict(request.query))
+            response = self.handler(request)
             return await response if asyncio.iscoroutine(response) else response
         app = web.Application()
         app.router.add_get('/api/v1/web', handle)
@@ -22,66 +27,57 @@ class FourgetTests(unittest.IsolatedAsyncioTestCase):
         site = web.TCPSite(self.runner, '127.0.0.1', 0)
         await site.start()
         self.port = site._server.sockets[0].getsockname()[1]
-        self.providers = []
 
     async def asyncTearDown(self):
-        for p in self.providers:
-            await p.close()
         await self.runner.cleanup()
 
-    def client(self, **kw):
-        p = self.Provider(port=self.port, **kw)
-        self.providers.append(p)
-        return p
+    async def search(self, query='測試 + & 中文', **options):
+        return await fourget(query, port=self.port, **options)
 
-    def task(self, id='q1', provider='4get'):
-        return SearchTask(id, id, f'測試 {id} + & 中文', 'official', provider=provider)
-
-    async def test_protocol_sanitation_and_full_description(self):
+    async def test_protocol_url_sanitation_and_full_descriptions(self):
         description = '很長的摘要\n' * 1000
-        self.handler = lambda req: web.json_response({'web': [
+        self.handler = lambda request: web.json_response({'web': [
             {'title': 'A', 'url': 'javascript:bad', 'description': 'bad'},
+            {'title': 'B', 'url': 'https://user:pw@example.com/', 'description': 'credentials'},
+            {'title': 'C', 'url': 'https://example.com/a b', 'description': 'whitespace'},
             {'title': '官方資料', 'url': 'https://example.com/a?x=1', 'description': description},
-        ]})
-        result = await self.client().search(self.task())
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].description, description)
-        self.assertEqual(result[0].url, 'https://example.com/a?x=1')
-        self.assertEqual(self.calls[0], {'s': self.task().query, 'scraper': 'ddg', 'country': 'any'})
+            {'title': ' ', 'url': 'http://example.com/b', 'description': None}]})
+        self.assertEqual(await self.search(), [('官方資料', 'https://example.com/a?x=1', description),
+                                               ('No Title', 'http://example.com/b', 'No snippet available.')])
+        self.assertEqual(self.calls[0], {'s': '測試 + & 中文', 'scraper': 'ddg', 'country': 'any'})
 
     async def test_top_ten_only(self):
-        self.handler = lambda req: web.json_response({'web': [
+        self.handler = lambda request: web.json_response({'web': [
             {'title': str(i), 'url': f'https://example.com/{i}', 'description': 'x'} for i in range(15)]})
-        result = await self.client().search(self.task())
-        self.assertEqual(len(result), 10)
+        self.assertEqual(len(await self.search()), 10)
 
-    async def test_redirects_and_bad_json_fail_explicitly(self):
-        from research.providers import ProviderError
-        for response in (web.Response(status=302, headers={'Location': '/other'}),
-                         web.Response(text='not json'), web.json_response({'error': 'bad'}),
+    async def test_redirects_errors_and_bad_json_fail_without_the_body(self):
+        for response in (web.Response(status=302, headers={'Location': '/other'}), web.Response(text='not json'),
+                         web.json_response({'error': 'bad'}), web.json_response({'web': {}}),
                          web.Response(status=503, text='private error body')):
-            self.handler = lambda req, response=response: response
-            with self.assertRaises(ProviderError) as e:
-                await self.client().search(self.task())
-            self.assertNotIn('private error body', str(e.exception))
+            self.handler = lambda request, response=response: response
+            with self.subTest(status=response.status), self.assertRaises(ProviderError) as caught:
+                await self.search()
+            self.assertNotIn('private error body', str(caught.exception))
 
     async def test_body_limit_rejects_instead_of_truncating(self):
-        from research.providers import ProviderError
-        self.handler = lambda req: web.Response(text='x' * 2000)
-        with self.assertRaises(ProviderError):
-            await self.client(max_body_bytes=100).search(self.task())
+        self.handler = lambda request: web.Response(text='x' * 2000)
+        with self.assertRaisesRegex(ProviderError, 'byte limit'):
+            await self.search(max_bytes=100)
 
     async def test_timeout_and_cancellation(self):
-        from research.providers import ProviderError
         entered, release = asyncio.Event(), asyncio.Event()
-        async def block(req):
-            entered.set(); await release.wait()
+
+        async def block(request):
+            entered.set()
+            await release.wait()
             return web.json_response({'web': []})
         self.handler = block
         try:
-            with self.assertRaises(ProviderError):
-                await self.client(timeout=0.03).search(self.task())
-            task = asyncio.create_task(self.client().search(self.task('q2')))
+            with self.assertRaisesRegex(ProviderError, 'timeout'):
+                await self.search(timeout=0.03)
+            entered.clear()
+            task = asyncio.create_task(self.search())
             await entered.wait()
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
@@ -89,53 +85,52 @@ class FourgetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
 
-    async def test_parallel_batch_budget_and_early_result_delivery(self):
-        from research.budget import QueryBudget
-        started, release = asyncio.Event(), asyncio.Event()
-        async def handle(req):
-            if len(self.calls) >= 2:
-                started.set()
-            if 'slow' in req.query['s']:
-                await release.wait()
-            return web.json_response({'web': []})
-        self.handler = handle
-        batch = self.Batch({'4get': self.client()}, QueryBudget(2), concurrency=3)
-        jobs = [self.task('slow'), self.task('fast'), self.task('not-sent')]
-        results = batch.run(jobs)
-        try:
-            first = await asyncio.wait_for(anext(results), 1)
-            await asyncio.wait_for(started.wait(), 1)
-            self.assertEqual(first.task.task_id, 'fast')
-            self.assertIsNone(first.error)
-            self.assertEqual(batch.budget.used, 2)
-            self.assertEqual(len(self.calls), 2)
-            release.set()
-            rest = [r async for r in results]
-            self.assertEqual([r.task.task_id for r in rest], ['slow'])
-        finally:
-            release.set()
-            await results.aclose()
 
-    async def test_duplicate_query_is_not_dispatched_or_charged(self):
-        from research.budget import QueryBudget
-        batch = self.Batch({'4get': self.client()}, QueryBudget(3))
-        a = self.task('q1')
-        b = SearchTask('q2', 'q2', a.query.upper(), 'other')
-        self.assertEqual(len([r async for r in batch.run([a, b])]), 1)
-        self.assertEqual(batch.budget.used, 1)
-        self.assertEqual(len(self.calls), 1)
+class GoogleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_browser_search_and_redirect_tokens_become_their_targets(self):
+        service = SimpleNamespace(search_one=AsyncMock(return_value={'ok': True, 'results': [
+            {'title': 'Fixture', 'url': 'https://www.google.com/goto?url=CAES1', 'snippet': 'x' * 600},
+            {'title': '', 'url': 'https://www.example.com/a/?q=%2f', 'snippet': 'y'},
+            {'title': 'bad', 'url': 'https://www.google.com/goto?url=bad', 'snippet': 'z'}]}))
+        targets = {'https://www.google.com/goto?url=CAES1': 'https://nasa.gov/seasons', 'https://www.google.com/goto?url=bad': 'ftp://x'}
+        with patch.object(providers, 'resolve_google_redirect', lambda url: targets.get(url, url)):
+            found = await google(service, 'research-owner', 'seasons')
+        self.assertEqual(found, [('Fixture', 'https://nasa.gov/seasons', 'x' * 600),
+                                 ('No Title', 'https://www.example.com/a/?q=%2f', 'y')])
+        search, index, owner, slots = service.search_one.await_args.args
+        self.assertEqual((search['query'], owner), ('seasons', 'research-owner'))
 
-    async def test_one_failure_does_not_cancel_sibling_queries(self):
-        from research.budget import QueryBudget
-        self.handler = lambda req: web.Response(status=500) if 'bad' in req.query['s'] else web.json_response({'web': []})
-        batch = self.Batch({'4get': self.client()}, QueryBudget(2))
-        results = [r async for r in batch.run([self.task('bad'), self.task('good')])]
-        self.assertEqual(sum(r.error is not None for r in results), 1)
-        self.assertEqual(batch.budget.used, 2)
+    async def test_a_failed_search_is_an_error(self):
+        service = SimpleNamespace(search_one=AsyncMock(return_value={'ok': False, 'results': [], 'error': 'blocked'}))
+        with self.assertRaisesRegex(ProviderError, 'google_search_failed'):
+            await google(service, 'owner', 'q')
 
-    async def test_unsupported_provider_fails_before_budget_reservation(self):
-        from research.budget import QueryBudget
-        batch = self.Batch({'4get': self.client()}, QueryBudget(2))
-        with self.assertRaises(ValueError):
-            _ = [r async for r in batch.run([self.task('q1', provider='google')])]
-        self.assertEqual(batch.budget.used, 0)
+
+class RedirectAndUrlTests(unittest.TestCase):
+    def test_google_goto_resolves_to_its_302_target_and_failures_keep_the_url(self):
+        class Opener:
+            def __init__(self, location):
+                self.location = location
+
+            def open(self, request, timeout):
+                raise urllib.error.HTTPError(request.full_url, 302, 'Found', {'Location': self.location}, None)
+        goto = 'https://www.google.com/goto?url=CAES123'
+        with patch('urllib.request.build_opener', return_value=Opener('https://spaceplace.nasa.gov/seasons/')):
+            self.assertEqual(resolve_google_redirect(goto), 'https://spaceplace.nasa.gov/seasons/')
+            self.assertEqual(resolve_google_redirect('https://example.com/a'), 'https://example.com/a')
+        with patch('urllib.request.build_opener', return_value=Opener('javascript:alert(1)')):
+            self.assertEqual(resolve_google_redirect(goto), goto)
+        with patch('urllib.request.build_opener', side_effect=OSError('offline')):
+            self.assertEqual(resolve_google_redirect(goto), goto)
+
+    def test_only_plain_web_urls_can_be_crawled(self):
+        for url in ('file:///etc/passwd', 'javascript:alert(1)', 'https://user:pw@example.com', 'https://',
+                    'https://example.com/\nfoo', 'https://example.com:99999/', 'chrome://settings', 'x' * 9000):
+            with self.subTest(url=url):
+                self.assertFalse(web_url(url))
+        self.assertTrue(web_url('https://example.com/?x=1#f'))
+        self.assertTrue(web_url('http://例子.tw:8080/路徑'))
+
+
+if __name__ == '__main__':
+    unittest.main()
