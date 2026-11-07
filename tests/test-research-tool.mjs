@@ -265,6 +265,7 @@ test('browser_intent: piweb progress rows, one task at a time per conversation, 
 /** A router server: the decision request (max_tokens 1) gets P(true) as token probabilities, the query request
  * (its answer forced to start inside the query list) gets `queries`. */
 async function fakeRouter(pTrue, queries) {
+ process.env.RESEARCH_FIRST = '1';
  const { createServer } = await import('node:http');
  const server = createServer((req, res) => {
   let body = '';

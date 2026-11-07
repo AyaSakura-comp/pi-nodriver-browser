@@ -10,7 +10,7 @@ import { type ResearchParams, SOCKET, WorkerClient, startWorker } from "./worker
 
 // Research first (see before_agent_start): on unless RESEARCH_FIRST=0. Its latency budget: deliver
 // the evidence this long after the job starts, at most this many rough tokens, no wait for images.
-const RESEARCH_FIRST = process.env.RESEARCH_FIRST !== "0";
+const RESEARCH_FIRST = process.env.RESEARCH_FIRST === "1";   // off: the user dropped the LFM router approach (2026-11-08)
 const isLocalModel = (baseUrl: string | undefined) => {
   try {
     return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(new URL(baseUrl ?? "").hostname);
