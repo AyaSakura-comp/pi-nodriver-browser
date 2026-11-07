@@ -2,8 +2,9 @@
 """Resident Pi RPC benchmark driver for time breakdown analysis.
 
 Executes questions against a persistent resident Pi RPC process with:
-- Installed extension code run as an instrumented daemon on an isolated Unix socket.
-- Full trace capturing (crawls, searches, images, focus).
+- Installed extension code run as an instrumented daemon on an isolated Unix socket,
+  Chrome profile and agent directory (events, Chrome log, downloads).
+- Full trace capturing (searches, crawls, images, research jobs).
 - Event streaming recording (*.events.jsonl).
 """
 
@@ -16,70 +17,41 @@ import signal
 import sys
 import time
 
-# Instrumented daemon template
+# Instrumented daemon template: the installed worker with timed searches, crawls, image
+# downloads and research jobs (trace.jsonl, read by plot_breakdown.py).
 DAEMON_TEMPLATE = r'''
 import asyncio, json, pathlib, sys, time
 sys.path.insert(0, sys.argv[1])
 import worker
-from research.jobs import ResearchConnection, _Google
-from research.providers import FourgetProvider
-from research.decisions import LayaClient
+import research.jobs as jobs
 
 P = pathlib.Path(sys.argv[2])
-SOCKET = str(P / 'browser.sock')
 
 def log(event, **data):
     with (P / 'trace.jsonl').open('a') as f:
         f.write(json.dumps(dict(time=time.time(), event=event, **data), ensure_ascii=False) + '\n')
 
-def wrap(cls, name, kind):
-    original = getattr(cls, name)
-    async def measured(self, *a, **kw):
+def timed(function, kind, start=lambda args: {}, end=lambda result: {}):
+    async def measured(*args, **kwargs):
         begin = time.time()
-        log(kind + '_start', query=getattr(a[0], 'query', None) if a else None,
-            url=a[0] if a and isinstance(a[0], str) and kind == 'crawl' else None)
+        log(kind + '_start', **start(args))
         try:
-            result = await original(self, *a, **kw)
-            detail = {}
-            if kind == 'crawl':
-                detail = {'ok': result.get('ok'), 'text_chars': len(result.get('text', '')),
-                          'error': result.get('error'), 'truncated': result.get('truncated')}
-            if kind in ('search', 'google_search'):
-                detail = {'results': len(result)}
-            log(kind + '_end', seconds=time.time() - begin, **detail)
-            return result
+            result = await function(*args, **kwargs)
         except BaseException as e:
             log(kind + '_error', seconds=time.time() - begin, error=type(e).__name__)
             raise
-    setattr(cls, name, measured)
+        log(kind + '_end', seconds=time.time() - begin, **end(result))
+        return result
+    return measured
 
-wrap(FourgetProvider, 'search', 'search')
-wrap(_Google, 'search', 'google_search')
-wrap(LayaClient, 'choose', 'laya')
-wrap(worker.BrowserWorker, 'crawl_one', 'crawl')
-wrap(worker.BrowserWorker, 'run_fetch_image', 'image')
+jobs.fourget = timed(jobs.fourget, 'search', lambda a: {'query': a[0]}, lambda rows: {'results': len(rows)})
+jobs.google = timed(jobs.google, 'google_search', lambda a: {'query': a[2]}, lambda rows: {'results': len(rows)})
+jobs.Job.run = timed(jobs.Job.run, 'job', end=lambda r: {'status': r['status'], 'reason': r['reason']})
+worker.BrowserService.crawl_one = timed(worker.BrowserService.crawl_one, 'crawl', lambda a: {'url': a[1]}, lambda r: {
+    'ok': r.get('ok'), 'text_chars': len(r.get('text', '')), 'error': r.get('error'), 'truncated': r.get('truncated')})
+worker.BrowserService.run_fetch_image = timed(worker.BrowserService.run_fetch_image, 'image', lambda a: {'url': a[1]})
 
-import research.focus as _fm
-_of = _fm.focus_page
-async def _tf(q, title, text, **kw):
-    begin = time.time()
-    log('focus_start')
-    r = await _of(q, title, text, **kw)
-    log('focus_end', seconds=time.time() - begin, source_chars=len(text),
-        focused_chars=(r[1]['focused_chars'] if r else None))
-    return r
-_fm.focus_page = _tf
-
-from research.controller import ResearchController
-_oc = ResearchController.run
-async def _tc(self, plan):
-    log('job_start')
-    r = await _oc(self, plan)
-    log('job_end', status=r.snapshot.status, reason=r.snapshot.reason)
-    return r
-ResearchController.run = _tc
-
-worker.main([sys.argv[0], '--socket', SOCKET, '--profile', str(P / 'chrome-profile')])
+asyncio.run(worker.server_main(str(P / 'browser.sock')))
 '''
 
 DEFAULT_QUESTIONS = [
@@ -97,6 +69,7 @@ async def run_benchmark(output_dir: Path, questions: list[str], pi_bin: str,
         ext_dir = repo_dir
 
     daemon_file = output_dir / 'daemon.py'
+    (output_dir / 'agent').mkdir()  # the daemon's PI_AGENT_DIR: its events, Chrome log and downloads
     daemon_file.write_text(DAEMON_TEMPLATE)
 
     env = dict(
@@ -119,7 +92,8 @@ async def run_benchmark(output_dir: Path, questions: list[str], pi_bin: str,
     daemon = await asyncio.create_subprocess_exec(
         'xvfb-run', '-a', '-s', '-screen 0 1366x768x24',
         str(daemon_python), str(daemon_file), str(ext_dir), str(output_dir),
-        cwd=str(ext_dir), env=env, stdout=daemon_log, stderr=daemon_log, start_new_session=True
+        cwd=str(ext_dir), env=dict(env, PI_AGENT_DIR=str(output_dir / 'agent')),
+        stdout=daemon_log, stderr=daemon_log, start_new_session=True
     )
 
     try:

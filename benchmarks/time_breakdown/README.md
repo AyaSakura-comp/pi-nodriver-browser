@@ -14,7 +14,7 @@ Standard end-to-end benchmark timing (`total_seconds`) is insufficient for diagn
 5. Long answer generation token decoding
 
 This tool fuses three synchronized telemetry streams to reconstruct the exact multi-lane timeline:
-- **Nodriver Browser Trace (`trace.jsonl`)**: Precise search durations, per-page parallel crawl windows, image download latencies, and focus-filter operations.
+- **Nodriver Browser Trace (`trace.jsonl`)**: Precise search durations, per-page parallel crawl windows, image download latencies, and research job boundaries, from the installed extension run as an instrumented worker on its own socket, Chrome profile and agent directory.
 - **Pi Agent RPC Events (`*.events.jsonl`)**: Tool execution boundaries, agent thinking durations, and user-visible streaming text tokens (TTFT - Time To First Token).
 - **Inference Server Log (`journalctl -u qwen-mtp` or llama-server)**: Exact prompt evaluation durations (`prompt eval time`), token counts, speculative background warms (`n_predict: 0`), and decode rates.
 

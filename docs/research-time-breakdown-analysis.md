@@ -6,10 +6,10 @@
 
 ## 1. Why Time Breakdown Analysis is Mandatory
 
-In an autonomous multi-stage agent pipeline (`Model Planning` ➔ `Web Search` ➔ `Parallel Crawl` ➔ `Evidence Chunking & BM25` ➔ `GPU KV-Cache Prefill` ➔ `Answer Thinking` ➔ `Answer Generation`), aggregate execution time conflates completely orthogonal subsystems:
+In an autonomous multi-stage agent pipeline (`Agent writes q1–q4` ➔ `Web Search` ➔ `Parallel Crawl` ➔ `Evidence Chunking & BM25` ➔ `GPU KV-Cache Prefill` ➔ `Answer Thinking` ➔ `Answer Generation`), aggregate execution time conflates completely orthogonal subsystems:
 
 1. **Network & External I/O**: Search API roundtrip, target website HTTP latency, Cloudflare challenge gates.
-2. **Local Concurrency & IPC**: Chrome DevTools Protocol (CDP) concurrency, tab pool lifecycle locks, Python/Node.js Unix socket IPC.
+2. **Local Concurrency & IPC**: Chrome DevTools Protocol (CDP) concurrency, the browser liveness probe, Python/Node.js Unix socket IPC.
 3. **GPU Compute & Cache Affinity**:
    - Intermediate chunk speculative prefill (`n_predict: 0`)
    - Prefix cache matching vs. cache invalidation
