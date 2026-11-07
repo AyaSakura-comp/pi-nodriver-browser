@@ -5,25 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import registerBrowserIntent from "./browser-intent-tool.ts";
-import { routeResearch, ROUTER_THRESHOLD } from "./research-router.ts";
-import { type ResearchParams, SOCKET, WorkerClient, startWorker } from "./worker-launch.ts";
-
-// Research first (see before_agent_start): on unless RESEARCH_FIRST=0. Its latency budget: deliver
-// the evidence this long after the job starts, at most this many rough tokens, no wait for images.
-const RESEARCH_FIRST = process.env.RESEARCH_FIRST === "1";   // off: the user dropped the LFM router approach (2026-11-08)
-const isLocalModel = (baseUrl: string | undefined) => {
-  try {
-    return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(new URL(baseUrl ?? "").hostname);
-  } catch {
-    return false;
-  }
-};
-const PREFILL_STOP_BEFORE_MS = 500;
-const RESEARCH_FIRST_BUDGET = {
-  deadlineMs: Number(process.env.RESEARCH_FIRST_DEADLINE_MS ?? 2700),
-  evidenceBudget: Number(process.env.RESEARCH_FIRST_EVIDENCE ?? 1500),
-  imageWaitMs: 0,
-};
+import { SOCKET, WorkerClient, startWorker } from "./worker-launch.ts";
 
 const MAX_BATCH_IMAGE_BYTES = 40 * 1024 * 1024;
 const TIME_SENSITIVE_SEARCH_PATTERN = /(?:\b(?:19|20)\d{2}\b|\b(?:today|tomorrow|yesterday|now|current|currently|latest|recent|recently|upcoming|ago|date|time|timezone|schedule|deadline|release|price|stock|availability|exchange\s+rate|weather)\b|\bthis\s+(?:week|month|year)\b|\b(?:last|next)\s+(?:week|month|year)\b|今天|明天|昨天|現在|當下|目前|最新|最近|即將|本週|這週|上週|下週|本月|上月|下月|今年|去年|明年|日期|時間|時區|時程|排程|截止|發布|上市|價格|庫存|供貨|匯率|天氣|活動)/iu;
@@ -138,8 +120,6 @@ interface Job {
   abort: AbortController;
   adopted: boolean;
   timer?: ReturnType<typeof setTimeout>;
-  /** A latency-budget job: when its evidence is delivered at the latest (epoch ms). */
-  deadlineAt?: number;
 }
 
 // Browser and search guidance belongs to the tools, not Pi's system prompt: promptGuidelines
@@ -218,19 +198,22 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
     }
   });
 
+  pi.on("before_agent_start", () => ({
+    // Persist an appended context message. Never rewrite earlier date messages:
+    // the system/tool prefix and existing conversation KV remain reusable.
+    message: { customType: "browser-date-context", content: localDateLine(), display: false },
+  }));
+
   // Research starts the moment q1 of a research call is written: search, crawl and evidence
   // need only the queries and the user's question. q2..q4 join the running job as they are
   // written, and execute() adopts it. A job whose call is never executed is cancelled.
   const jobs = new Map<string, Job>();
-  const startResearch = (sid: string, callId: string, queries: string[], streaming: boolean,
-    budget: Pick<ResearchParams, "deadlineMs" | "evidenceBudget" | "imageWaitMs"> = {}): Job => {
+  const startResearch = (sid: string, callId: string, queries: string[], streaming: boolean): Job => {
     const turn = turnOf(sid);
-    const job: Job = { id: randomUUID(), callId, done: Promise.resolve({}), prefix: "", abort: new AbortController(), adopted: false,
-      ...(budget.deadlineMs && { deadlineAt: Date.now() + budget.deadlineMs }) };
+    const job: Job = { id: randomUUID(), callId, done: Promise.resolve({}), prefix: "", abort: new AbortController(), adopted: false };
     job.done = worker.research({
       jobId: job.id, question: turn.asked.slice(0, 4000) || queries.join(" ; "), queries, clock: hostClock(),
       answer: turn.depth ? "depth" : "breadth", crawlConcurrency: 32, crawlWordBudget: 20000, ...(streaming && { streaming }),
-      ...budget,
     }, sid, job.abort.signal, (prefix) => {
       job.prefix = prefix;
       job.listener?.(prefix);
@@ -246,50 +229,6 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
     clearTimeout(job.timer);
     job.abort.abort();
   };
-
-  // Research first. Deciding to research is otherwise the agent's first turn: reading the new
-  // message, thinking and writing the call took 3.4-5.1 s before the first search (2026-11-08,
-  // Strata), and the evidence could only be prefilled after it. A small local model (the router)
-  // takes that decision in ~0.5 s: when it gives research a probability of at least
-  // RESEARCH_ROUTER_THRESHOLD, the job starts at once with the user's words as q1 and the turn
-  // starts with that research call (before_agent_start toolCall), so the agent's first model call
-  // is the answer, with the evidence prefilled while it arrived. A latency budget keeps the
-  // evidence small enough to be read before the answer. Anything else (router down, below the
-  // threshold, an image, a running job) keeps the agent's own decision.
-  pi.on("before_agent_start", async (event, ctx) => {
-    // Persist an appended context message. Never rewrite earlier date messages:
-    // the system/tool prefix and existing conversation KV remain reusable.
-    const date = { customType: "browser-date-context", content: localDateLine(), display: false };
-    // Only for a model on this machine: its prompt reading is what the latency budget is for, and a cloud
-    // model is better served by the full evidence of the agent's own research call.
-    if (!RESEARCH_FIRST || !ctx || event.images?.length || !isLocalModel(ctx.model?.baseUrl)) return { message: date };
-    const sid = sessionId(ctx);
-    const turn = turnOf(sid);
-    if (jobs.has(sid) || !turn.asked || guarded(turn, "research")) return { message: date };
-    const routed = await routeResearch(turn.asked, localDateLine()).catch(() => undefined);
-    if (!routed || routed.p < ROUTER_THRESHOLD) return { message: date };
-    // Strata saves the conversation it holds before another one replaces it (~0.25 s); asked now, it does so
-    // while the queries are written instead of in front of the first prefill. Other servers refuse it harmlessly.
-    void fetch(`${ctx.model!.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/slots/0?action=flush`,
-      { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal: AbortSignal.timeout(5000) })
-      .catch(() => {});
-    const callId = `call_${randomUUID().replaceAll("-", "")}`;
-    const q1 = turn.asked.replace(/\s+/g, " ").trim().slice(0, 80);
-    // q1 (the user's words) searches at once; q2-q4, the router's keyword queries, join as soon as it has
-    // written them (~0.3 s later). A research call is four queries: without three more, the agent writes its own.
-    const job = startResearch(sid, callId, [currentYearQuery(q1, turn.asked)], true, RESEARCH_FIRST_BUDGET);
-    job.timer = setTimeout(() => dropJob(sid), 60_000);
-    const extra = [...new Set((await routed.queries.catch(() => [] as string[]))
-      .map((q) => q.replace(/\s+/g, " ").trim()).filter((q) => q && q.length <= 80 && q !== q1))].slice(0, 3);
-    if (extra.length < 3) {
-      dropJob(sid);
-      return { message: date };
-    }
-    extra.forEach((query, i) => worker.addQuery(sid, { jobId: job.id, query: currentYearQuery(query, turn.asked), index: i + 1 }).catch(() => {}));
-    worker.addQuery(sid, { jobId: job.id, done: true }).catch(() => {});
-    const [q2, q3, q4] = extra;
-    return { message: date, toolCall: { id: callId, name: "research", arguments: { q1, q2, q3, q4 } } };
-  });
   const streamed = new Map<string, { raw: string; sent: Set<number> }>();
   pi.on("message_update", (event, ctx) => {
     const ev = event.assistantMessageEvent;
@@ -375,11 +314,6 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
       // Committed evidence is appended once, in order; the final packet must start with it
       // or Pi drops the prefill (never affects correctness).
       const prefill = ACTIVE_PREFILL ? ctx.prefill?.begin(callId) : undefined;
-      // Near a latency budget's deadline no new prefill starts: one started then would still be reading when the
-      // evidence is delivered, and the answer waits for it and pays a second read. What arrives after this is read
-      // by the answer itself, in the same pass as the rest. (The evidence delivered is the same either way.)
-      const stopPrefill = job?.deadlineAt && prefill
-        ? setTimeout(() => prefill.end(), Math.max(0, job.deadlineAt - PREFILL_STOP_BEFORE_MS - Date.now())) : undefined;
       let committed = "";
       let shown = "";
       let delivered = false;
@@ -424,8 +358,7 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
         }
         // Restating the question after ~20k tokens of evidence keeps the answer on it.
         const turn = turnOf(sid);
-        // A research-first packet opens with the question and its answer rules (prefilled early).
-        if (response.fullEvidenceDelivered && turn.asked && !response.rulesFirst) text += `\nThe user's question: «${turn.asked.slice(-600)}»\n` + (turn.depth
+        if (response.fullEvidenceDelivered && turn.asked) text += `\nThe user's question: «${turn.asked.slice(-600)}»\n` + (turn.depth
           ? "Answer it now, in depth: direct answer in the first sentence; then every concrete detail of the item asked about plus the 2-3 things the user needs next; "
           : "Answer it now, breadth first: direct answer in the first sentence; then every distinct on-topic item in one or two lines each (時間、地點、費用 or the key fact + 一句亮點), no deep dive into any single item; end by naming 1-3 items to expand and asking which one; ") +
           "a [來源](URL) link right after every key fact; nothing off-topic, nothing said twice. If the evidence is about a different product or company than the one asked, say so.\n";
@@ -434,7 +367,6 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
         return { content: [{ type: "text" as const, text }], details: { ...details, estimatedInputTokens, ...(prefill && { prefill: prefill.stats() }) } };
       } finally {
         if (jobs.get(sid) === job) jobs.delete(sid);
-        clearTimeout(stopPrefill);
         if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
       }
     },
