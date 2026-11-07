@@ -1,5 +1,5 @@
 [Unit]
-Description=Browser-agent watchdog: health-check, revive and log outages of browser_intent's services
+Description=Browser-agent watchdog: health-check the shared browser worker, revive it and log outages
 
 [Service]
 Type=oneshot

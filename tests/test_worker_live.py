@@ -4,6 +4,7 @@ Skipped unless PI_BROWSER_LIVE=1 (needs google-chrome and xvfb-run; ~20 s).
 """
 import functools
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / 'tests' / 'live' / 'site'
@@ -150,6 +152,8 @@ class WorkerLiveTests(unittest.TestCase):
         self.ref(result['snapshot'], r'link "Menu results link"$')
         links = self.ok('get links')['text'].split('\n')
         self.assertIn(f'{self.base}/newtab.html', links)
+        self.assertIn('Scroll:', self.ok('scroll down')['snapshot'])
+        self.assertIn('/fixture.html', self.ok('press Escape')['url'])
 
         shot = self.ok('screenshot')
         self.assertTrue(Path(shot['path']).stat().st_size > 1000)
@@ -171,6 +175,15 @@ class WorkerLiveTests(unittest.TestCase):
         self.assertIn('Results for abc', result['text'])
         health = self.ok('browser-health')
         self.assertEqual(health['browser'], 'ok')
+        refused = self.request(f'fetch-image {self.base}/missing.png')
+        self.assertIn('private address', refused['error'], 'downloads go to public addresses only')
+        # The watchdog's own check, against this worker.
+        spec = importlib.util.spec_from_file_location('watchdog', ROOT / 'ops' / 'browser-agent-watchdog.py')
+        watchdog = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watchdog)
+        with mock.patch.object(watchdog, 'SOCKET', Path(self.sock)):
+            status, detail = watchdog.health()
+        self.assertEqual(status, 'ok', detail)
 
 
 if __name__ == '__main__':
