@@ -1,14 +1,15 @@
 import { readFileSync } from "node:fs";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { runBrowserTask, type LlmConfig, type TaskResult, type WorkerLike } from "./browser-agent.ts";
 
-// Planner model when the conversation's own model cannot be called over /chat/completions.
-const DEFAULT_ENDPOINT = process.env.PI_BROWSER_AGENT_URL || "http://127.0.0.1:8090/v1/chat/completions";
-const DEFAULT_MODEL = process.env.PI_BROWSER_AGENT_MODEL || "qwen3.8-flash";
+// Planner model when the conversation's own model cannot be called over /chat/completions,
+// and the fallback when it cannot produce browser actions.
+const DEFAULT_ENDPOINT = "http://127.0.0.1:8090/v1/chat/completions";
+const DEFAULT_MODEL = "qwen3.8-flash";
 
 /** OpenAI-style chat endpoint for a Pi model, when its API has one. */
-export function chatEndpoint(api: string | undefined, baseUrl: string | undefined): string | undefined {
+function chatEndpoint(api: string | undefined, baseUrl: string | undefined): string | undefined {
   if (!baseUrl) return undefined;
   const base = baseUrl.replace(/\/+$/, "");
   if (api === "openai-completions") return `${base}/chat/completions`;
@@ -24,16 +25,18 @@ function isLocal(url: string): boolean {
   }
 }
 
-async function plannerFor(ctx: any): Promise<{ llm: LlmConfig; note: string }> {
-  const model = ctx?.model;
+const DEFAULT_LLM: LlmConfig = { endpoint: DEFAULT_ENDPOINT, model: DEFAULT_MODEL, local: isLocal(DEFAULT_ENDPOINT) };
+
+async function plannerFor(ctx: ExtensionContext): Promise<{ llm: LlmConfig; note: string }> {
+  const model = ctx.model;
   if (model && chatEndpoint(model.api, model.baseUrl)) {
     let baseUrl = model.baseUrl;
     let headers: Record<string, string> = { ...(model.headers || {}) };
     try {
-      const auth = await ctx.modelRegistry?.getApiKeyAndHeaders?.(model);
-      if (auth?.ok) {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (auth.ok) {
         if (auth.baseUrl) baseUrl = auth.baseUrl;
-        if (auth.headers) headers = { ...headers, ...auth.headers };
+        if (auth.headers) headers = { ...headers, ...auth.headers } as Record<string, string>;
         if (auth.apiKey && auth.apiKey !== "not-needed" && !headers.Authorization && !headers.authorization) {
           headers.Authorization = `Bearer ${auth.apiKey}`;
         }
@@ -45,8 +48,7 @@ async function plannerFor(ctx: any): Promise<{ llm: LlmConfig; note: string }> {
         note: `${model.provider ?? ""}/${model.id}`.replace(/^\//, "") };
     }
   }
-  return { llm: { endpoint: DEFAULT_ENDPOINT, model: DEFAULT_MODEL, local: isLocal(DEFAULT_ENDPOINT) },
-    note: `${DEFAULT_MODEL} (local default)` };
+  return { llm: DEFAULT_LLM, note: `${DEFAULT_MODEL} (local default)` };
 }
 
 const DESCRIPTION = `Live browser autopilot on the shared, logged-in Chrome. Give a goal (and a start URL when you have one); it opens the page, clicks, types, selects and scrolls by itself, then returns:
@@ -76,17 +78,18 @@ const NEXT: Record<string, string> = {
   TASK_NEEDS_CONFIRM: "Next: ask the user. Call again with confirm=true only after they agree to this exact step.",
 };
 
+const HEAD: Record<string, string> = {
+  TASK_DONE: "✅ 任務完成（證據已在頁面上找到）",
+  TASK_UNVERIFIED: "🔍 已有答案，但部分證據在頁面上找不到",
+  TASK_NEEDS_INPUT: "🔑 需要使用者提供登入或驗證資料",
+  TASK_NEEDS_CONFIRM: "⚠️ 下一步是不可逆操作，需要使用者確認",
+  TASK_BLOCKED: "🛑 網站擋下自動瀏覽",
+  TASK_STOPPED: "⏸️ 未完成就停止",
+  TASK_FAILED: "❌ 任務失敗",
+};
+
 function summary(result: TaskResult, goal: string, planner: string): string {
-  const head: Record<string, string> = {
-    TASK_DONE: "✅ 任務完成（證據已在頁面上找到）",
-    TASK_UNVERIFIED: "🔍 已有答案，但部分證據在頁面上找不到",
-    TASK_NEEDS_INPUT: "🔑 需要使用者提供登入或驗證資料",
-    TASK_NEEDS_CONFIRM: "⚠️ 下一步是不可逆操作，需要使用者確認",
-    TASK_BLOCKED: "🛑 網站擋下自動瀏覽",
-    TASK_STOPPED: "⏸️ 未完成就停止",
-    TASK_FAILED: "❌ 任務失敗",
-  };
-  const lines = [`${head[result.status] ?? result.status}：${goal}`];
+  const lines = [`${HEAD[result.status] ?? result.status}：${goal}`];
   if (result.answer) lines.push("", result.answer);
   if (result.reason) lines.push("", `原因：${result.reason}`);
   if (NEXT[result.status]) lines.push("", NEXT[result.status]);
@@ -106,7 +109,6 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
     name: "browser_intent",
     label: "Browser autopilot",
     description: DESCRIPTION,
-    promptSnippet: "Hand a live-browser goal (and start URL) to an autopilot that does the clicking and reports back",
     promptGuidelines: GUIDELINES,
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "Start page (exact page, site home page, or a Google search URL). Omit to continue on this conversation's current page." })),
@@ -114,11 +116,10 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
       confirm: Type.Optional(Type.Boolean({ description: "Only when the user explicitly approved the irreversible step a previous TASK_NEEDS_CONFIRM stopped at." })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const goal = String(params.goal || "").trim();
+      const goal = params.goal.trim();
       if (!goal) throw new Error("browser_intent needs a goal");
-      const url = typeof params.url === "string" && params.url.trim() ? params.url.trim() : undefined;
+      const url = params.url?.trim() || undefined;
       const { llm, note } = await plannerFor(ctx);
-      const fallbackLlm: LlmConfig = { endpoint: DEFAULT_ENDPOINT, model: DEFAULT_MODEL, local: isLocal(DEFAULT_ENDPOINT) };
       const started = Date.now();
       const lines = [`🎯 瀏覽任務：${goal}`];
       // piweb shows one progress row per update from details.message (transport/web.ts).
@@ -128,24 +129,20 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
       });
       show(lines[0]);
       const session = `intent-${ctx.sessionManager.getSessionId()}`;
-      const previous = queues.get(session) ?? Promise.resolve();
-      let release = () => {};
-      const mine = new Promise<void>((resolve) => { release = resolve; });
-      const chained = previous.then(() => mine);
-      queues.set(session, chained);
-      await previous.catch(() => undefined);
-      const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(170_000)]);
-      const result = await runBrowserTask({
-        goal, url, confirm: params.confirm === true, session,
-        worker, llm, fallbackLlm, signal: bounded,
+      const task = (queues.get(session) ?? Promise.resolve()).then(() => runBrowserTask({
+        goal, url, confirm: params.confirm === true, session, worker, llm, fallbackLlm: DEFAULT_LLM,
+        // The hard limit counts from the start of this task, not from the wait in the queue.
+        signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(170_000)]),
         onProgress: (line) => {
           const stamped = `${((Date.now() - started) / 1000).toFixed(1)}s ${line}`;
           lines.push(stamped);
           show(stamped);
         },
-      }).finally(() => {
-        release();
-        if (queues.get(session) === chained) queues.delete(session);
+      }));
+      const settled = task.catch(() => undefined);
+      queues.set(session, settled);
+      const result = await task.finally(() => {
+        if (queues.get(session) === settled) queues.delete(session);
       });
       const details = { ...result, planner: result.planner_switched ? `${note} → ${DEFAULT_MODEL} (fallback)` : note };
       const content: any[] = [{ type: "text" as const, text: `${summary(result, goal, note)}\n\n\`\`\`json\n${JSON.stringify(details, null, 1)}\n\`\`\`` }];

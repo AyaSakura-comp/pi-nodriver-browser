@@ -31,8 +31,6 @@ export interface TaskOptions {
   fallbackLlm?: LlmConfig;
   signal?: AbortSignal;
   onProgress?: (line: string) => void;
-  maxSteps?: number;
-  timeBudgetMs?: number;
 }
 
 export type TaskStatus = "TASK_DONE" | "TASK_UNVERIFIED" | "TASK_STOPPED" | "TASK_FAILED"
@@ -89,6 +87,8 @@ const IRREVERSIBLE = /結帳|立即購買|直接購買|馬上購買|確認購買
 const ADD_TO_CART = /加入購物車|放入購物車|加入購物籃|add to (cart|bag|basket)|\(icon: cart\)/i;
 const SECRET_FIELD = /type=password|密碼|password|passcode|驗證碼|otp|one-time|一次性|卡號|card number|cvv|cvc|安全碼/i;
 const MAX_SNAPSHOT_CHARS = 11000;
+const MAX_STEPS = 20;
+const TIME_BUDGET_MS = 150_000;
 
 /** Escape raw newlines/tabs inside JSON strings: models often write a multi-line answer literally. */
 function escapeControlInStrings(json: string): string {
@@ -110,7 +110,7 @@ function escapeControlInStrings(json: string): string {
   return out;
 }
 
-function parseAction(text: string): Record<string, any> | undefined {
+export function parseAction(text: string): Record<string, any> | undefined {
   const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/```(?:json)?/g, "");
   // The action may follow some prose; try every object start until one parses.
   for (let start = cleaned.indexOf("{"); start >= 0; start = cleaned.indexOf("{", start + 1)) {
@@ -139,8 +139,6 @@ function parseAction(text: string): Record<string, any> | undefined {
   }
   return undefined;
 }
-
-export const _test = { parseAction, IRREVERSIBLE, ADD_TO_CART, SECRET_FIELD, normalize: (s: string) => normalize(s) };
 
 function normalize(text: string): string {
   return text.normalize("NFKC").replace(/[\s​]+/g, "").toLowerCase();
@@ -225,8 +223,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
   const { goal, worker, session, signal } = options;
   let llm = options.llm;
   let switched: string | undefined;
-  const maxSteps = options.maxSteps ?? 20;
-  const deadline = Date.now() + (options.timeBudgetMs ?? 150_000);
+  const deadline = Date.now() + TIME_BUDGET_MS;
   const started = Date.now();
   const progress = options.onProgress ?? (() => undefined);
   const steps: string[] = [];
@@ -282,14 +279,14 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
       } catch {}
     }
 
-    for (let step = 1; step <= maxSteps; step++) {
+    for (let step = 1; step <= MAX_STEPS; step++) {
       signal?.throwIfAborted();
       if (Date.now() > deadline) break;
       const history = steps.length ? steps.map((s, i) => `${i + 1}. ${s}`).join("\n") : "(none yet)";
       const view = snapshot.length > MAX_SNAPSHOT_CHARS
         ? snapshot.slice(0, MAX_SNAPSHOT_CHARS) + "\n(… snapshot cut; scroll down for more)" : snapshot;
       const user = `Goal: ${goal}\nConfirmed by the user for irreversible steps: ${options.confirm ? "yes" : "no"}\n` +
-        `Step ${step} of at most ${maxSteps}. Steps so far:\n${history}\n` +
+        `Step ${step} of at most ${MAX_STEPS}. Steps so far:\n${history}\n` +
         (lastError ? `Last action failed: ${lastError}\n` : "") +
         `\nCurrent page:\n${view}\n\nReply with one JSON object.`;
       let action: Record<string, any> | undefined;
@@ -311,7 +308,6 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         llmMs += Date.now() - t;
         lastReply = reply;
         action = parseAction(reply);
-        if (process.env.PI_BROWSER_AGENT_TRACE) progress(`· model: ${reply.replace(/\s+/g, " ").slice(0, 300)}`);
       }
       if (!action && options.fallbackLlm && options.fallbackLlm.model !== llm.model && !switched) {
         // The conversation's model cannot drive the browser (seen: a 1.7B model answering with
@@ -472,7 +468,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
       }
     }
     return finish("TASK_STOPPED", {
-      reason: Date.now() > deadline ? "time budget used up before the goal was reached" : `stopped after ${maxSteps} steps without reaching the goal`,
+      reason: Date.now() > deadline ? "time budget used up before the goal was reached" : `stopped after ${MAX_STEPS} steps without reaching the goal`,
     });
   } catch (error) {
     // The tool's hard limit (a TimeoutError on the signal) ends the task like the budget

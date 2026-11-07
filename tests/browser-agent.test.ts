@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runBrowserTask, _test } from "../browser-agent.ts";
+import { parseAction, runBrowserTask } from "../browser-agent.ts";
 
 const PAGE = (body: string) => `URL: https://shop.example/item\nTitle: Item\n---\n${body}`;
 
@@ -28,9 +28,9 @@ function harness(replies: string[], pages: Record<string, string>, initial = PAG
 }
 
 test("parseAction tolerates fences, think blocks and braces inside strings", () => {
-  assert.deepEqual(_test.parseAction("<think>x</think>```json\n{\"action\":\"click\",\"ref\":\"e2\"}\n```"), { action: "click", ref: "e2" });
-  assert.equal(_test.parseAction("{\"action\":\"done\",\"answer\":\"a {b} c\"} trailing").answer, "a {b} c");
-  assert.equal(_test.parseAction("no json here"), undefined);
+  assert.deepEqual(parseAction("<think>x</think>```json\n{\"action\":\"click\",\"ref\":\"e2\"}\n```"), { action: "click", ref: "e2" });
+  assert.equal(parseAction("{\"action\":\"done\",\"answer\":\"a {b} c\"} trailing").answer, "a {b} c");
+  assert.equal(parseAction("no json here"), undefined);
 });
 
 test("an irreversible click is not sent without confirm", async () => {
@@ -98,8 +98,8 @@ test("select on a link is treated as a click", async () => {
 
 test("parseAction repairs raw line breaks inside strings and skips prose objects", () => {
   const raw = '{"action":"done","answer":"1. A $1\n2. B $2","evidence":["A $1"]}';
-  assert.equal(_test.parseAction(raw).answer, "1. A $1\n2. B $2");
-  assert.equal(_test.parseAction('Note {not json} then {"action":"scroll","direction":"down"}').action, "scroll");
+  assert.equal(parseAction(raw).answer, "1. A $1\n2. B $2");
+  assert.equal(parseAction('Note {not json} then {"action":"scroll","direction":"down"}').action, "scroll");
 });
 
 test("a planner that cannot produce actions hands the task to the fallback planner", async () => {
