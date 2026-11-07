@@ -6,6 +6,9 @@ cgroup and received SIGTERM with it. The launcher now gives the browser its own 
 
     RUN_SYSTEMD_INTEGRATION=1 .venv/bin/python -m unittest tests.test_systemd_browser_unit -v
 
+Negative control: with PI_NODRIVER_SYSTEMD=0 (forwarded to the launcher) the worker starts
+as a plain child and this test must fail, because Chrome dies with the parent unit.
+
 Everything is private to the test: socket, profile, logs and downloads live in a temp dir
 (PI_AGENT_DIR), the parent unit is pi-test-parent-*, and Xvfb picks a free display.
 """
@@ -166,6 +169,8 @@ class SystemdBrowserUnitTests(unittest.TestCase):
             # --setenv values are not subject to ExecStart expansion; only argv is.
             f'--setenv=PI_NODRIVER_PROFILE={self.profile}',
             f'--setenv=PI_AGENT_DIR={self.dir}',
+            *([f"--setenv=PI_NODRIVER_SYSTEMD={os.environ['PI_NODRIVER_SYSTEMD']}"]
+              if 'PI_NODRIVER_SYSTEMD' in os.environ else []),
             *map(literal, (shutil.which('node'), ROOT / 'tests' / 'fixtures' / 'launch-worker.mjs', ROOT, self.sock)),
         ], check=True, timeout=30)
         client = self.connect()

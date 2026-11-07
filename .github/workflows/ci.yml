@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      # Some Python tests run TypeScript snippets with --experimental-strip-types.
+      # Some Python tests run JavaScript snippets in node.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

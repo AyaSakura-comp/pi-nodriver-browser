@@ -77,7 +77,7 @@ Page commands (they return the new snapshot): `open <url>`, `snapshot`, `click <
 `type <ref> <text> [--submit]`, `select <ref> <option>`, `press <key>`,
 `scroll down|up|top|bottom`, `back`. Others: `get text|links`, `screenshot`,
 `session-cleanup`, `crawl <urls>`, `google-search <json>`, `fetch-image <url>`,
-`browser-health`, `shutdown`, and `research`, `research-add-query`, `research-prefetch`.
+`browser-health`, `shutdown`, `research` and `research-add-query`.
 
 ## Install / deploy
 
@@ -116,7 +116,13 @@ The live tests run their own worker, profile and socket in a temporary directory
 |---|---|---|
 | `PI_NODRIVER_SOCKET` | `~/.pi/agent/nodriver-browser.sock` | worker socket (Pi side, installer, watchdog) |
 | `PI_NODRIVER_PROFILE` | `~/.pi/agent/nodriver-profile` | Chrome profile (logins live here) |
-| `PI_AGENT_DIR` | `~/.pi/agent` | where the worker keeps its profile, logs, events and downloads |
+| `PI_AGENT_DIR` | `~/.pi/agent` | worker profile, logs, events and downloads; `browser-config.json` |
+| `PI_NODRIVER_SYSTEMD` | on | `0` starts the worker as a plain child instead of its own unit |
+| `RESEARCH_ACTIVE_PREFILL` | on | `0` stops warming the model with research evidence while it arrives |
+
+`browser-config.json` in `PI_AGENT_DIR`: `{"crawlGuards": false}` exempts `crawl` from the
+research guards (by default `crawl` is blocked before research unless the user gave a URL or
+asked for a crawl, and after research until the user asks for more).
 
 ## History
 

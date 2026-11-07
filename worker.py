@@ -114,7 +114,7 @@ class SessionState:
 class BrowserService:
     """Owns Chrome and runs the page commands. Research (research.jobs.ResearchConnection)
     also uses ensure_browser, search_one, crawl_one, run_fetch_image, image_fetch_semaphore,
-    cleanup_research_owner, research_cleanup_tasks, sweep_crawl_pool and .browser."""
+    cleanup_research_owner, research_cleanup_tasks and .browser."""
 
     def __init__(self):
         self.browser = None
@@ -204,11 +204,14 @@ class BrowserService:
                 self.sessions.pop(session_id, None)
 
     async def sweep_targets(self):
-        """Close temp tabs nobody is using and, as a safety valve, the oldest foreign tabs
-        once Chrome holds more than MAX_PAGE_TARGETS pages (e.g. leaked by another script)."""
+        """Close temp tabs a failed close left behind (no crawl or search runs 3 minutes) and,
+        as a safety valve, the oldest foreign tabs once Chrome holds more than MAX_PAGE_TARGETS
+        pages (e.g. leaked by another script)."""
         if self.browser is None:  # shut down meanwhile
             return
-        await self.sweep_crawl_pool()
+        for target_id, (tab, _owner) in list(self.temp_tabs.items()):
+            if time.monotonic() - tab.created > 180:
+                await self._close_temp(target_id)
         pages = self.browser.pages()
         if len(pages) > MAX_PAGE_TARGETS:
             owned = self._owned()
@@ -455,12 +458,6 @@ class BrowserService:
             if tab_owner == owner:
                 await self._close_temp(target_id)
 
-    async def sweep_crawl_pool(self):
-        """Close temp tabs a failed close left behind; no crawl or search runs for 3 minutes."""
-        for target_id, (tab, _owner) in list(self.temp_tabs.items()):
-            if time.monotonic() - tab.created > 180:
-                await self._close_temp(target_id)
-
     async def search_one(self, search, idx, session_id, search_slots, *, research=False):
         started = time.monotonic()
         result = {'index': idx + 1, 'direction': search.get('direction', ''), 'query': search['query'],
@@ -664,9 +661,6 @@ async def server_main(socket_path):
                     response = {**base, 'ok': True, 'type': 'result', **result}
                 elif action == 'research-add-query':
                     research.add_query(session_id, request.get('research'))
-                    response = {**base, 'ok': True, 'type': 'result'}
-                elif action == 'research-prefetch':
-                    await research.prefetch(session_id, request.get('research'))
                     response = {**base, 'ok': True, 'type': 'result'}
                 elif action in LOCK_FREE:
                     response = await execute_request(service, request)
