@@ -1,172 +1,94 @@
-"""Bounded parallel search, with HTTP-only 4get and injectable Google bridge.
-
-Provider selection is explicit. No implicit fallback, retries, external model
-calls, or browser startup happen in this module.
-"""
+"""The two search engines: 4get (its DuckDuckGo scraper, local HTTP) and Google in a
+temporary tab of the shared browser. Each returns up to 10 (title, url, description)
+rows whose URLs are plain http(s), the only URLs research may crawl."""
 import asyncio
-from dataclasses import dataclass
-import math
-from typing import AsyncIterator, Protocol
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
 import aiohttp
-from .budget import QueryBudget
-from .contracts import SearchTask, SearchResult, natural
 
 
 class ProviderError(RuntimeError):
-    pass
+    """A failed search; the message never carries response bodies or transport details."""
 
 
-class SearchProvider(Protocol):
-    async def search(self, task: SearchTask) -> list[SearchResult]: ...
+def web_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # raises ValueError for an invalid port
+    except ValueError:
+        return False
+    return (parts.scheme in ('http', 'https') and bool(parts.hostname) and parts.username is None
+            and parts.password is None and len(url) <= 8192 and not any(c.isspace() or ord(c) < 32 for c in url))
 
 
-class FourgetProvider:
-    """Direct loopback 4get client. Only the service port is configurable.
-
-    Keeps full descriptions within the response safety limit rather than applying
-    the legacy Markdown formatter's per-description truncation. Original URLs
-    are retained exactly. Invalid candidates are not given URL authority.
-    """
-    def __init__(self, *, port: int = 8088, timeout: float = 10.0,
-                 max_body_bytes: int = 5 * 1024 * 1024):
-        natural(port, 'port', 1)
-        if port > 65535:
-            raise ValueError('invalid service port')
-        natural(max_body_bytes, 'max_body_bytes', 1)
-        if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError('timeout must be finite and positive')
-        self.url = f'http://127.0.0.1:{port}/api/v1/web'
-        self.timeout = timeout
-        self.max_body_bytes = max_body_bytes
-        self._session = None
-        self._closed = False
-
-    async def close(self):
-        self._closed = True
-        if self._session:
-            await self._session.close()
-
-    async def search(self, task: SearchTask) -> list[SearchResult]:
-        if task.provider != '4get':
-            raise ValueError('4get adapter cannot search another provider')
-        if self._closed:
-            raise RuntimeError('provider closed')
-        if self._session is None:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-                headers={'Accept': 'application/json', 'User-Agent': 'pi-agent-web-search/1.0'},
-                trust_env=False, cookie_jar=aiohttp.DummyCookieJar())
-        try:
-            async with self._session.get(self.url, params={'s': task.query, 'scraper': 'ddg', 'country': 'any'},
-                                         allow_redirects=False) as response:
+async def fourget(query, *, port=8088, timeout=10.0, max_bytes=5 * 1024 * 1024):
+    """Top 10 results of the local 4get instance, with full descriptions."""
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
+                headers={'Accept': 'application/json', 'User-Agent': 'pi-agent-web-search/1.0'}) as session:
+            async with session.get(f'http://127.0.0.1:{port}/api/v1/web', allow_redirects=False,
+                                   params={'s': query, 'scraper': 'ddg', 'country': 'any'}) as response:
                 if response.status != 200:
                     raise ProviderError(f'4get HTTP {response.status}')
-                if response.content_length and response.content_length > self.max_body_bytes:
-                    raise ProviderError('4get response exceeds byte limit')
-                raw = bytearray()
-                async for chunk in response.content.iter_chunked(16384):
-                    if len(raw) + len(chunk) > self.max_body_bytes:
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    body += chunk
+                    if len(body) > max_bytes:
                         raise ProviderError('4get response exceeds byte limit')
-                    raw.extend(chunk)
-                import json
-                try:
-                    data = json.loads(raw)
-                except (ValueError, UnicodeError):
-                    raise ProviderError('4get returned invalid JSON') from None
-                if not isinstance(data, dict) or not isinstance(data.get('web'), list):
-                    raise ProviderError('4get response has no results array')
-                results = []
-                for item in data['web'][:100]:
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        url = item.get('url')
-                        if not isinstance(url, str) or len(url.encode('utf-8')) > 2048:
-                            continue
-                        title = item.get('title')
-                        description = item.get('description')
-                        result = SearchResult(title if isinstance(title, str) and title.strip() else 'No Title',
-                                              url, description if isinstance(description, str) else 'No snippet available.')
-                    except ValueError:
-                        continue
-                    results.append(result)
-                    if len(results) == 10:
-                        break
-                return results
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            # Do not expose response bodies, credentials, or transport internals.
-            raise ProviderError('4get network error or timeout') from None
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise ProviderError('4get network error or timeout') from None
+    try:
+        items = json.loads(body).get('web')
+    except (ValueError, AttributeError):
+        items = None
+    if not isinstance(items, list):
+        raise ProviderError('4get returned no results array')
+    rows = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get('url'), str) and web_url(item['url']):
+            title, description = item.get('title'), item.get('description')
+            rows.append((title.strip() if isinstance(title, str) and title.strip() else 'No Title', item['url'],
+                         description if isinstance(description, str) else 'No snippet available.'))
+    return rows[:10]
 
 
-@dataclass(frozen=True)
-class SearchOutcome:
-    task: SearchTask
-    results: tuple[SearchResult, ...]
-    error: str | None = None
+async def google(service, owner, query):
+    """Google through the browser service; its opaque /goto links become their targets."""
+    result = await service.search_one({'query': query}, 0, owner, asyncio.Semaphore(1))
+    if not result['ok']:
+        raise ProviderError('google_search_failed')
+    rows = result['results'][:10]
+    urls = await asyncio.gather(*(asyncio.to_thread(resolve_google_redirect, r['url']) for r in rows))
+    return [(r['title'] or 'No Title', url, r['snippet']) for r, url in zip(rows, urls) if web_url(url)]
 
 
-class SearchBatch:
-    """One job's dispatcher. Results arrive individually, not after a gather barrier.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
 
-    The owner calls run serially for BFS waves. A single run has bounded active
-    tasks; closing/cancelling its async iterator cancels and joins all owned work.
-    Providers own transport lifetime; the controller must close them separately.
-    """
-    def __init__(self, providers: dict[str, SearchProvider], budget: QueryBudget, *, concurrency: int = 3):
-        natural(concurrency, 'concurrency', 1)
-        self.providers = dict(providers)
-        self.budget = budget
-        self.concurrency = concurrency
-        self._seen = set()
-        self._running = False
 
-    async def _search(self, task: SearchTask) -> SearchOutcome:
+def resolve_google_redirect(url, timeout=5.0):
+    """Google SERP links are opaque /goto or /url tokens. Ask Google for its own
+    302 target (one request, no redirect followed) so URL dedup can see that a
+    Google result and a 4get result are the same page. Any failure keeps the
+    observed URL unchanged."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != 'https' or parts.netloc != 'www.google.com' or parts.path not in ('/goto', '/url'):
+            return url
+        request = urllib.request.Request(url, method='GET', headers={'User-Agent': 'Mozilla/5.0'})
         try:
-            results = await self.providers[task.provider].search(task)
-            if not isinstance(results, list) or not all(isinstance(r, SearchResult) for r in results):
-                raise ValueError('invalid provider result')
-            return SearchOutcome(task, tuple(results))
-        except Exception as exc:
-            # Cancellation is BaseException and deliberately propagates.
-            return SearchOutcome(task, (), type(exc).__name__)
-
-    async def run(self, tasks: list[SearchTask], *, allow_repeated_queries: bool = False) -> AsyncIterator[SearchOutcome]:
-        if self._running:
-            raise RuntimeError('one SearchBatch run at a time')
-        ids = set()
-        for task in tasks:
-            if not isinstance(task, SearchTask) or task.provider not in self.providers:
-                raise ValueError('unsupported provider/task')
-            if task.task_id in ids:
-                raise ValueError('duplicate attempt ID')
-            ids.add(task.task_id)
-        self._running = True
-        pending = set()
-        remaining = iter(tasks)
-        exhausted = False
-        try:
-            while True:
-                while not exhausted and len(pending) < self.concurrency and self.budget.remaining:
-                    try:
-                        task = next(remaining)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    if task.query_key in self._seen and not allow_repeated_queries:
-                        continue
-                    if not await self.budget.reserve(task.task_id):
-                        continue
-                    self._seen.add(task.query_key)
-                    # Reservation and task creation have no intervening await.
-                    pending.add(asyncio.create_task(self._search(task), name=f'search:{task.task_id}'))
-                if not pending:
-                    break
-                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for future in done:
-                    pending.remove(future)
-                    yield future.result()
-        finally:
-            for future in pending:
-                future.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            self._running = False
+            with urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout):
+                return url
+        except urllib.error.HTTPError as redirect:
+            target = redirect.headers.get('Location', '') if redirect.code in (301, 302, 303, 307, 308) else ''
+        target_parts = urllib.parse.urlsplit(target)
+        if target_parts.scheme in ('http', 'https') and target_parts.netloc and len(target) <= 2048:
+            return target
+    except Exception:
+        pass
+    return url

@@ -22,7 +22,7 @@ class ResearchImagesTests(unittest.IsolatedAsyncioTestCase):
             with open(path, 'wb') as handle:
                 handle.write(url.encode())
             return dict(path=path, width=800, height=600)
-        images = ResearchImages('台南 黑琵季 活動', fetch, max_deliver=3, max_fetch=6)
+        images = ResearchImages('台南 黑琵季 活動', fetch)
         images.offer('s1', '台南活動', [
             candidate('https://a.example/logo.png'),
             candidate('https://a.example/thumb', role='thumbnail'),
@@ -79,7 +79,7 @@ class StreamingImagesTests(unittest.IsolatedAsyncioTestCase):
             return dict(path=path, width=800, height=600)
         streamed = []
         delivered = {'s1', 's2'}
-        images = ResearchImages('q', fetch, max_deliver=3, on_ready=streamed.append,
+        images = ResearchImages('q', fetch, on_ready=streamed.append,
                                 is_delivered=lambda sid: sid in delivered)
         images.offer('s1', 't', [candidate('https://a.example/one'), candidate('https://a.example/dup1')])
         images.offer('s2', 't', [candidate('https://b.example/dup2')])

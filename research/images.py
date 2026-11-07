@@ -1,68 +1,62 @@
-"""Background image fetching for research: pick illustrative images while pages
-are crawled, download them off the critical path, and list the finished ones so
-the answering agent can embed them next to the paragraphs they illustrate."""
+"""Images for research evidence: pick illustrative images while pages are crawled,
+download them off the critical path, and list the finished ones as [[image: …]] markers
+the answering agent can place next to the paragraphs they illustrate."""
 import asyncio
 import hashlib
 import re
 
+MAX_DELIVER, MAX_FETCH, PER_PAGE, MIN_SIDE = 3, 6, 2, 200
 _SKIP_URL = re.compile(r'\.svg(\?|$)|^data:|sprite|logo|icon|avatar|favicon|pixel|spacer|blank\.', re.I)
-_ROLE_SCORE = {'representative': 3.0, 'content': 2.0, 'gallery': 1.5}
+_ROLE_SCORE = {'representative': 3.0, 'content': 2.0, 'gallery': 1.5}  # thumbnails and unknown roles are skipped
+_HEADER = ('\n## Images (already downloaded; do not fetch). To illustrate a point, copy its [[image: …]] '
+           'marker exactly onto its own line inside the paragraph it supports (at most 3); skip images that '
+           'do not match the answer.\n')
 
 
-def _bigrams(text):
-    text = re.sub(r'\s+', '', (text or '').lower())
+def bigrams(text):  # keeps punctuation, unlike passages.bigrams: that is what image relevance was tuned with
+    text = re.sub(r'\s+', '', text.lower())
     return {text[i:i + 2] for i in range(len(text) - 1)}
 
 
 class ResearchImages:
-    """Collects at most `per_page` candidates per crawled page, starts at most
-    `max_fetch` downloads, and reports at most `max_deliver` finished ones."""
+    """Up to PER_PAGE candidates per page, MAX_FETCH downloads and MAX_DELIVER listed images.
 
-    def __init__(self, question, fetch, *, max_deliver=3, max_fetch=6, per_page=2, min_side=200,
-                 on_ready=None, is_delivered=None):
-        self._question = _bigrams(question)
-        self._fetch = fetch
-        self.max_deliver, self.max_fetch, self.per_page, self.min_side = max_deliver, max_fetch, per_page, min_side
-        self._tasks = []  # (source_id, title, candidate, relevance, task)
-        self._urls = set()
-        # Streaming delivery: a finished download from a page whose passages are in
-        # the evidence is committed right away (append-only, so it is prefilled while
-        # crawling); the rest wait for section() at the end.
+    A finished download from a page whose passages are already in the evidence goes out at
+    once through `on_ready` (append-only, so it is prefilled while crawling); the others
+    wait for section() at the end. `fetch(url)` returns {'path', 'width', 'height'}."""
+
+    def __init__(self, question, fetch, *, on_ready=None, is_delivered=None):
+        self._question, self._fetch = bigrams(question), fetch
         self._on_ready, self._is_delivered = on_ready, is_delivered
-        self._digests, self._listed = set(), set()
+        self._entries = []  # (source_id, title, candidate, relevance, download task)
+        self._urls, self._digests, self._listed = set(), set(), set()
         self.delivered = 0
 
     def _relevance(self, title, candidate):
-        described = _bigrams(f"{candidate.get('caption') or ''} {candidate.get('alt') or ''}")
+        described = bigrams(f"{candidate.get('caption') or ''} {candidate.get('alt') or ''}")
         overlap = len(self._question & described) / max(1, len(self._question))
-        page = len(self._question & _bigrams(title)) / max(1, len(self._question))
-        return _ROLE_SCORE.get(candidate.get('role'), 0) + 4 * overlap + page + min(candidate.get('score') or 0, 200) / 200
+        page = len(self._question & bigrams(title)) / max(1, len(self._question))
+        return _ROLE_SCORE[candidate['role']] + 4 * overlap + page + min(candidate.get('score') or 0, 200) / 200
 
     def offer(self, source_id, title, candidates):
-        """Called once per crawled page; never blocks the crawl."""
+        """The image candidates of one crawled page; never blocks the crawl."""
         picked = []
-        for candidate in candidates or ():
-            url = candidate.get('url') or ''
-            if not url.startswith(('http://', 'https://')) or url in self._urls or _SKIP_URL.search(url):
-                continue
-            if candidate.get('role') not in _ROLE_SCORE:
-                continue  # thumbnails and unknown roles
-            width, height = candidate.get('width') or 0, candidate.get('height') or 0
-            if width and height and min(width, height) < self.min_side:
-                continue
-            picked.append((self._relevance(title, candidate), candidate))
+        for candidate in candidates:
+            url, width, height = candidate.get('url') or '', candidate.get('width') or 0, candidate.get('height') or 0
+            if (url.startswith(('http://', 'https://')) and url not in self._urls and not _SKIP_URL.search(url)
+                    and candidate.get('role') in _ROLE_SCORE and not (width and height and min(width, height) < MIN_SIDE)):
+                picked.append((self._relevance(title, candidate), candidate))
         picked.sort(key=lambda item: -item[0])
-        for relevance, candidate in picked[:self.per_page]:
-            if len(self._tasks) >= self.max_fetch:
+        for relevance, candidate in picked[:PER_PAGE]:
+            if len(self._entries) >= MAX_FETCH:
                 return
             self._urls.add(candidate['url'])
-            task = asyncio.create_task(self._fetch(candidate['url']))
-            entry = (source_id, title, candidate, relevance, task)
-            task.add_done_callback(lambda t, entry=entry: self._finished(entry))
-            self._tasks.append(entry)
+            entry = (source_id, title, candidate, relevance, asyncio.create_task(self._fetch(candidate['url'])))
+            entry[4].add_done_callback(lambda _task, entry=entry: self._finished(entry))
+            self._entries.append(entry)
 
     def _line(self, entry):
-        """Marker line for a finished, non-duplicate download, or None."""
+        """The marker line of a finished, not yet listed, non-duplicate download, or None."""
         source_id, title, candidate, _, task = entry
         if not task.done() or task.cancelled() or task.exception() is not None or id(task) in self._listed:
             return None
@@ -84,51 +78,35 @@ class ResearchImages:
         return f"- [[image: {image['path']}]] [{source_id}] {description[:120]}{size}"
 
     def _finished(self, entry):
-        task = entry[4]
-        if task.cancelled() or task.exception() is not None:
+        if entry[4].cancelled() or entry[4].exception() is not None:
             return
-        if self._on_ready is None or self.delivered >= self.max_deliver:
-            return
-        if self._is_delivered is not None and not self._is_delivered(entry[0]):
+        if self._on_ready is None or self.delivered >= MAX_DELIVER or not self._is_delivered(entry[0]):
             return  # page not used by the evidence (yet): keep it for section()
         line = self._line(entry)
         if line:
-            header = _HEADER if self.delivered == 1 else ''
-            self._on_ready(f'{header}{line}\n')
+            self._on_ready(f'{_HEADER if self.delivered == 1 else ""}{line}\n')
 
     async def settle(self, timeout):
         """Give in-flight downloads at most `timeout` seconds once crawling is done."""
-        pending = [t for *_, t in self._tasks if not t.done()]
+        pending = [entry[4] for entry in self._entries if not entry[4].done()]
         if pending and timeout > 0:
             await asyncio.wait(pending, timeout=timeout)
 
     def cancel(self):
-        for *_, task in self._tasks:
-            if not task.done():
-                task.cancel()
+        for entry in self._entries:
+            entry[4].cancel()
 
     def section(self, delivered_sources=()):
-        """Markdown for finished downloads not committed while crawling (pages with
-        delivered passages first), up to max_deliver images in total."""
-        done = []
-        for entry in self._tasks:
-            source_id, _, _, relevance, task = entry
-            if task.done() and not task.cancelled() and task.exception() is None and id(task) not in self._listed:
-                done.append((source_id in delivered_sources, relevance, entry))
-        done.sort(key=lambda item: (not item[0], -item[1]))
+        """Finished downloads not listed while crawling (pages with delivered passages first)."""
+        done = sorted((entry for entry in self._entries if entry[4].done()),
+                      key=lambda entry: (entry[0] not in delivered_sources, -entry[3]))
         lines = []
-        for _, _, entry in done:
-            if self.delivered >= self.max_deliver:
+        for entry in done:
+            if self.delivered >= MAX_DELIVER:
                 break
             line = self._line(entry)
             if line:
                 lines.append(line)
         if not lines:
             return ''
-        header = _HEADER if self.delivered == len(lines) else '\n'
-        return header + '\n'.join(lines) + '\n'
-
-
-_HEADER = ('\n## Images (already downloaded; do not fetch). To illustrate a point, copy its [[image: …]] '
-           'marker exactly onto its own line inside the paragraph it supports (at most 3); skip images that '
-           'do not match the answer.\n')
+        return (_HEADER if self.delivered == len(lines) else '\n') + '\n'.join(lines) + '\n'

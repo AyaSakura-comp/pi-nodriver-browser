@@ -2,7 +2,7 @@
 """Time breakdown analysis and Gantt chart generator for research benchmark runs.
 
 Reconstructs the full multi-lane execution timeline from:
-1. cases.jsonl & trace.jsonl (crawling, search, image downloads, focus filtering)
+1. cases.jsonl & trace.jsonl (searches, crawls, image downloads, research jobs)
 2. *.events.jsonl (Pi tool execution, thinking, streaming text tokens)
 3. llama-server journalctl logs (prompt eval ms / tokens, decode eval ms / tokens, speculative warms)
 

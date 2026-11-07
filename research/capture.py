@@ -1,11 +1,7 @@
-"""Acquisition-only HTML ceiling; no relevance selection or semantic trimming."""
-from .contracts import natural
+"""The research page capture: the page's innerText up to `limit` UTF-16 units, and how much was cut."""
 
 
 def research_capture_js(limit):
-    natural(limit, 'capture limit', 1)
-    if limit > 1_000_000:
-        raise ValueError('capture limit exceeded')
     return r'''(() => {
         const text = document.body?.innerText || '';
         const limit = LIMIT;
@@ -16,4 +12,4 @@ def research_capture_js(limit):
             text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
         return {text:text.slice(0,end),sourceChars:text.length,capturedChars:end,
                 captureLimit:limit,captureUnits:'utf16',truncated:end<text.length};
-    })()'''.replace('LIMIT', str(limit))
+    })()'''.replace('LIMIT', str(int(limit)))
