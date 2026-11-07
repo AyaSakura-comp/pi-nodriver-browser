@@ -267,10 +267,13 @@ export class WorkerClient {
   }
 
   /** One research job; its evidence frames go to onEvidence. No replay: a lost reply may already have used its searches. */
-  research(params: ResearchParams, sessionId: string, signal: AbortSignal, onEvidence: (prefix: string) => void) {
+  research(params: ResearchParams, sessionId: string, signal: AbortSignal,
+    onEvidence: (prefix: string, searched: boolean) => void) {
     this.sessions.add(sessionId);
     return this.send("research", sessionId, signal, params, (frame) => {
-      if (frame.phase === "evidence" && frame.jobId === params.jobId && typeof frame.prefix === "string") onEvidence(frame.prefix);
+      if (frame.phase === "evidence" && frame.jobId === params.jobId && typeof frame.prefix === "string") {
+        onEvidence(frame.prefix, frame.searched === true);
+      }
     });
   }
 
