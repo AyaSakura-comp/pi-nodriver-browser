@@ -1,5 +1,6 @@
 /**
- * Starts the shared browser worker (xvfb-run → worker.py → Chrome).
+ * The shared browser worker (xvfb-run → worker.py → Chrome): how it is started, and the one
+ * socket client every tool uses.
  *
  * One worker serves every Pi process through a single Unix socket, so it must not live
  * in the cgroup of whichever Pi process happened to start it. A plain child of Pi lands
@@ -17,8 +18,13 @@
  */
 import { execFile as execFileCallback, spawn as spawnProcess, type SpawnOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { userInfo } from "node:os";
+import { createConnection, type Socket } from "node:net";
+import { homedir, userInfo } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 export const BROWSER_UNIT_PREFIX = "pi-nodriver-browser-";
@@ -172,4 +178,185 @@ export async function launchWorker(spec: WorkerLaunchSpec, deps: LaunchDeps = {}
       }
     },
   };
+}
+
+const ROOT = fileURLToPath(new URL(".", import.meta.url));
+export const SOCKET = process.env.PI_NODRIVER_SOCKET || join(homedir(), ".pi", "agent", "nodriver-browser.sock");
+
+/** Starts this extension's worker.py serving `socket`. */
+export async function startWorker(socket: string): Promise<LaunchedWorker> {
+  const python = join(ROOT, ".venv", "bin", "python");
+  if (!existsSync(python)) throw new Error(`The browser worker's Python environment is missing (${python}); run install.sh.`);
+  return launchWorker({ root: ROOT, python, worker: join(ROOT, "worker.py"), socket, screen: "1366x768x24" });
+}
+
+const MARKER = "__PI_NODRIVER__";
+
+export type WorkerResponse = { id: number; ok: boolean; text?: string; error?: string; [key: string]: any };
+
+/** The research request; the model writes only the queries, the tool fixes everything else. */
+export interface ResearchParams {
+  jobId: string;
+  question: string;
+  queries: string[];
+  clock: { iso: string; timezone: string };
+  answer: "breadth" | "depth";
+  crawlConcurrency: number;
+  crawlWordBudget: number;
+  /** Queries after the first arrive by research-add-query while the call is still being written. */
+  streaming?: boolean;
+}
+
+function connect(path: string): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(path);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out connecting to browser daemon: ${path}`));
+    }, 500);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      resolve(socket);
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error);
+    });
+  });
+}
+
+type Pending = { onFrame?: (frame: WorkerResponse) => void; settle: (error?: Error, reply?: WorkerResponse) => void };
+
+/**
+ * This process's one connection to the worker. A request is one JSON line
+ * {id, command, sessionId, research?}; its reply is one line MARKER + JSON with the same id,
+ * which research precedes with progress frames. {cancelId} cancels a request.
+ */
+export class WorkerClient {
+  private readonly path: string;
+  private readonly start?: (socket: string) => Promise<LaunchedWorker>;
+  private socket?: Socket;
+  private connecting?: Promise<Socket>;
+  private nextId = 1;
+  private readonly pending = new Map<number, Pending>();
+  /** Sessions this process used: only they get a session-cleanup, which must not start a worker. */
+  private readonly sessions = new Set<string>();
+
+  /** Without `start` the client only connects (the live harness must never start a worker). */
+  constructor(path: string, start?: (socket: string) => Promise<LaunchedWorker>) {
+    this.path = path;
+    this.start = start;
+  }
+
+  /** A browser command; replayed once on a new connection when the worker dropped it (restart). */
+  async request(command: string, sessionId: string, signal?: AbortSignal): Promise<WorkerResponse> {
+    this.sessions.add(sessionId);
+    try {
+      return await this.send(command, sessionId, signal);
+    } catch (error) {
+      if (!/connection closed|Timed out connecting/.test(String((error as Error).message))) throw error;
+      return this.send(command, sessionId, signal);
+    }
+  }
+
+  /** One research job; its evidence frames go to onEvidence. No replay: a lost reply may already have used its searches. */
+  research(params: ResearchParams, sessionId: string, signal: AbortSignal, onEvidence: (prefix: string) => void) {
+    this.sessions.add(sessionId);
+    return this.send("research", sessionId, signal, params, (frame) => {
+      if (frame.phase === "evidence" && frame.jobId === params.jobId && typeof frame.prefix === "string") onEvidence(frame.prefix);
+    });
+  }
+
+  /** Delivers {jobId, query, index} or {jobId, done: true} to a streaming research job. */
+  async addQuery(sessionId: string, payload: Record<string, unknown>) {
+    await this.send("research-add-query", sessionId, undefined, payload);
+  }
+
+  async cleanupSession(sessionId: string) {
+    if (this.sessions.delete(sessionId)) await this.send("session-cleanup", sessionId);
+  }
+
+  disconnect() {
+    const socket = this.socket;
+    this.socket = undefined;
+    for (const request of [...this.pending.values()]) request.settle(new Error("Browser daemon connection closed"));
+    socket?.destroy();
+  }
+
+  private async send(command: string, sessionId: string, signal?: AbortSignal, research?: object,
+    onFrame?: Pending["onFrame"]): Promise<WorkerResponse> {
+    const socket = await this.connection();
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const settle = (error?: Error, reply?: WorkerResponse, cancel = false) => {
+        if (!this.pending.delete(id)) return;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (cancel) socket.write(`${JSON.stringify({ id: this.nextId++, cancelId: id, sessionId })}\n`);
+        if (error) reject(error);
+        else resolve(reply!);
+      };
+      const abort = () => settle(new Error("Browser command cancelled"), undefined, true);
+      const timer = setTimeout(() => settle(new Error(`Browser command timed out: ${command}`), undefined, true),
+        research ? 300_000 : 90_000);
+      this.pending.set(id, { onFrame, settle });
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      socket.write(`${JSON.stringify({ id, command, sessionId, ...(research && { research }) })}\n`, (error) => {
+        if (error) settle(error);
+      });
+    });
+  }
+
+  private connection(): Promise<Socket> {
+    if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket);
+    return this.connecting ??= this.connectOrStart().finally(() => {
+      this.connecting = undefined;
+    });
+  }
+
+  private async connectOrStart(): Promise<Socket> {
+    try {
+      return this.attach(await connect(this.path));
+    } catch (error) {
+      if (!this.start) throw error;
+    }
+    // The worker unlinks a stale socket itself once it holds the socket's lock.
+    const launched = await this.start(this.path);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try {
+        return this.attach(await connect(this.path));
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    launched.stop();
+    throw lastError;
+  }
+
+  private attach(socket: Socket): Socket {
+    this.socket = socket;
+    createInterface({ input: socket }).on("line", (line) => {
+      if (!line.startsWith(MARKER)) return;
+      let reply: WorkerResponse;
+      try {
+        reply = JSON.parse(line.slice(MARKER.length));
+      } catch {
+        return;
+      }
+      const request = this.pending.get(reply.id);
+      if (reply.type === "progress") request?.onFrame?.(reply);
+      else request?.settle(reply.ok ? undefined : new Error(reply.error || "Nodriver command failed"), reply);
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      for (const request of [...this.pending.values()]) request.settle(new Error("Browser daemon connection closed"));
+    });
+    return socket;
+  }
 }

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BROWSER_UNIT_PREFIX, forwardedEnv, launchWorker, systemdRunArgs, userManagerOutlivesCaller } from '../worker-launch.ts';
+import { mkdtempSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { BROWSER_UNIT_PREFIX, WorkerClient, forwardedEnv, launchWorker, systemdRunArgs, userManagerOutlivesCaller } from '../worker-launch.ts';
 
 const spec = {
   root: '/opt/ext', python: '/opt/ext/.venv/bin/python', worker: '/opt/ext/worker.py',
@@ -135,4 +139,122 @@ test('user manager durability: service of the manager, or lingering', async () =
   assert.equal(await userManagerOutlivesCaller(login, linger('Linger=no\n')), false);
   assert.equal(await userManagerOutlivesCaller(login, async () => { throw new Error('no logind'); }), false);
   assert.equal(await userManagerOutlivesCaller('', linger('Linger=yes\n')), true);
+});
+
+// ---- the socket client ------------------------------------------------------------------
+
+const MARKER = '__PI_NODRIVER__';
+const tempSocket = () => join(mkdtempSync(join(tmpdir(), 'pi-client-')), 'worker.sock');
+const research = { jobId: 'job', question: 'q', queries: ['q'], clock: { iso: '2026-01-01T00:00:00.000Z', timezone: 'UTC' },
+  answer: 'breadth' as const, crawlConcurrency: 32, crawlWordBudget: 20000 };
+
+/** A stand-in worker on `path`; answer() decides what each request gets back. */
+async function fakeWorker(answer: (request: any, reply: (frame: object) => void, connection: Socket, index: number) => void,
+  path = tempSocket()) {
+  const received: any[] = [];
+  let connections = 0;
+  const server = createServer((connection) => {
+    const index = connections++;
+    let buffer = '';
+    connection.on('data', (chunk) => {
+      buffer += chunk;
+      for (let newline = buffer.indexOf('\n'); newline >= 0; newline = buffer.indexOf('\n')) {
+        const request = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        received.push(request);
+        answer(request, (frame) => connection.write(`${MARKER}${JSON.stringify(frame)}\n`), connection, index);
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  return { path, received, connections: () => connections, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+async function until(condition: () => boolean) {
+  for (let i = 0; i < 400 && !condition(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(condition(), 'condition not reached');
+}
+
+test('research progress frames reach only their job and never settle the request', async () => {
+  const worker = await fakeWorker((request, reply) => {
+    reply({ id: request.id, type: 'progress', phase: 'evidence', jobId: 'other', prefix: 'not mine' });
+    reply({ id: request.id, type: 'progress', phase: 'evidence', jobId: request.research.jobId, prefix: 'mine' });
+    reply({ id: request.id, ok: true, type: 'result', action: 'research', jobId: request.research.jobId, text: 'complete' });
+  });
+  const client = new WorkerClient(worker.path);
+  const seen: string[] = [];
+  const reply = await client.research(research, 's1', new AbortController().signal, (prefix) => seen.push(prefix));
+  assert.equal(reply.text, 'complete');
+  assert.deepEqual(seen, ['mine']);
+  assert.deepEqual(worker.received[0], { id: 1, command: 'research', sessionId: 's1', research });
+  client.disconnect();
+  await worker.close();
+});
+
+test('a cancelled request is cancelled on the worker too', async () => {
+  const worker = await fakeWorker(() => {});
+  const client = new WorkerClient(worker.path);
+  const abort = new AbortController();
+  const pending = client.request('open "https://example.com/"', 's1', abort.signal);
+  await until(() => worker.received.length === 1);
+  abort.abort();
+  await assert.rejects(pending, /Browser command cancelled/);
+  await until(() => worker.received.length === 2);
+  assert.equal(worker.received[1].cancelId, worker.received[0].id);
+  assert.equal(worker.received[1].sessionId, 's1');
+  client.disconnect();
+  await worker.close();
+});
+
+test('disconnect settles pending requests at once', async () => {
+  const worker = await fakeWorker(() => {});
+  const client = new WorkerClient(worker.path);
+  const pending = client.research(research, 's1', new AbortController().signal, () => {});
+  await until(() => worker.received.length === 1);
+  client.disconnect();
+  await assert.rejects(pending, /connection closed/);
+  await worker.close();
+});
+
+test('a command the worker dropped (restart) is replayed once on a new connection; research never is', async () => {
+  const worker = await fakeWorker((request, reply, connection, index) => {
+    if (index === 0 || request.command === 'research') connection.destroy();
+    else reply({ id: request.id, ok: true, text: 'second try' });
+  });
+  const client = new WorkerClient(worker.path);
+  assert.equal((await client.request('snapshot', 's1')).text, 'second try');
+  assert.equal(worker.connections(), 2);
+  await assert.rejects(client.research(research, 's1', new AbortController().signal, () => {}), /connection closed/);
+  assert.equal(worker.received.filter((request) => request.command === 'research').length, 1);
+  client.disconnect();
+  await worker.close();
+});
+
+test('the client starts a worker only when it was given a way to, then connects to it', async () => {
+  const missing = new WorkerClient(tempSocket());
+  await assert.rejects(missing.request('snapshot', 's1'), /ENOENT/, 'a connect-only client (live harness) never starts one');
+  const path = tempSocket();
+  let worker: Awaited<ReturnType<typeof fakeWorker>> | undefined;
+  const starts: string[] = [];
+  const client = new WorkerClient(path, async (socket) => {
+    starts.push(socket);
+    worker = await fakeWorker((request, reply) => reply({ id: request.id, ok: true, text: 'up' }), socket);
+    return { mode: 'spawn', stop() {} };
+  });
+  assert.equal((await client.request('snapshot', 's1')).text, 'up');
+  assert.deepEqual(starts, [path]);
+  client.disconnect();
+  await worker!.close();
+});
+
+test('session-cleanup goes only to sessions this process used', async () => {
+  const worker = await fakeWorker((request, reply) => reply({ id: request.id, ok: true }));
+  const client = new WorkerClient(worker.path);
+  await client.cleanupSession('never-used');
+  await client.request('snapshot', 's1');
+  await client.cleanupSession('s1');
+  await client.cleanupSession('s1');
+  assert.deepEqual(worker.received.map((request) => `${request.command} ${request.sessionId}`), ['snapshot s1', 'session-cleanup s1']);
+  client.disconnect();
+  await worker.close();
 });

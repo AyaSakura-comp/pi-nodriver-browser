@@ -1,47 +1,15 @@
 // Runs browser-agent.ts tasks directly against a worker socket (no Pi), for live checks.
 // usage: node tests/live/agent-harness.ts <socket> <tasks.json> <out.json> [--only id,id]
-import { createConnection } from "node:net";
+// AGENT_LLM_URL / AGENT_LLM_MODEL pick the planner (default: local qwen3.8-flash on :8090).
 import { readFileSync, writeFileSync } from "node:fs";
-import { runBrowserTask, type WorkerLike } from "../../browser-agent.ts";
-
-const MARKER = "__PI_NODRIVER__";
-
-function client(socketPath: string): WorkerLike {
-  let next = 1;
-  return {
-    request(command, sessionId, signal) {
-      return new Promise((resolve, reject) => {
-        const id = next++;
-        const socket = createConnection(socketPath);
-        let buffer = "";
-        const timer = setTimeout(() => { socket.destroy(); reject(new Error(`timeout: ${command}`)); }, 95_000);
-        signal?.addEventListener("abort", () => { socket.destroy(); reject(new Error("aborted")); }, { once: true });
-        socket.on("connect", () => socket.write(JSON.stringify({ id, command, sessionId }) + "\n"));
-        socket.on("data", (chunk) => {
-          buffer += chunk.toString();
-          let index;
-          while ((index = buffer.indexOf("\n")) >= 0) {
-            const line = buffer.slice(0, index);
-            buffer = buffer.slice(index + 1);
-            if (!line.startsWith(MARKER)) continue;
-            const response = JSON.parse(line.slice(MARKER.length));
-            if (response.id !== id) continue;
-            clearTimeout(timer);
-            socket.end();
-            if (response.ok) resolve(response);
-            else reject(new Error(response.error || "command failed"));
-          }
-        });
-        socket.on("error", (error) => { clearTimeout(timer); reject(error); });
-      });
-    },
-  };
-}
+import { runBrowserTask } from "../../browser-agent.ts";
+import { WorkerClient } from "../../worker-launch.ts";
 
 const [socketPath, tasksPath, outPath, ...rest] = process.argv.slice(2);
 const only = rest[0] === "--only" ? new Set(rest[1].split(",")) : undefined;
 const tasks = JSON.parse(readFileSync(tasksPath, "utf8")).filter((t: any) => !only || only.has(t.id));
-const worker = client(socketPath);
+// Connect only: a harness must never start a worker (it would take the production profile).
+const worker = new WorkerClient(socketPath);
 const llm = {
   endpoint: process.env.AGENT_LLM_URL || "http://127.0.0.1:8090/v1/chat/completions",
   model: process.env.AGENT_LLM_MODEL || "qwen3.8-flash",
@@ -68,3 +36,4 @@ for (const task of tasks) {
   console.log("   answer: " + String(row.answer || row.reason || "").slice(0, 400).replace(/\n/g, " | "));
   writeFileSync(outPath, JSON.stringify(results, null, 2));
 }
+worker.disconnect();
