@@ -261,3 +261,74 @@ test('browser_intent: piweb progress rows, one task at a time per conversation, 
   globalThis.fetch = realFetch;
  }
 });
+
+/** A router server: the decision request (max_tokens 1) gets P(true) as token probabilities, the query request
+ * (its answer forced to start inside the query list) gets `queries`. */
+async function fakeRouter(pTrue, queries) {
+ const { createServer } = await import('node:http');
+ const server = createServer((req, res) => {
+  let body = '';
+  req.on('data', (c) => { body += c; });
+  req.on('end', () => {
+   const request = JSON.parse(body);
+   res.writeHead(200, {'content-type': 'application/json'});
+   if (request.max_tokens === 1) {
+    res.end(JSON.stringify({choices: [{message: {content: pTrue >= 0.5 ? ' true' : ' false'}, logprobs: {content: [{top_logprobs: [
+     {token: ' true', logprob: Math.log(pTrue)}, {token: ' false', logprob: Math.log(1 - pTrue)}]}]}}]}));
+   } else {
+    res.end(JSON.stringify({choices: [{message: {content: `${queries.map((q) => JSON.stringify(q)).join(', ').slice(1)}]}`}}]}));
+   }
+  });
+ });
+ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+ process.env.RESEARCH_ROUTER_URL = `http://127.0.0.1:${server.address().port}/v1/chat/completions`;
+ return server;
+}
+
+test('research first: a router decision starts the job and the turn with a research call', async () => {
+ const server = await fakeRouter(0.8, ['台北 展覽', '台北 活動 2026-11-08', 'Taipei exhibitions weekend']);
+ try {
+  const {worker, fire, ctx} = await setup({user: '這個週末台北有什麼展覽？'});
+  const cloud = await fire('before_agent_start', {prompt: '這個週末台北有什麼展覽？'},
+   {...ctx, model: {baseUrl: 'https://api.anthropic.com'}});
+  assert.equal(cloud.toolCall, undefined, 'a cloud model keeps its own research call');
+  ctx.model = {baseUrl: 'http://localhost:8090/v1'};
+  const out = await fire('before_agent_start', {prompt: '這個週末台北有什麼展覽？'}, ctx);
+  assert.equal(out.message.customType, 'browser-date-context');
+  assert.equal(out.toolCall.name, 'research');
+  assert.match(out.toolCall.id, /^call_/);
+  assert.deepEqual(out.toolCall.arguments, {q1: '這個週末台北有什麼展覽？', q2: '台北 展覽', q3: '台北 活動 2026-11-08', q4: 'Taipei exhibitions weekend'},
+   'the call carries the four queries the job searches');
+  const {params} = worker.calls[0];
+  assert.deepEqual(params.queries, ['這個週末台北有什麼展覽？'], 'q1, the user\'s words, searches at the decision');
+  assert.equal(params.streaming, true);
+  assert.equal(params.deadlineMs, 2700);
+  assert.equal(params.evidenceBudget, 1500);
+  assert.equal(params.imageWaitMs, 0);
+  assert.deepEqual(worker.added.map((a) => a.query ?? (a.done && 'done')), ['台北 展覽', '台北 活動 2026-11-08', 'Taipei exhibitions weekend', 'done']);
+  assert.deepEqual(worker.added.slice(0, 3).map((a) => a.index), [1, 2, 3], 'q2-q4: the fourth goes to Google');
+ } finally { server.close(); delete process.env.RESEARCH_ROUTER_URL; }
+});
+
+test('research first: below the threshold the agent decides, as without a router', async () => {
+ const server = await fakeRouter(0.1, []);
+ try {
+  const {worker, fire, ctx} = await setup({user: '幫我寫一首詩'});
+  ctx.model = {baseUrl: 'http://localhost:8090/v1'};
+  const out = await fire('before_agent_start', {prompt: '幫我寫一首詩'}, ctx);
+  assert.equal(out.toolCall, undefined);
+  assert.equal(worker.calls.length, 0);
+ } finally { server.close(); delete process.env.RESEARCH_ROUTER_URL; }
+});
+
+test('research first: without three router queries the agent writes its own research call', async () => {
+ const server = await fakeRouter(0.9, ['只有一個查詢', '兩個']);
+ try {
+  const {worker, fire, ctx} = await setup({user: '台北 101 跨年煙火幾點？'});
+  ctx.model = {baseUrl: 'http://localhost:8090/v1'};
+  const out = await fire('before_agent_start', {prompt: '台北 101 跨年煙火幾點？'}, ctx);
+  assert.equal(out.toolCall, undefined);
+  assert.equal(worker.calls.length, 1, 'q1 had started');
+  assert.equal(worker.calls[0].signal.aborted, true, 'and its job is cancelled');
+ } finally { server.close(); delete process.env.RESEARCH_ROUTER_URL; }
+});

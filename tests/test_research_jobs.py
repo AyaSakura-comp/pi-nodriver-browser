@@ -73,7 +73,9 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
                dict(good, clock={'iso': '2026-01-01T00:00:00'}), dict(good, clock={'iso': '2026-01-01T00:00:00', 'timezone': 'UTC'}),
                dict(good, clock={'iso': 'fixture', 'timezone': 'UTC'}), dict(good, streaming='yes'),
                dict(good, answer='deep'), dict(good, crawlConcurrency=0), dict(good, crawlConcurrency=65),
-               dict(good, crawlConcurrency=True), dict(good, crawlWordBudget=999), dict(good, crawlWordBudget=100001)]
+               dict(good, crawlConcurrency=True), dict(good, crawlWordBudget=999), dict(good, crawlWordBudget=100001),
+               dict(good, deadlineMs=499), dict(good, deadlineMs=1.5), dict(good, evidenceBudget=499),
+               dict(good, evidenceBudget=True), dict(good, imageWaitMs=-1), dict(good, imageWaitMs=10001)]
         conn = ResearchConnection(service(), self.send, self.root)
         for params in bad:
             with self.subTest(params=params), self.assertRaisesRegex(ValueError, 'invalid_research_input'):
@@ -343,6 +345,56 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         pages = [r['text'] for r in self.journal() if r['kind'] == 'page_extract']
         self.assertEqual(sorted(pages), sorted(f'{page} {url}' for url in crawled), 'full page text is kept')
         self.assertEqual(result['crawlWords'], sum(map(rough_words, pages)))
+
+    async def test_deadline_delivers_what_is_committed_and_drops_pages_still_loading(self):
+        release = asyncio.Event()
+
+        async def fourget(query):
+            return rows('https://example.com/fast', 'https://example.com/slow')
+
+        async def crawl_one(url, *args, **kwargs):
+            if url.endswith('slow'):
+                await release.wait()                      # never finishes before the deadline
+            return dict(ok=True, text=f'台積電 收盤價 1200 元 {url}')
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        result = await self.research(service(crawl_one=crawl_one), fourget, deadlineMs=500, imageWaitMs=0)
+        self.assertLess(loop.time() - t0, 1.5, 'delivered at the deadline, not after the slow page')
+        self.assertEqual(result['reason'], 'deadline_reached')
+        self.assertIn('example.com/fast', result['text'])
+        self.assertNotIn('1200 元 https://example.com/slow', result['text'])
+        release.set()
+
+    async def test_a_latency_budget_delivers_once_its_evidence_budget_is_used(self):
+        release = asyncio.Event()
+        page = '台積電 收盤價 ' + '。'.join(f'第{i}句 台積電 今日 收盤價 為 {1000 + i} 元' for i in range(400))
+
+        async def fourget(query):
+            return rows(*(f'https://example.com/{i}' for i in range(8)))
+
+        async def crawl_one(url, *args, **kwargs):
+            if url.endswith('/7'):
+                await release.wait()                      # a slow page: no room for it once the budget is used
+            return dict(ok=True, text=f'{page} {url}')
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        result = await self.research(service(crawl_one=crawl_one), fourget, deadlineMs=5000, evidenceBudget=800, crawlWordBudget=100000,
+                                     imageWaitMs=0)
+        self.assertLess(loop.time() - t0, 2.0, 'delivered when the budget was used, not at the deadline')
+        self.assertEqual(result['reason'], 'evidence_budget_reached')
+        release.set()
+
+    async def test_evidence_budget_caps_the_committed_passages(self):
+        page = '台積電 收盤價 ' + '。'.join(f'第{i}句 台積電 今日 收盤價 為 {1000 + i} 元' for i in range(400))
+
+        async def fourget(query):
+            return rows(*(f'https://example.com/{i}' for i in range(5)))
+
+        async def crawl_one(url, *args, **kwargs):
+            return dict(ok=True, text=f'{page} {url}')
+        small = await self.research(service(crawl_one=crawl_one), fourget, jobId='small', evidenceBudget=800)
+        large = await self.research(service(crawl_one=crawl_one), fourget, jobId='large')
+        self.assertLess(len(small['text']), len(large['text']))
 
     async def test_failed_and_truncated_pages_commit_no_passage(self):
         async def fourget(query):

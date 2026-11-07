@@ -205,6 +205,12 @@ export interface ResearchParams {
   crawlWordBudget: number;
   /** Queries after the first arrive by research-add-query while the call is still being written. */
   streaming?: boolean;
+  /** Latency budget: deliver what is committed this many ms after the job starts. */
+  deadlineMs?: number;
+  /** Rough tokens of evidence passages (default 6000). */
+  evidenceBudget?: number;
+  /** How long a finished job waits for images still downloading (default 1000). */
+  imageWaitMs?: number;
 }
 
 function connect(path: string): Promise<Socket> {

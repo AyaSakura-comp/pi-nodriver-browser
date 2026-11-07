@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .images import ResearchImages
-from .passages import ProgressivePassages, rough_words
+from .passages import TOP, ProgressivePassages, model_tokens, rough_words
 from .providers import fourget, google, resolve_google_redirect  # worker.py imports resolve_google_redirect from here
 
 ENGINES = ('4get', '4get', '4get', 'google')  # engine of query index 0..3 (q1..q4)
@@ -34,7 +34,8 @@ EVIDENCE_BUDGET = 6000  # rough tokens of committed passages
 IMAGE_WAIT = 1.0        # how long finished crawling waits for in-flight image downloads
 CLEANUP_TIMEOUT = 5.0
 MAX_PACKET_BYTES, MAX_PACKET_LINES = 2 * 1024 * 1024, 20000
-PARAMS = {'jobId', 'question', 'queries', 'clock', 'streaming', 'answer', 'crawlConcurrency', 'crawlWordBudget'}
+PARAMS = {'jobId', 'question', 'queries', 'clock', 'streaming', 'answer', 'crawlConcurrency', 'crawlWordBudget',
+          'deadlineMs', 'evidenceBudget', 'imageWaitMs'}
 
 # Answer rules 2 and 5 of the closing instructions. A new question gets the
 # breadth-first overview; the depth rules apply once the user picks an item.
@@ -57,6 +58,24 @@ BREADTH_CLOSURE = ('5. Closure: do not search, crawl, browse or fetch images on 
 DEPTH_CLOSURE = ('5. Closure: do not search, crawl, browse or fetch images on your own. End with one short line on what '
                  'the evidence does not cover that matters for this question, then ask whether the user wants a deep '
                  'crawl of specific sources above or another research round.\n')
+
+
+BUDGET_TAIL = '\nEnd of evidence. Answer now from the passages and search results above, following the rules at the top.\n'
+IMAGE_TAIL = ('This evidence includes downloaded images: if they show the thing asked about, place one or two '
+              '[[image: …]] markers from the Images list, copied exactly, on their own lines next to the text they illustrate.\n')
+BUDGET_TOP = 6  # a latency-budget job commits only the top 6 snippets at once: room is left for page passages
+
+
+def leading_rules(question, answer):
+    """A latency-budget job's answer rules, placed BEFORE its evidence and kept to the few the tool description does
+    not already give (answer from the evidence, cite it, do not search again): they are known when the job starts,
+    so they are prefilled while the searches run, and every token of them is read before the answer."""
+    shape = ('Breadth first: every distinct on-topic item, one or two lines each (時間/地點/價格 or the key number), '
+             'then name 1-3 items to expand and ask which one.' if answer == 'breadth' else
+             'Depth: that item in full with every concrete fact, plus the 2-3 things the user needs next.')
+    return (f"The user's question: «{question[-600:]}»\n"
+            f"# How to answer: this evidence is enough; answer now and do not search, crawl or call any tool again. Open "
+            f"with the direct answer, a [來源](URL) link after every key fact, each fact once. {shape}\n")
 
 
 def closing(answer, images):
@@ -169,9 +188,18 @@ class Job:
             aware = False
         self.open, self.answer = p.get('streaming', False), p.get('answer', 'breadth')
         self.concurrency, self.word_budget = p.get('crawlConcurrency', 32), p.get('crawlWordBudget', 20000)
+        # A latency budget (research-first answers): deliver what is committed when the deadline passes,
+        # with a smaller evidence budget and no wait for images still downloading.
+        self.deadline = p.get('deadlineMs')
+        self.evidence_budget = p.get('evidenceBudget', EVIDENCE_BUDGET)
+        image_wait_ms = p.get('imageWaitMs', int(IMAGE_WAIT * 1000))
         _check(aware and type(self.open) is bool and self.answer in ('breadth', 'depth')
                and type(self.concurrency) is int and 1 <= self.concurrency <= 64
-               and type(self.word_budget) is int and 1000 <= self.word_budget <= 100000)
+               and type(self.word_budget) is int and 1000 <= self.word_budget <= 100000
+               and (self.deadline is None or (type(self.deadline) is int and 500 <= self.deadline <= 120000))
+               and type(self.evidence_budget) is int and 500 <= self.evidence_budget <= 20000
+               and type(image_wait_ms) is int and 0 <= image_wait_ms <= 10000)
+        self.image_wait, self.expired = image_wait_ms / 1000, False
         self.conn, self.service, self.request_id, self.session = conn, conn.service, request_id, session
         self.id, self.date_line = p['jobId'], local_date_line(clock)
         self.owner = 'research-' + secrets.token_hex(16)  # its tabs never share interactive session state
@@ -187,7 +215,10 @@ class Job:
         self.errors = []
         self.wake, self.changed = asyncio.Event(), asyncio.Event()
         self.sha256 = hashlib.sha256()
-        self.passages = ProgressivePassages(p['question'], EVIDENCE_BUDGET)
+        # a latency budget counts the model's tokens (the time to read them); the default keeps its rough count
+        self.passages = (ProgressivePassages(p['question'], self.evidence_budget, BUDGET_TOP, model_tokens) if self.deadline
+                         else ProgressivePassages(p['question'], self.evidence_budget))
+        self.lead = leading_rules(p['question'], self.answer) if self.deadline else ''
         self.images = ResearchImages(p['question'], self._fetch_image, on_ready=self._image,
                                      is_delivered=self.passages.delivered.__contains__)
 
@@ -209,6 +240,9 @@ class Job:
             probe = asyncio.create_task(self.service.ensure_browser())
             probe.add_done_callback(lambda task: task.cancelled() or task.exception())
             sender = asyncio.create_task(self._send_progress())
+            if self.lead:
+                self.changed.set()   # the leading rules go out (and get prefilled) before any search returns
+            timer = asyncio.get_running_loop().call_later(self.deadline / 1000, self._expire) if self.deadline else None
             try:
                 while True:
                     while self.wanted:
@@ -216,13 +250,27 @@ class Job:
                     while self.queue and self.crawling < self.concurrency and not self.reason:
                         self.crawling += 1
                         self._spawn(self._crawl(heapq.heappop(self.queue)[2]))
-                    if not self.tasks and (self.reason or not self.open):
+                    # Past the deadline the searches and pages still loading are dropped (_stop cancels them).
+                    if self.expired or (not self.tasks and (self.reason or not self.open)):
                         break
                     await self.wake.wait()
                     self.wake.clear()
                 return await self._deliver()
             finally:
+                if timer:
+                    timer.cancel()
                 await self._stop(sender)
+
+    def _expire(self, reason='deadline_reached'):
+        self.expired = True
+        self.reason = self.reason or reason
+        self.wake.set()
+
+    def _check_full(self):
+        # A latency budget delivers once its evidence budget is (nearly) used: later pages could not commit anything,
+        # so waiting for them until the deadline only delays the answer.
+        if self.deadline and self.passages.used >= 0.9 * self.passages.budget:
+            self._expire('evidence_budget_reached')
 
     def _spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -271,6 +319,7 @@ class Job:
             rows_seen.append((source['id'], title, url, description))
         if self.passages.add_results(rows_seen):
             self.changed.set()
+            self._check_full()
         # Crawl in search order: every query's 1st new result, then its 2nd, and so on.
         # This queue is the only way to a crawl, so a job opens nothing but search results.
         for position, source in enumerate(new[:TOP_PER_QUERY]):
@@ -324,6 +373,7 @@ class Job:
         # A failed or partial page commits nothing and frees the budget reserved for it.
         if self.passages.add(source['id'], source['title'], source['url'], text if ok else ''):
             self.changed.set()
+            self._check_full()
 
     def _record(self, **record):
         line = json.dumps(record, ensure_ascii=False) + '\n'
@@ -346,7 +396,7 @@ class Job:
             self.changed.clear()
             try:
                 await self.conn.send(dict(type='progress', id=self.request_id, jobId=self.id, phase='evidence',
-                                          prefix=self.date_line + '\n' + self.passages.text))
+                                          prefix=self.date_line + '\n' + self.lead + self.passages.text))
             except Exception:
                 pass  # best effort: the final packet carries everything
 
@@ -354,9 +404,11 @@ class Job:
         # Everything was committed (and prefilled) while crawling: from here on only the
         # images still downloading and the closing rules follow the last prefix.
         self.done = True
-        packet = self.date_line + '\n' + self.passages.text
-        await self.images.settle(IMAGE_WAIT)
-        packet += self.images.section(self.passages.delivered) + closing(self.answer, self.images.delivered)
+        packet = self.date_line + '\n' + self.lead + self.passages.text
+        await self.images.settle(self.image_wait)
+        packet += self.images.section(self.passages.delivered)
+        packet += (BUDGET_TAIL + (IMAGE_TAIL if self.images.delivered else '')) if self.lead \
+            else closing(self.answer, self.images.delivered)
         result = dict(action='research', jobId=self.id, status='collected' if self.collected else 'incomplete',
                       reason=self.reason or 'searches_done', text=packet, fullEvidenceDelivered=True,
                       artifactPath=str(self.journal_path), sha256=self.sha256.hexdigest(),
@@ -365,7 +417,7 @@ class Job:
                                for s in self.sources.values()],
                       authorizations=[dict(url=url, discoveries=d) for url, d in self.authority.items()],
                       errors=self.errors, crawlWords=self.words, crawlWordBudget=self.word_budget,
-                      crawlConcurrency=self.concurrency)
+                      crawlConcurrency=self.concurrency, rulesFirst=bool(self.lead))
         if len(packet.encode()) > MAX_PACKET_BYTES or packet.count('\n') >= MAX_PACKET_LINES:
             result.update(status='incomplete', reason='packet_too_large', fullEvidenceDelivered=False,
                           text='Research incomplete: packet_too_large. Full evidence was NOT delivered. '
