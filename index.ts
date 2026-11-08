@@ -7,15 +7,6 @@ import { Type } from "typebox";
 import registerBrowserIntent from "./browser-intent-tool.ts";
 import { SOCKET, WorkerClient, startWorker } from "./worker-launch.ts";
 
-// Early answer (research hands back snippets first, research_details the pages): on unless RESEARCH_EARLY_ANSWER=0.
-const EARLY_ANSWER = process.env.RESEARCH_EARLY_ANSWER !== "0";
-const EARLY_WAIT_MS = 1500;   // after research starts, at most this long for the remaining searches
-const PRELIMINARY_RULES = "\nThese are the search-result snippets only; the result pages are still loading in the background.\n"
-  + "1. Now write a short preliminary answer: 2-4 sentences with the direct answer if the snippets give it (otherwise what "
-  + "they indicate), a [來源](URL) link after each fact, and say that the full answer follows.\n"
-  + "2. In the same message, right after that text, call research_details (no arguments): it returns the crawled pages. "
-  + "Then write the complete answer from all the evidence.\n";
-
 const MAX_BATCH_IMAGE_BYTES = 40 * 1024 * 1024;
 const TIME_SENSITIVE_SEARCH_PATTERN = /(?:\b(?:19|20)\d{2}\b|\b(?:today|tomorrow|yesterday|now|current|currently|latest|recent|recently|upcoming|ago|date|time|timezone|schedule|deadline|release|price|stock|availability|exchange\s+rate|weather)\b|\bthis\s+(?:week|month|year)\b|\b(?:last|next)\s+(?:week|month|year)\b|今天|明天|昨天|現在|當下|目前|最新|最近|即將|本週|這週|上週|下週|本月|上月|下月|今年|去年|明年|日期|時間|時區|時程|排程|截止|發布|上市|價格|庫存|供貨|匯率|天氣|活動)/iu;
 const FRESH_TIME_MAX_AGE_MS = 10 * 60 * 1000;
@@ -126,10 +117,6 @@ interface Job {
   done: Promise<Record<string, any>>;
   prefix: string;       // evidence committed so far
   listener?: (prefix: string) => void;
-  /** Every query has its results (the worker's frames say so); pages may still be loading. */
-  searched?: boolean;
-  /** Called on every evidence frame (early answer: waiting for the searches). */
-  onFrame?: () => void;
   abort: AbortController;
   adopted: boolean;
   timer?: ReturnType<typeof setTimeout>;
@@ -161,33 +148,7 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
   const guarded = (turn: Turn, tool: string) => FOLLOW_UP_LOOKUPS.has(tool) && (crawlGuards || tool !== "crawl")
     && turn.answered && !turn.more && !(turn.imageTask && IMAGE_TASK_LOOKUPS.has(tool));
 
-  // Early answer: research hands back the search snippets once the searches are in, while its pages keep
-  // loading; the agent writes a short preliminary answer and calls research_details, which delivers the
-  // crawled pages for the complete answer. The conversation only grows at its end (snippets, preliminary
-  // answer, page evidence, complete answer), so every request extends the cached prompt of the one before.
-  const pending = new Map<string, { job: Job; given: string; timer: ReturnType<typeof setTimeout> }>();
-  const dropPending = (sid: string) => {
-    const entry = pending.get(sid);
-    if (!entry) return;
-    pending.delete(sid);
-    clearTimeout(entry.timer);
-    entry.job.abort.abort();
-  };
-  /** Waits until every query has its results (false), the job finishes (true) or `ms` pass (false). */
-  const searchesIn = (job: Job, ms: number) => new Promise<boolean>((resolve) => {
-    const finish = (finished: boolean) => {
-      clearTimeout(timer);
-      job.onFrame = undefined;
-      resolve(finished);
-    };
-    const timer = setTimeout(() => finish(false), ms);
-    job.onFrame = () => { if (job.searched) finish(false); };
-    job.done.then(() => finish(true), () => finish(true));
-    if (job.searched) finish(false);
-  });
-
   pi.on("input", (event, ctx) => {
-    dropPending(sessionId(ctx));
     const asked = userBody(event.text);
     const previous = lastAssistantText(ctx);
     const accepted = AFFIRMATIVE.test(asked) && OFFERED_MORE_SEARCH.test(previous.slice(-600));
@@ -253,11 +214,9 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
     job.done = worker.research({
       jobId: job.id, question: turn.asked.slice(0, 4000) || queries.join(" ; "), queries, clock: hostClock(),
       answer: turn.depth ? "depth" : "breadth", crawlConcurrency: 32, crawlWordBudget: 20000, ...(streaming && { streaming }),
-    }, sid, job.abort.signal, (prefix, searched) => {
+    }, sid, job.abort.signal, (prefix) => {
       job.prefix = prefix;
-      job.searched = searched;
       job.listener?.(prefix);
-      job.onFrame?.();
     });
     job.done.catch(() => {});
     jobs.set(sid, job);
@@ -381,38 +340,9 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
         const cancel = job.abort;
         if (signal?.aborted) cancel.abort();
         signal?.addEventListener("abort", () => cancel.abort(), { once: true });
-        if (EARLY_ANSWER) {
-          const running = job;
-          const finished = await searchesIn(running, EARLY_WAIT_MS);
-          // Only with snippets to answer from; a job that already finished goes out whole, as before.
-          if (!finished && /^- \[s\d+\]/m.test(running.prefix)) {
-            prefill?.end();
-            const given = running.prefix;
-            running.listener = undefined;
-            // Nobody asked for the details within two minutes: the crawl stops.
-            const timer = setTimeout(() => dropPending(sid), 120_000);
-            timer.unref?.();
-            pending.set(sid, { job: running, given, timer });
-            delivered = true;
-            return { content: [{ type: "text" as const, text: given + PRELIMINARY_RULES }],
-              details: { jobId: running.id, status: "snippets", phase: "preliminary", ...(prefill && { prefill: prefill.stats() }) } };
-          }
-        }
         const response = await job.done;
         prefill?.end();
-        const { text, details } = finishPacket(response, response.text || "Research incomplete: no terminal evidence packet.", ctx, sid);
-        delivered = true;
-        return { content: [{ type: "text" as const, text }], details: { ...details, ...(prefill && { prefill: prefill.stats() }) } };
-      } finally {
-        if (jobs.get(sid) === job) jobs.delete(sid);
-        if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
-      }
-    },
-  });
-
-  // The packet's closing checks, shared by research and research_details.
-  function finishPacket(response: Record<string, any>, packet: string, ctx: ExtensionContext, sid: string) {
-    let text = packet;
+        let text: string = response.text || "Research incomplete: no terminal evidence packet.";
         // Coarse byte-based estimate, NOT tokenizer/model inference or a guarantee.
         // Keep half the remaining context plus 16k for sibling tools/prompt/output.
         const usage = ctx.getContextUsage();
@@ -433,54 +363,10 @@ export default function (pi: ExtensionAPI, worker: WorkerClient = new WorkerClie
           : "Answer it now, breadth first: direct answer in the first sentence; then every distinct on-topic item in one or two lines each (時間、地點、費用 or the key fact + 一句亮點), no deep dive into any single item; end by naming 1-3 items to expand and asking which one; ") +
           "a [來源](URL) link right after every key fact; nothing off-topic, nothing said twice. If the evidence is about a different product or company than the one asked, say so.\n";
         const { text: _packet, ...details } = response;
-        return { text, details: { ...details, estimatedInputTokens } };
-  }
-
-  toolApi.registerTool({
-    name: "research_details",
-    label: "Research: crawled pages",
-    description: "The crawled-page evidence of this message's research call. When research returns only search snippets (its pages were still loading), it asks for a short preliminary answer first; research_details then waits for the pages and returns their passages. Call it with no arguments right after that preliminary answer, then write the complete answer from all the evidence.",
-    promptGuidelines: [
-      "Call research_details only when a research result asked for it (snippets first), right after the short preliminary answer, in the same message.",
-    ],
-    parameters: Type.Object({}),
-    async execute(callId, _params, signal, onUpdate, ctx) {
-      const sid = sessionId(ctx);
-      const entry = pending.get(sid);
-      if (!entry) {
-        return { content: [{ type: "text" as const, text: "No crawl is pending: the research result above is all the evidence for this message. Answer from it." }],
-          details: { status: "none" } };
-      }
-      pending.delete(sid);
-      clearTimeout(entry.timer);
-      const { job, given } = entry;
-      // The result is the evidence after what research already gave, appended in order, prefilled as it arrives.
-      const prefill = ACTIVE_PREFILL ? ctx.prefill?.begin(callId) : undefined;
-      let committed = given;
-      let shown = given;
-      let delivered = false;
-      const onPrefix = (prefix: string) => {
-        if (!prefix.startsWith(given)) return;
-        if (prefill) {
-          if (!prefix.startsWith(committed)) prefill.cancel("prefix_rewritten");
-          else if (prefix.length > committed.length && prefill.append(prefix.slice(committed.length))) committed = prefix;
-        }
-        if (prefix.length <= shown.length) return;
-        shown = prefix;
-        onUpdate?.({ content: [{ type: "text", text: prefix.slice(given.length) }], details: { jobId: job.id, status: "evidence" } });
-      };
-      try {
-        job.listener = onPrefix;
-        if (job.prefix.length > given.length) onPrefix(job.prefix);
-        if (signal?.aborted) job.abort.abort();
-        signal?.addEventListener("abort", () => job.abort.abort(), { once: true });
-        const response = await job.done;
-        prefill?.end();
-        const packet: string = response.text || "Research incomplete: no terminal evidence packet.";
-        const { text, details } = finishPacket(response, packet.startsWith(given) ? packet.slice(given.length) : packet, ctx, sid);
         delivered = true;
-        return { content: [{ type: "text" as const, text }], details: { ...details, ...(prefill && { prefill: prefill.stats() }) } };
+        return { content: [{ type: "text" as const, text }], details: { ...details, estimatedInputTokens, ...(prefill && { prefill: prefill.stats() }) } };
       } finally {
+        if (jobs.get(sid) === job) jobs.delete(sid);
         if (!delivered) prefill?.cancel(signal?.aborted ? "aborted" : "research_failed");
       }
     },

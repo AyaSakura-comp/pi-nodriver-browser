@@ -210,7 +210,7 @@ class Job:
         self.authority = {}  # exact URL a search engine returned -> [{taskId, provider}]
         self.sources = {}    # url_key -> {'id', 'url', 'title'}
         self.queue, self.order = [], itertools.count()  # crawl queue: (position in its query, arrival, source)
-        self.tasks, self.crawling, self.searching = set(), 0, 0
+        self.tasks, self.crawling = set(), 0
         self.words, self.reason, self.collected, self.done = 0, None, False, False
         self.errors = []
         self.wake, self.changed = asyncio.Event(), asyncio.Event()
@@ -230,8 +230,6 @@ class Job:
     def close_stream(self):
         self.open = False
         self.wake.set()
-        if self.searches_done():
-            self.changed.set()
 
     async def run(self):
         directory = self.conn.root / self.id
@@ -291,7 +289,6 @@ class Job:
             return
         self.searched[key] = attempt = f'q{len(self.searched) + 1}'
         self.passages.queries.append(query)
-        self.searching += 1
         self._spawn(self._search(attempt, engine, query))
 
     async def _results(self, engine, query):
@@ -300,19 +297,7 @@ class Job:
         await self.service.ensure_browser(max_age=PROBE_MAX_AGE)
         return await google(self.service, self.owner, query)
 
-    def searches_done(self):
-        """Every query of the call has its results (or failed): the snippets are complete, pages may still load."""
-        return not self.open and not self.wanted and self.searching == 0
-
     async def _search(self, attempt, engine, query):
-        try:
-            await self._search_one(attempt, engine, query)
-        finally:
-            self.searching -= 1
-            if self.searches_done():
-                self.changed.set()                       # a frame that says so, even with no new evidence
-
-    async def _search_one(self, attempt, engine, query):
         try:
             results = await asyncio.wait_for(self._results(engine, query), TASK_TIMEOUT)
         except TimeoutError:
@@ -411,8 +396,7 @@ class Job:
             self.changed.clear()
             try:
                 await self.conn.send(dict(type='progress', id=self.request_id, jobId=self.id, phase='evidence',
-                                          prefix=self.date_line + '\n' + self.lead + self.passages.text,
-                                          searched=self.searches_done()))
+                                          prefix=self.date_line + '\n' + self.lead + self.passages.text))
             except Exception:
                 pass  # best effort: the final packet carries everything
 
