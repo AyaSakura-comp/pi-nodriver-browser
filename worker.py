@@ -3507,7 +3507,6 @@ class BrowserWorker:
                 pass
         await page.bring_to_front()
         self.xvfb_active_target_id = target_id
-        await self.keep_page_visible(page)
         return True
 
     async def keep_page_visible(self, page):
@@ -3983,7 +3982,8 @@ class BrowserWorker:
         If a concurrent reconcile adopted the new tab before it was marked as
         a pool tab, the registry record is dropped again here."""
         page = await self.browser.get('about:blank', new_tab=True)
-        await self.keep_page_visible(page)
+        if macos_window.IS_MACOS:
+            await self.keep_page_visible(page)
         target_id = self.tab_registry.target_id(page)
         self.crawl_pool_targets[target_id] = page
         self.crawl_pool_inflight.add(target_id)
@@ -4035,7 +4035,8 @@ class BrowserWorker:
                             pass
                 finally:
                     raise
-            await self.keep_page_visible(page)
+            if macos_window.IS_MACOS:
+                await self.keep_page_visible(page)
             self.register_tab(page, session_id, kind)
             return page
 
@@ -4246,7 +4247,7 @@ class BrowserWorker:
                 default_window_size = f'{def_frame_w},{def_frame_h}'
                 window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', default_window_size)
                 b_args = [
-                    *(['--ozone-platform=x11'] if sys.platform.startswith('linux') else []),
+                    *([] if macos_window.IS_MACOS else ['--ozone-platform=x11']),
                     '--window-position=0,0',
                     f'--window-size={window_size}',
                     '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,PasswordLeakDetection',
@@ -4278,7 +4279,7 @@ class BrowserWorker:
                         # Never touch the user's login keychain ("Chrome Safe Storage").
                         '--use-mock-keychain',
                     ])
-                previous_front = macos_window.frontmost_pid()
+                previous_front = macos_window.frontmost_pid() if macos_window.IS_MACOS else None
                 self.browser = await uc.start(
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
@@ -4288,7 +4289,8 @@ class BrowserWorker:
                     lang='zh-TW',
                 )
                 self.launched_browser = self.browser
-                self.adopt_macos_chrome(getattr(self.browser, '_process_pid', None), previous_front)
+                if macos_window.IS_MACOS:
+                    self.adopt_macos_chrome(getattr(self.browser, '_process_pid', None), previous_front)
             except Exception as startup_error:
                 # Nodriver 0.50.x waits less than three seconds for DevTools.
                 # On cold CI machines Chrome can become ready just after that
@@ -4318,7 +4320,8 @@ class BrowserWorker:
                         break
                 if self.browser is None:
                     raise startup_error
-                self.adopt_macos_chrome(profile_lock_pid(profile), None)
+                if macos_window.IS_MACOS:
+                    self.adopt_macos_chrome(profile_lock_pid(profile), None)
             await self.configure_browser_connection()
         return self.browser
 

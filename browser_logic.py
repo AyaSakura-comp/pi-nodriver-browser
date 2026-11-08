@@ -1085,9 +1085,9 @@ def pid_alive(pid) -> bool:
     except (TypeError, ValueError):
         return False
     except OSError:
-        if Path('/proc/self/stat').exists():
+        if sys.platform != 'darwin':
             return False
-        # No procfs (macOS): ps reports the state; a zombie (Z) has already exited.
+        # macOS has no procfs: ps reports the state; a zombie (Z) has already exited.
         state = _ps_field(pid, 'stat')
         return state is not None and not state.startswith('Z')
     # The state letter follows the parenthesised command name; a zombie has already exited.
@@ -1114,9 +1114,9 @@ def chrome_debug_port(pid) -> int | None:
     except (TypeError, ValueError):
         return None
     except OSError:
-        if Path('/proc/self/cmdline').exists():
+        if sys.platform != 'darwin':
             return None
-        # No procfs (macOS): ps prints the command line space-separated; the flag has no spaces.
+        # macOS has no procfs: ps prints the command line space-separated; the flag has no spaces.
         command = _ps_field(pid, 'command')
         if command is None:
             return None
