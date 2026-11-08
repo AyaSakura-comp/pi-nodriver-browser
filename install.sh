@@ -13,7 +13,7 @@ copy_runtime() {
   install -m 0644 "$ROOT/index.ts" "$ROOT/browser-config.ts" "$ROOT/worker-launch.ts" "$target/"
   install -m 0644 "$ROOT/intent/"*.py "$ROOT/intent/"*.ts "$target/intent/"
   install -m 0755 "$ROOT/worker.py" "$target/worker.py"
-  install -m 0644 "$ROOT/browser_logic.py" "$ROOT/requirements.txt" "$target/"
+  install -m 0644 "$ROOT/browser_logic.py" "$ROOT/macos_window.py" "$ROOT/requirements.txt" "$target/"
   install -m 0644 "$ROOT/research/"*.py "$target/research/"
   install -m 0644 "$ROOT/research-model.ts" "$target/"
   if [[ -d "$ROOT/stealth-extension" ]]; then
@@ -31,19 +31,56 @@ if [[ "${1:-}" == "--stage" ]]; then
 fi
 [[ $# == 0 ]] || { echo 'unknown installer arguments' >&2; exit 2; }
 
-if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
-  for command in python3 xvfb-run; do
-    if ! command -v "$command" >/dev/null 2>&1; then
-      echo "Missing required command: $command" >&2
-      exit 1
+OS="$(uname -s)"
+
+chrome_found() {
+  local command app
+  for command in google-chrome google-chrome-stable chromium chromium-browser; do
+    command -v "$command" >/dev/null 2>&1 && return 0
+  done
+  if [[ "$OS" == "Darwin" ]]; then
+    for app in "Google Chrome.app/Contents/MacOS/Google Chrome" \
+               "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" \
+               "Chromium.app/Contents/MacOS/Chromium"; do
+      [[ -x "/Applications/$app" || -x "$HOME/Applications/$app" ]] && return 0
+    done
+  fi
+  return 1
+}
+
+# Python 3.10+ for the worker venv (macOS ships /usr/bin/python3 3.9). PI_NODRIVER_PYTHON wins;
+# otherwise the newest python3.x on PATH; otherwise uv provides one.
+python_ok() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; }
+PYTHON_BIN="${PI_NODRIVER_PYTHON:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && python_ok "$(command -v "$candidate")"; then
+      PYTHON_BIN="$(command -v "$candidate")"
+      break
     fi
   done
+fi
+if [[ -z "$PYTHON_BIN" ]] && command -v uv >/dev/null 2>&1; then
+  uv python install 3.12 >/dev/null
+  PYTHON_BIN="$(uv python find 3.12)"
+fi
+
+if [[ "${SKIP_SYSTEM_CHECKS:-0}" != "1" ]]; then
+  if [[ -z "$PYTHON_BIN" ]] || ! python_ok "$PYTHON_BIN"; then
+    echo "Python 3.10+ is required (set PI_NODRIVER_PYTHON, or install uv)." >&2
+    exit 1
+  fi
+  # macOS has no Xvfb: the worker hides its own headful Chrome instead (macos_window.py).
+  if [[ "$OS" != "Darwin" ]] && ! command -v xvfb-run >/dev/null 2>&1; then
+    echo "Missing required command: xvfb-run" >&2
+    exit 1
+  fi
   for command in pdftotext pdfimages; do
     if ! command -v "$command" >/dev/null 2>&1; then
-      echo "Warning: $command was not found; PDF extraction requires Poppler (usually poppler-utils)." >&2
+      echo "Warning: $command was not found; PDF extraction requires Poppler (poppler-utils; macOS: brew install poppler)." >&2
     fi
   done
-  if ! python3 - <<'PY'
+  if ! "$PYTHON_BIN" - <<'PY'
 import sqlite3
 connection = sqlite3.connect(':memory:')
 connection.execute('CREATE VIRTUAL TABLE fts_check USING fts5(text)')
@@ -51,11 +88,7 @@ PY
   then
     echo "Warning: Python's SQLite lacks FTS5; temporary large-PDF wiki search will be unavailable." >&2
   fi
-  if [[ -z "${PI_NODRIVER_CHROME:-}" ]] && \
-     ! command -v google-chrome >/dev/null 2>&1 && \
-     ! command -v google-chrome-stable >/dev/null 2>&1 && \
-     ! command -v chromium >/dev/null 2>&1 && \
-     ! command -v chromium-browser >/dev/null 2>&1; then
+  if [[ -z "${PI_NODRIVER_CHROME:-}" ]] && ! chrome_found; then
     echo "Chrome/Chromium was not found. Install it or set PI_NODRIVER_CHROME." >&2
     exit 1
   fi
@@ -81,7 +114,7 @@ PY
 fi
 
 # Ensure any leftover nodriver workers and their chrome children are completely reset
-stale_workers=$(pgrep -u "$USER" -f '^/home/chihmin/.pi/agent/extensions/nodriver-browser/.venv/bin/python .*worker.py' || true)
+stale_workers=$(pgrep -u "$USER" -f "^$TARGET/.venv/bin/python .*worker.py" || true)
 if [[ -n "$stale_workers" ]]; then
   kill $stale_workers 2>/dev/null || true
   sleep 0.5
@@ -98,7 +131,10 @@ copy_runtime "$TARGET"
 # outside Pi's extensions directory so it cannot register a duplicate tool.
 if [[ -e "$PI_AGENT_DIR/extensions/browser-intent.ts" || -L "$PI_AGENT_DIR/extensions/browser-intent.ts" ]]; then
   mkdir -p "$PI_AGENT_DIR/extension-backups"
-  mv --backup=numbered "$PI_AGENT_DIR/extensions/browser-intent.ts" "$PI_AGENT_DIR/extension-backups/browser-intent.ts"
+  backup="$PI_AGENT_DIR/extension-backups/browser-intent.ts"
+  n=0
+  while [[ -e "$backup" || -L "$backup" ]]; do n=$((n + 1)); backup="$PI_AGENT_DIR/extension-backups/browser-intent.ts.~$n~"; done
+  mv "$PI_AGENT_DIR/extensions/browser-intent.ts" "$backup"
 fi
 if [[ ! -f "$PI_AGENT_DIR/browser-config.json" ]]; then
   printf '{"browserMode":"direct"}\n' > "$PI_AGENT_DIR/browser-config.json"
@@ -106,7 +142,7 @@ fi
 
 if [[ "${SKIP_PIP_INSTALL:-0}" != "1" ]]; then
   if [[ ! -x "$TARGET/.venv/bin/python" ]]; then
-    python3 -m venv "$TARGET/.venv"
+    "${PYTHON_BIN:-python3}" -m venv "$TARGET/.venv"
   fi
   "$TARGET/.venv/bin/python" -m pip install --upgrade pip
   "$TARGET/.venv/bin/python" -m pip install -r "$TARGET/requirements.txt"

@@ -1,5 +1,5 @@
 /**
- * Starts the shared browser worker (xvfb-run → worker.py → Chrome).
+ * Starts the shared browser worker (xvfb-run → worker.py → Chrome; on macOS worker.py → hidden Chrome).
  *
  * One worker serves every Pi process through a single Unix socket, so it must not live
  * in the cgroup of whichever Pi process happened to start it. A plain child of Pi lands
@@ -121,6 +121,16 @@ export function systemdRunArgs(spec: WorkerLaunchSpec, unit: string, envNames: s
   ];
 }
 
+/**
+ * The detached worker command. Linux wraps it in xvfb-run (an invisible X display). macOS has
+ * no Xvfb: the worker runs directly and hides its own headful Chrome instead (macos_window.py).
+ */
+export function spawnCommand(spec: WorkerLaunchSpec, platform: NodeJS.Platform): [string, string[]] {
+  const worker = [spec.worker, "--server", spec.socket];
+  if (platform === "darwin") return [spec.python, worker];
+  return ["xvfb-run", ["-a", "-s", `-screen 0 ${spec.screen}`, spec.python, ...worker]];
+}
+
 const execFilePromise = promisify(execFileCallback) as unknown as ExecFile;
 
 const defaultDurableManager = (execFile: ExecFile, env: Env) => async () => userManagerOutlivesCaller(
@@ -153,9 +163,9 @@ export async function launchWorker(spec: WorkerLaunchSpec, deps: LaunchDeps = {}
   }
   const childEnv: Env = { ...env };
   delete childEnv.WAYLAND_DISPLAY;
+  const [file, args] = spawnCommand(spec, deps.platform ?? process.platform);
   const child = (deps.spawn ?? spawnProcess)(
-    "xvfb-run",
-    ["-a", "-s", `-screen 0 ${spec.screen}`, spec.python, spec.worker, "--server", spec.socket],
+    file, args,
     { cwd: spec.root, stdio: "ignore", detached: true, env: childEnv },
   );
   // A missing xvfb-run must surface as "did not start", not crash Pi with an unhandled error.

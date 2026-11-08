@@ -34,6 +34,8 @@ from pathlib import Path
 import nodriver as uc
 from PIL import Image, ImageDraw
 
+import macos_window
+
 from browser_logic import OpenActionGuard, locate_viewport_offset, omni_dynamic_params, omni_rect_from_metrics, trim_screen_margins, TabActivityRegistry, TabLimitError, VisionCorrectnessGuard, VisionFallbackContext, VisionFallbackGuard, VisionPageState, detect_access_gate, ensure_profile_preferences, format_snapshot, generate_minimum_jerk_offsets, identity_viewport_metrics, is_google_lens_surface, is_auth_url, is_confident_option_match, is_semantic_click_attempt, is_touch_lab_url, map_screenshot_point_to_viewport, normalize_open_url, normalize_option_text, normalize_origin, parse_command, parse_devtools_active_port, parse_dismiss_options, parse_duration_ms, parse_google_search_payload, parse_long_press, parse_popup_timeout_ms, parse_vision_click, parse_vision_mark, parse_vision_mark_drag, chrome_debug_port, pid_alive, profile_lock_pid, rank_option_matches, resolve_browser_executable, resolve_google_redirect_url, resolve_profile_dir, select_diverse_search_results, should_disable_sandbox
 
 MARKER = '__PI_NODRIVER__'
@@ -3488,6 +3490,13 @@ class BrowserWorker:
 
     async def ensure_page_front(self, page):
         target_id = self.page_target_id(page)
+        if macos_window.should_hide():
+            # macOS hidden Chrome: Target.activateTarget would unhide and activate the app
+            # (stealing the user's focus). Focus emulation already keeps every tab visible,
+            # and screenshots/input go through CDP, so no tab needs to be in front.
+            await self.keep_page_visible(page)
+            self.xvfb_active_target_id = target_id
+            return False
         if target_id is not None and target_id == self.xvfb_active_target_id:
             try:
                 if await page.evaluate('document.visibilityState') == 'visible':
@@ -3498,7 +3507,22 @@ class BrowserWorker:
                 pass
         await page.bring_to_front()
         self.xvfb_active_target_id = target_id
+        await self.keep_page_visible(page)
         return True
+
+    async def keep_page_visible(self, page):
+        """macOS only (no Xvfb): keep the hidden worker Chrome hidden, and make the page
+        render as a visible, focused page. A hidden app's pages otherwise report
+        visibilityState "hidden" and pause requestAnimationFrame. Best effort."""
+        if not macos_window.should_hide():
+            return
+        try:
+            await asyncio.wait_for(page.send(uc.cdp.emulation.set_focus_emulation_enabled(True)), timeout=2)
+        except Exception:
+            pass
+        pid = getattr(self, 'macos_chrome_pid', None)
+        if pid:
+            macos_window.hide(pid)  # immediately; the keep-hidden thread is the safety net
 
     async def apply_android_user_agent(self, page):
         _, product, _, browser_user_agent, _ = await page.send(
@@ -3959,6 +3983,7 @@ class BrowserWorker:
         If a concurrent reconcile adopted the new tab before it was marked as
         a pool tab, the registry record is dropped again here."""
         page = await self.browser.get('about:blank', new_tab=True)
+        await self.keep_page_visible(page)
         target_id = self.tab_registry.target_id(page)
         self.crawl_pool_targets[target_id] = page
         self.crawl_pool_inflight.add(target_id)
@@ -4010,6 +4035,7 @@ class BrowserWorker:
                             pass
                 finally:
                     raise
+            await self.keep_page_visible(page)
             self.register_tab(page, session_id, kind)
             return page
 
@@ -4220,7 +4246,7 @@ class BrowserWorker:
                 default_window_size = f'{def_frame_w},{def_frame_h}'
                 window_size = os.environ.get('PI_NODRIVER_WINDOW_SIZE', default_window_size)
                 b_args = [
-                    '--ozone-platform=x11',
+                    *(['--ozone-platform=x11'] if sys.platform.startswith('linux') else []),
                     '--window-position=0,0',
                     f'--window-size={window_size}',
                     '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,PasswordLeakDetection',
@@ -4240,6 +4266,17 @@ class BrowserWorker:
                     b_args.insert(1, '--start-maximized')
                 if ext_path.is_dir():
                     b_args.extend([f'--load-extension={ext_path}', f'--disable-extensions-except={ext_path}'])
+                if macos_window.IS_MACOS:
+                    # No Xvfb: the window is hidden (macos_window), so Chrome must not throttle it.
+                    b_args.extend([
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-background-timer-throttling',
+                        # Retina would double every screenshot; Xvfb renders at 1x, which the
+                        # vision coordinate mapping and image token budgets assume.
+                        '--force-device-scale-factor=1',
+                    ])
+                previous_front = macos_window.frontmost_pid()
                 self.browser = await uc.start(
                     headless=False,
                     browser_executable_path=resolve_browser_executable(),
@@ -4249,6 +4286,7 @@ class BrowserWorker:
                     lang='zh-TW',
                 )
                 self.launched_browser = self.browser
+                self.adopt_macos_chrome(getattr(self.browser, '_process_pid', None), previous_front)
             except Exception as startup_error:
                 # Nodriver 0.50.x waits less than three seconds for DevTools.
                 # On cold CI machines Chrome can become ready just after that
@@ -4278,8 +4316,24 @@ class BrowserWorker:
                         break
                 if self.browser is None:
                     raise startup_error
+                self.adopt_macos_chrome(profile_lock_pid(profile), None)
             await self.configure_browser_connection()
         return self.browser
+
+    def adopt_macos_chrome(self, pid, previous_front):
+        """macOS: hide the Chrome this worker launched and give focus back (Xvfb stand-in)."""
+        self.macos_chrome_pid = pid
+        if not pid or not macos_window.should_hide():
+            return
+        for _ in range(20):
+            if macos_window.hide(pid):
+                break
+            time.sleep(0.1)  # the app registers with the window server shortly after exec
+        if previous_front and previous_front != pid:
+            macos_window.activate(previous_front)
+        if getattr(self, 'macos_keep_hidden_pid', None) != pid:
+            self.macos_keep_hidden_pid = pid
+            macos_window.keep_hidden(pid)
 
     async def configure_browser_connection(self):
         self.download_dir.mkdir(parents=True, exist_ok=True)

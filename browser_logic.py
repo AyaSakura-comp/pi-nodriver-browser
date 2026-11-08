@@ -5,6 +5,8 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 import time
 import unicodedata
 import urllib.error
@@ -1066,11 +1068,28 @@ def parse_devtools_active_port(content: str) -> int:
     return port
 
 
+def _ps_field(pid, field: str) -> str | None:
+    """One `ps -o <field>=` value for a PID (platforms without /proc, e.g. macOS)."""
+    try:
+        result = subprocess.run(['ps', '-o', f'{field}=', '-p', str(int(pid))],
+                                capture_output=True, text=True, timeout=2)
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
 def pid_alive(pid) -> bool:
     try:
         stat_line = Path(f'/proc/{int(pid)}/stat').read_text()
-    except (OSError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return False
+    except OSError:
+        if Path('/proc/self/stat').exists():
+            return False
+        # No procfs (macOS): ps reports the state; a zombie (Z) has already exited.
+        state = _ps_field(pid, 'stat')
+        return state is not None and not state.startswith('Z')
     # The state letter follows the parenthesised command name; a zombie has already exited.
     return stat_line.rsplit(')', 1)[-1].split()[:1] != ['Z']
 
@@ -1092,8 +1111,16 @@ def chrome_debug_port(pid) -> int | None:
     port is given explicitly (nodriver always does), so the command line is the only record."""
     try:
         args = Path(f'/proc/{int(pid)}/cmdline').read_bytes().split(b'\0')
-    except (OSError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return None
+    except OSError:
+        if Path('/proc/self/cmdline').exists():
+            return None
+        # No procfs (macOS): ps prints the command line space-separated; the flag has no spaces.
+        command = _ps_field(pid, 'command')
+        if command is None:
+            return None
+        args = [arg.encode() for arg in command.split()]
     for arg in args:
         if arg.startswith(b'--remote-debugging-port='):
             value = arg.split(b'=', 1)[1]
@@ -1159,7 +1186,20 @@ def resolve_browser_executable() -> str:
         executable = shutil.which(command)
         if executable:
             return executable
+    if sys.platform == 'darwin':
+        for app in MACOS_BROWSER_APPS:
+            for root in (Path('/Applications'), Path.home() / 'Applications'):
+                executable = root / app
+                if os.access(executable, os.X_OK):
+                    return str(executable)
     raise RuntimeError('Chrome or Chromium was not found; set PI_NODRIVER_CHROME')
+
+
+MACOS_BROWSER_APPS = (
+    'Google Chrome.app/Contents/MacOS/Google Chrome',
+    'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+    'Chromium.app/Contents/MacOS/Chromium',
+)
 
 
 def parse_dismiss_options(parts: list[str]) -> str:

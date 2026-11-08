@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BROWSER_UNIT_PREFIX, forwardedEnv, launchWorker, systemdRunArgs, userManagerOutlivesCaller } from '../worker-launch.ts';
+import { BROWSER_UNIT_PREFIX, forwardedEnv, launchWorker, spawnCommand, systemdRunArgs, userManagerOutlivesCaller } from '../worker-launch.ts';
 
 const spec = {
   root: '/opt/ext', python: '/opt/ext/.venv/bin/python', worker: '/opt/ext/worker.py',
@@ -135,4 +135,15 @@ test('user manager durability: service of the manager, or lingering', async () =
   assert.equal(await userManagerOutlivesCaller(login, linger('Linger=no\n')), false);
   assert.equal(await userManagerOutlivesCaller(login, async () => { throw new Error('no logind'); }), false);
   assert.equal(await userManagerOutlivesCaller('', linger('Linger=yes\n')), true);
+});
+
+test('macOS runs the worker directly (no Xvfb); Linux wraps it in xvfb-run', async () => {
+  const spawned: { file: string; args: string[] }[] = [];
+  await launchWorker(spec, {
+    platform: 'darwin', env: { PATH: '/usr/bin' },
+    spawn: (file, args) => { spawned.push({ file, args }); return fakeChild(8) as never; },
+  });
+  assert.deepEqual(spawned, [{ file: spec.python, args: [spec.worker, '--server', spec.socket] }]);
+  assert.deepEqual(spawnCommand(spec, 'linux'),
+    ['xvfb-run', ['-a', '-s', '-screen 0 1366x768x24', spec.python, spec.worker, '--server', spec.socket]]);
 });

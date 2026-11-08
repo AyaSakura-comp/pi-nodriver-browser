@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![Nodriver: 0.50.3](https://img.shields.io/badge/Nodriver-0.50.3-orange.svg)](https://github.com/ultrafunkamsterdam/nodriver)
-[![Platform: Linux](https://img.shields.io/badge/Platform-Linux%20%2F%20Xvfb-lightgrey.svg)]()
+[![Platform: Linux | macOS](https://img.shields.io/badge/Platform-Linux%20(Xvfb)%20%7C%20macOS-lightgrey.svg)]()
 
 A high-performance, persistent browser automation and parallel web crawling extension for the [Pi coding agent](https://github.com/badlogic/pi-mono), powered by **Nodriver**, headful **Chrome/Chromium**, **Xvfb**, and an integrated **stealth and challenge-detection subsystem**.
 
@@ -178,6 +178,49 @@ its changed version. See [dependency upgrade rules](docs/dependencies.md).
 verified. The existing host's INT8 API and browser integration were smoke-tested.
 The complete multi-service installation above has not been tested from scratch
 on a clean machine; do not treat it as a one-command, fully automated installer.
+
+## Deploy on macOS
+
+macOS has no Xvfb. The worker starts the same **headful** Chrome (not headless: no
+`HeadlessChrome` user agent) and hides that one application with
+`NSRunningApplication.hide` ([`macos_window.py`](macos_window.py)), so it never appears on
+screen or takes keyboard focus. Your own Chrome is a separate process and is not touched.
+No Accessibility or Automation permission is needed.
+
+| Linux (Xvfb) | macOS |
+|---|---|
+| `xvfb-run` wraps the worker | `worker.py` is spawned directly (`worker-launch.ts`) |
+| Invisible X display | Worker Chrome hidden. A watchdog thread re-hides it and gives focus back if anything activates it |
+| Only the front tab renders | Every tab gets CDP focus emulation, so it stays `visible` and keeps `requestAnimationFrame` running |
+| `bring_to_front` before screenshots/clicks | Skipped (it would activate the app); screenshots and input use CDP |
+| `xdotool` trusted clicks, `import` screenshots | CDP input and CDP screenshots (the existing fallback path) |
+| 1x Xvfb pixels | `--force-device-scale-factor=1`, so Retina does not double screenshots |
+| `/proc` for Chrome liveness | `ps` fallback (`pid_alive`, `chrome_debug_port`) |
+
+```sh
+brew install poppler uv            # PDF extraction; uv supplies Python 3.12 (system python3 is 3.9)
+git clone https://github.com/AyaSakura-comp/pi-nodriver-browser.git
+cd pi-nodriver-browser
+./install.sh                       # finds /Applications/Google Chrome.app; no xvfb-run needed
+```
+
+Research uses 4get (`127.0.0.1:8088`) for three of its four searches, and Google through
+the browser for the fourth. Run 4get in Docker (OrbStack or Docker Desktop):
+
+```sh
+docker run -d --name 4get --restart unless-stopped -p 127.0.0.1:8088:80 \
+  -e FOURGET_PROTO=http luuul/4get:latest
+curl -s 'http://127.0.0.1:8088/api/v1/web?s=test' | head -c 200
+```
+
+For a local llama.cpp-style model with `reasoning: true`, the research planner needs to be
+able to turn thinking off. Set `compat.thinkingFormat` (for Qwen: `"qwen-chat-template"`) in
+`~/.pi/agent/models.json`, or research fails with `research_thinking_off_unsupported`.
+
+`PI_NODRIVER_MACOS_WINDOW=visible` shows the worker Chrome (for debugging).
+`PI_NODRIVER_VISION_FALLBACK=manual` avoids the OmniParser service if you have not deployed it.
+
+---
 
 ## 📚 Design Documents
 
