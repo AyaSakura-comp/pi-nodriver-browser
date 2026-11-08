@@ -65,8 +65,25 @@ class MacosProcessTests(unittest.TestCase):
              patch.object(browser_logic.shutil, 'which', return_value=None), \
              patch.object(browser_logic.os, 'access', side_effect=lambda p, m: str(p).startswith('/Applications/Google Chrome.app')):
             os.environ.pop('PI_NODRIVER_CHROME', None)
+            os.environ['PI_NODRIVER_MACOS_CLONE'] = '0'
             self.assertEqual(browser_logic.resolve_browser_executable(),
                              '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+
+    def test_runs_a_separate_chrome_identity_not_the_users_app(self):
+        clone = '/x/nodriver-chrome/Pi Agent Chrome.app/Contents/MacOS/Google Chrome'
+        with patch.dict('os.environ'), \
+             patch.object(browser_logic.shutil, 'which', return_value=None), \
+             patch.object(browser_logic.os, 'access', side_effect=lambda p, m: str(p).startswith('/Applications/Google Chrome.app')), \
+             patch.object(macos_window, 'agent_chrome', return_value=clone) as build:
+            os.environ.pop('PI_NODRIVER_CHROME', None)
+            os.environ.pop('PI_NODRIVER_MACOS_CLONE', None)
+            self.assertEqual(browser_logic.resolve_browser_executable(), clone)
+        build.assert_called_once_with('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+
+    def test_bundle_of_executable(self):
+        self.assertEqual(macos_window._bundle_of('/A/Google Chrome.app/Contents/MacOS/Google Chrome'),
+                         '/A/Google Chrome.app')
+        self.assertIsNone(macos_window._bundle_of('/usr/bin/chromium'))
 
 
 if __name__ == '__main__':

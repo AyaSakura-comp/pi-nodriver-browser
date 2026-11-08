@@ -1191,6 +1191,12 @@ def resolve_browser_executable() -> str:
             for root in (Path('/Applications'), Path.home() / 'Applications'):
                 executable = root / app
                 if os.access(executable, os.X_OK):
+                    if os.environ.get('PI_NODRIVER_MACOS_CLONE', '1') != '0':
+                        # Never run the user's own Chrome app: see macos_window.agent_chrome.
+                        import macos_window
+                        clone = macos_window.agent_chrome(str(executable))
+                        if clone:
+                            return clone
                     return str(executable)
     raise RuntimeError('Chrome or Chromium was not found; set PI_NODRIVER_CHROME')
 

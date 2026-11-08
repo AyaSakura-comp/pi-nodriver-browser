@@ -185,3 +185,90 @@ def hide_mode() -> str:
 
 def should_hide() -> bool:
     return IS_MACOS and hide_mode() == 'hidden'
+
+
+# --- A separate Chrome identity for the worker -------------------------------------------
+#
+# Running the worker with the user's own /Applications/Google Chrome.app makes two instances of
+# com.google.Chrome. LaunchServices then routes links opened from other apps (`open URL`, Mail,
+# Slack...) to either instance, including the hidden worker one, where they silently vanish.
+# The worker therefore runs a clone of Chrome with its own bundle id and no URL/document
+# handlers, so macOS never routes anything to it. Same binaries, so the browser still reports
+# itself as Google Chrome. The clone is ad-hoc signed; with --use-mock-keychain (worker.py) it
+# never asks for the user's "Chrome Safe Storage" keychain item.
+
+AGENT_BUNDLE_ID = 'com.pi.nodriver.chrome'
+AGENT_APP_NAME = 'Pi Agent Chrome'
+
+
+def agent_chrome_dir():
+    root = os.environ.get('PI_AGENT_DIR') or os.path.join(os.path.expanduser('~'), '.pi', 'agent')
+    return os.path.join(root, 'nodriver-chrome')
+
+
+def _bundle_of(executable):
+    """'/X/Google Chrome.app/Contents/MacOS/Google Chrome' -> '/X/Google Chrome.app'."""
+    parts = os.path.abspath(executable).split(os.sep)
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index].endswith('.app'):
+            return os.sep.join(parts[:index + 1])
+    return None
+
+
+def _plist(path, *commands):
+    for command in commands:
+        subprocess.run(['/usr/libexec/PlistBuddy', '-c', command, path],
+                       capture_output=True, text=True, timeout=10)
+
+
+def _plist_value(path, key):
+    result = subprocess.run(['/usr/libexec/PlistBuddy', '-c', f'Print :{key}', path],
+                            capture_output=True, text=True, timeout=10)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def agent_chrome(source_executable):
+    """Executable of the worker's own Chrome clone, (re)built from source_executable when it is
+    missing or the source Chrome was updated. Returns None when it cannot be built."""
+    source_app = _bundle_of(source_executable)
+    if not IS_MACOS or source_app is None:
+        return None
+    relative = os.path.relpath(source_executable, source_app)
+    target_app = os.path.join(agent_chrome_dir(), f'{AGENT_APP_NAME}.app')
+    target_exe = os.path.join(target_app, relative)
+    source_plist = os.path.join(source_app, 'Contents', 'Info.plist')
+    target_plist = os.path.join(target_app, 'Contents', 'Info.plist')
+    version = _plist_value(source_plist, 'CFBundleShortVersionString')
+    if (os.access(target_exe, os.X_OK) and version is not None
+            and _plist_value(target_plist, 'CFBundleShortVersionString') == version
+            and _plist_value(target_plist, 'CFBundleIdentifier') == AGENT_BUNDLE_ID):
+        return target_exe
+    try:
+        os.makedirs(agent_chrome_dir(), exist_ok=True)
+        staging = os.path.join(agent_chrome_dir(), f'.build-{os.getpid()}.app')
+        subprocess.run(['rm', '-rf', staging], check=True, timeout=120)
+        # APFS clone: no extra disk space; plain copy elsewhere.
+        if subprocess.run(['cp', '-cR', source_app, staging], capture_output=True, timeout=600).returncode:
+            subprocess.run(['cp', '-R', source_app, staging], check=True, capture_output=True, timeout=600)
+        subprocess.run(['xattr', '-cr', staging], capture_output=True, timeout=120)
+        plist = os.path.join(staging, 'Contents', 'Info.plist')
+        _plist(plist, f'Set :CFBundleIdentifier {AGENT_BUNDLE_ID}', f'Set :CFBundleName {AGENT_APP_NAME}',
+               'Delete :CFBundleURLTypes', 'Delete :CFBundleDocumentTypes', 'Delete :KSProductID')
+        _plist(plist, f'Add :CFBundleDisplayName string {AGENT_APP_NAME}',
+               f'Set :CFBundleDisplayName {AGENT_APP_NAME}')
+        # (LSUIElement would drop the Dock icon, but Chrome then fails to find its framework.)
+        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', staging],
+                       check=True, capture_output=True, timeout=600)
+        old = target_app + f'.old-{os.getpid()}'
+        if os.path.exists(target_app):
+            os.rename(target_app, old)
+        os.rename(staging, target_app)
+        subprocess.run(['rm', '-rf', old], capture_output=True, timeout=120)
+        # The first launch of a newly signed binary is assessed by the system; do it now, not
+        # inside nodriver's short DevTools connect window.
+        subprocess.run([target_exe, '--version'], capture_output=True, timeout=120)
+        return target_exe
+    except Exception:
+        subprocess.run(['rm', '-rf', os.path.join(agent_chrome_dir(), f'.build-{os.getpid()}.app')],
+                       capture_output=True)
+        return target_exe if os.access(target_exe, os.X_OK) else None

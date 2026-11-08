@@ -187,6 +187,15 @@ macOS has no Xvfb. The worker starts the same **headful** Chrome (not headless: 
 screen or takes keyboard focus. Your own Chrome is a separate process and is not touched.
 No Accessibility or Automation permission is needed.
 
+The worker never runs your own `Google Chrome.app`. With two running instances of
+`com.google.Chrome`, macOS can route links opened from other apps to the hidden one, where they
+vanish. Instead the worker builds an APFS clone at
+`~/.pi/agent/nodriver-chrome/Pi Agent Chrome.app`: same binaries, so pages still see Google
+Chrome; its own bundle id; no URL or document handlers; ad-hoc signed. It is rebuilt
+automatically when Chrome updates. It runs with `--use-mock-keychain`, so it never asks for your
+"Chrome Safe Storage" keychain item, and with its own profile (`~/.pi/agent/nodriver-profile`).
+`PI_NODRIVER_MACOS_CLONE=0` disables the clone, and `PI_NODRIVER_CHROME` overrides the browser.
+
 | Linux (Xvfb) | macOS |
 |---|---|
 | `xvfb-run` wraps the worker | `worker.py` is spawned directly (`worker-launch.ts`) |
@@ -196,6 +205,7 @@ No Accessibility or Automation permission is needed.
 | `xdotool` trusted clicks, `import` screenshots | CDP input and CDP screenshots (the existing fallback path) |
 | 1x Xvfb pixels | `--force-device-scale-factor=1`, so Retina does not double screenshots |
 | `/proc` for Chrome liveness | `ps` fallback (`pid_alive`, `chrome_debug_port`) |
+| System Chrome binary | Separate `Pi Agent Chrome.app` clone (own bundle id, mock keychain) |
 
 ```sh
 brew install poppler uv            # PDF extraction; uv supplies Python 3.12 (system python3 is 3.9)

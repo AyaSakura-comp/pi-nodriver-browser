@@ -4275,6 +4275,8 @@ class BrowserWorker:
                         # Retina would double every screenshot; Xvfb renders at 1x, which the
                         # vision coordinate mapping and image token budgets assume.
                         '--force-device-scale-factor=1',
+                        # Never touch the user's login keychain ("Chrome Safe Storage").
+                        '--use-mock-keychain',
                     ])
                 previous_front = macos_window.frontmost_pid()
                 self.browser = await uc.start(
