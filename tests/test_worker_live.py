@@ -147,17 +147,48 @@ class WorkerLiveTests(unittest.TestCase):
         result = self.ok('back')
         self.assertIn('/fixture.html', result['url'])
 
-        # Item links show where they go; menu links do not.
-        self.ref(result['snapshot'], r'link "Open report in new tab" → /newtab\.html')
-        self.ref(result['snapshot'], r'link "Menu results link"$')
+        # A link's address is not in its line: it comes beside the text, by ref.
+        report = self.ref(result['snapshot'], r'link "Open report in new tab"$')
+        self.assertEqual(result['links'][report], f'{self.base}/newtab.html')
         links = self.ok('get links')['text'].split('\n')
         self.assertIn(f'{self.base}/newtab.html', links)
-        self.assertIn('Scroll:', self.ok('scroll down')['snapshot'])
+        scrolled = self.ok('scroll down')
+        self.assertEqual(self.ref(scrolled['snapshot'], r'link "Open report in new tab"$'), report,
+                         'an element keeps its ref from one snapshot to the next')
         self.assertIn('/fixture.html', self.ok('press Escape')['url'])
 
         shot = self.ok('screenshot')
         self.assertTrue(Path(shot['path']).stat().st_size > 1000)
         self.ok('session-cleanup')
+
+    def test_whole_page_is_listed_wherever_it_is_scrolled_to(self):
+        # A body one screen tall with the content overflowing it (momo, PChome, 104, Yahoo,
+        # Wikipedia, YouTube): after two scrolls the snapshot was "(no visible text)".
+        first = self.ok(f'open {self.base}/tall.html', session='tall')
+        self.assertIn('Row 40 product', first['body'], 'the whole page, not one screen of it')
+        row = self.ref(first['body'], r'link "Row 30 product"')
+        for _ in range(3):
+            result = self.ok('scroll down', session='tall')
+        self.assertGreater(result['scrollY'], 1000)
+        self.assertEqual(result['body'], first['body'], 'scrolling a page that loads nothing changes nothing')
+        self.assertEqual(result['doc'], first['doc'])
+        self.assertEqual(self.ref(result['body'], r'link "Row 30 product"'), row)
+        body = first['body']
+        # A site menu (a nav of many links) stands after the content, not before it.
+        self.assertLess(body.index('Row 1 product'), body.index('Site menu:'))
+        self.assertLess(body.index('Site menu:'), body.index('分類 16'))
+        # Text that only says an element's name again is listed once.
+        self.assertEqual(body.count('快速到貨'), 1, body[-600:])
+        self.assertEqual(body.count('冰封散熱背夾 3 Pro'), 1, body[-600:])
+        self.assertIn('$1,990', body)
+        # Another page of the session goes on counting refs: none names two elements.
+        other = self.ok(f'open {self.base}/fixture.html', session='tall')
+        self.assertNotEqual(other['doc'], first['doc'])
+        used = {int(n) for n in re.findall(r'^\[e(\d+)\]', first['body'], re.M)}
+        again = {int(n) for n in re.findall(r'^\[e(\d+)\]', other['body'], re.M)}
+        self.assertFalse(used & again)
+        self.assertGreater(min(again), max(used))
+        self.ok('session-cleanup', session='tall')
 
     def test_open_dialog_is_listed_first(self):
         snap = self.ok(f'open {self.base}/modal.html', session='modal')['snapshot']

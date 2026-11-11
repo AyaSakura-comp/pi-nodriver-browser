@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>Tall page</title>
+<style>
+  /* Like momo, PChome, 104: the body is one screen tall and the content overflows it. */
+  html, body { height: 100%; margin: 0; }
+  .row { height: 120px; }
+  nav a { display: inline-block; margin: 2px; }
+</style>
+</head>
+<body>
+<nav id="menu"></nav>
+<div id="list"></div>
+<label><input type="checkbox" id="fast"> 快速到貨</label>
+<span>快速到貨</span>
+<div class="card">
+  <div><img alt="冰封散熱背夾 3 Pro" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" width="60" height="60"></div>
+  <a href="/results.html?q=card-name">冰封散熱背夾 3 Pro</a>
+  <div>$1,990</div>
+</div>
+<script>
+  const menu = document.getElementById('menu');
+  for (let i = 1; i <= 16; i++) menu.insertAdjacentHTML('beforeend', `<a href="/results.html?q=menu${i}">分類 ${i}</a>`);
+  const list = document.getElementById('list');
+  for (let i = 1; i <= 40; i++) list.insertAdjacentHTML('beforeend', `<div class="row"><a href="/results.html?q=row${i}">Row ${i} product</a> <span>$${i}00</span></div>`);
+</script>
+</body>
+</html>

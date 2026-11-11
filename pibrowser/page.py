@@ -263,8 +263,9 @@ class Tab:
         except (CDPError, PageError):
             return 0
 
-    async def snapshot(self, *, from_viewport=False):
-        return await self.call(SNAPSHOT_JS, from_viewport)
+    async def snapshot(self, *, base=0):
+        """base: the highest ref the session has used, so a new document's refs go on from it."""
+        return await self.call(SNAPSHOT_JS, base)
 
     async def click_ref(self, ref):
         target = await self.call(TARGET_JS, ref)

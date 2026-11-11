@@ -58,7 +58,7 @@ const DESCRIPTION = `Live browser autopilot on the shared, logged-in Chrome. Giv
 - TASK_NEEDS_CONFIRM: the next step is irreversible (buy, pay, submit an order, delete, log out, or add to cart when not asked). Ask the user; call again with confirm=true only if they agree.
 - TASK_BLOCKED: CAPTCHA, anti-bot or app-only wall. Tell the user; do not retry it or work around it (no verification clicks, curl, site APIs or proxies).
 - TASK_STOPPED / TASK_FAILED: not reached; steps show how far it got.
-A screenshot of where it ended is attached.`;
+The result names a screenshot of where it ended; the image itself is attached when the task did not finish.`;
 
 const GUIDELINES = [
   "When the user asks to use the browser or to act on a website (用瀏覽器、打開網站、幫我點/登入/填表/操作), call browser_intent, not research.",
@@ -96,7 +96,8 @@ function summary(result: TaskResult, goal: string, planner: string): string {
   if (result.steps.length) lines.push("", "步驟：", ...result.steps.map((s, i) => `${i + 1}. ${s}`));
   if (result.url) lines.push("", `目前頁面：${result.title || ""} ${result.url}`);
   if (result.screenshot) lines.push(`截圖：[[image: ${result.screenshot}]]`);
-  lines.push(`（${(result.elapsed_ms / 1000).toFixed(1)}s；規劃模型 ${planner}）`);
+  const waited = result.wait_ms > 2000 ? `，其中 ${(result.wait_ms / 1000).toFixed(0)}s 在等模型空檔` : "";
+  lines.push(`（${(result.elapsed_ms / 1000).toFixed(1)}s${waited}；規劃模型 ${planner}）`);
   return lines.join("\n");
 }
 
@@ -131,8 +132,10 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
       const session = `intent-${ctx.sessionManager.getSessionId()}`;
       const task = (queues.get(session) ?? Promise.resolve()).then(() => runBrowserTask({
         goal, url, confirm: params.confirm === true, session, worker, llm, fallbackLlm: DEFAULT_LLM,
-        // The hard limit counts from the start of this task, not from the wait in the queue.
-        signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(170_000)]),
+        // The hard limit counts from the start of this task, not from the wait in the queue. The
+        // task ends itself first: after 150 s of its own work, or 300 s on the clock when the
+        // engine was busy with other requests.
+        signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(320_000)]),
         onProgress: (line) => {
           const stamped = `${((Date.now() - started) / 1000).toFixed(1)}s ${line}`;
           lines.push(stamped);
@@ -145,8 +148,12 @@ export default function registerBrowserIntent(pi: ExtensionAPI, worker: WorkerLi
         if (queues.get(session) === settled) queues.delete(session);
       });
       const details = { ...result, planner: result.planner_switched ? `${note} → ${DEFAULT_MODEL} (fallback)` : note };
-      const content: any[] = [{ type: "text" as const, text: `${summary(result, goal, note)}\n\n\`\`\`json\n${JSON.stringify(details, null, 1)}\n\`\`\`` }];
-      if (result.screenshot) {
+      // The summary says everything the model needs (the same fields as JSON after it doubled the
+      // result's size); details carry the fields for the UI. A finished task's answer was checked
+      // against the pages, so its screenshot is named, not attached: an image costs the
+      // conversation's model an encode and its tokens.
+      const content: any[] = [{ type: "text" as const, text: summary(result, goal, note) }];
+      if (result.screenshot && result.status !== "TASK_DONE") {
         try {
           content.push({ type: "image" as const, data: readFileSync(result.screenshot).toString("base64"), mimeType: "image/jpeg" });
         } catch {}

@@ -1,18 +1,35 @@
 // Page snapshot for the browser agent. Runs in an isolated world: page scripts
 // cannot see window.__pi, and page monkey-patching cannot change these builtins.
-// Walks the DOM in document order and emits visible text lines with interactive
-// elements inline as "[eN] role "name"", so prices stay next to their product link.
-// Refs are kept in window.__pi.refs until the next snapshot.
-// fromViewport: leave out blocks scrolled above the viewport (after a scroll).
-((fromViewport) => {
-  const MAX_CHARS = 14000;
-  const MAX_ELEMENTS = 600;
-  const TIME_BUDGET_MS = 1500;
+// Walks the whole DOM in document order (not only what is on screen: the agent reads
+// a long page in parts, without scrolling) and emits visible text lines with
+// interactive elements inline as "[eN] role "name"", so prices stay next to their
+// product link.
+// A ref belongs to its element for as long as the document lives: the same element
+// keeps its ref in every snapshot, so an unchanged line is the same text again (the
+// agent shows only new lines) and several actions can follow one snapshot. Numbers
+// start after `base`, the highest ref this browser session has used, so a ref never
+// names two elements in one task.
+((base) => {
+  const MAX_CHARS = 120000;
+  const MAX_ELEMENTS = 3000;
+  const TIME_BUDGET_MS = 2500;
   const started = performance.now();
   const state = window.__pi || (window.__pi = {});
-  const refs = state.refs = new Map();
+  if (!state.doc) {
+    state.doc = Math.random().toString(36).slice(2, 10);
+    state.ids = new WeakMap();
+    state.refs = new Map();
+    state.next = 0;
+  }
+  state.next = Math.max(state.next, base || 0);
+  const refs = state.refs;
+  for (const [ref, el] of refs) if (!el.isConnected) refs.delete(ref);
+  const links = {};
   const vh = window.innerHeight;
-  const lines = [];
+  let lines = [];
+  const body = lines;
+  const menu = [];
+  let lastName = '';
   let chars = 0;
   let count = 0;
   let truncated = false;
@@ -37,18 +54,26 @@
     s = String(s || '').replace(/\s+/g, ' ').trim();
     return s.length > n ? s.slice(0, n - 1) + '…' : s;
   };
-  const push = (line) => {
+  // name: the name of the element this line lists. The text right after an element often
+  // says its name again (a checkbox and its label text, a card's image alt and its link).
+  const push = (line, name) => {
     if (truncated) return;
     if (!line || line === lines[lines.length - 1]) return;
+    if (name === undefined && lastName && (line === lastName || line === `[img ${lastName}]`)) return;
+    if (name && lines[lines.length - 1] === `[img ${name}]`) chars -= lines.pop().length + 1;
     if (chars + line.length > MAX_CHARS || performance.now() - started > TIME_BUDGET_MS) {
       truncated = true;
       return;
     }
     lines.push(line);
     chars += line.length + 1;
+    lastName = name || '';
   };
   const flush = () => {
-    if (buffer.length) push(clean(buffer.join(' '), 400));
+    if (buffer.length) {
+      const said = lastName ? buffer.filter((text) => text !== lastName && text !== `[img ${lastName}]`) : buffer;
+      if (said.length) push(clean(said.join(' '), 400));
+    }
     buffer = [];
   };
 
@@ -128,8 +153,13 @@
   };
 
   const describe = (el, role) => {
-    const ref = 'e' + (++count);
+    let ref = state.ids.get(el);
+    if (!ref) {
+      ref = 'e' + (++state.next);
+      state.ids.set(el, ref);
+    }
     refs.set(ref, el);
+    count++;
     const [name, placeholder] = nameOf(el);
     let line = `[${ref}] ${role}`;
     if (name || !placeholder) line += ` "${name}"`;
@@ -154,18 +184,11 @@
       if (el.getAttribute('aria-current') && el.getAttribute('aria-current') !== 'false') line += ' current';
     }
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') line += ' disabled';
-    // Item links (a job, a product, an article) show where they go, so an answer can give
-    // real links; menus and short links do not, to keep the snapshot small.
-    if (role === 'link' && /^https?:/.test(el.href || '') && name.length >= 4 &&
-        !el.closest('nav,header,footer,[role=navigation]')) {
-      try {
-        const u = new URL(el.href);
-        if (u.href.split('#')[0] !== location.href.split('#')[0]) {
-          line += ` → ${clean(u.origin === location.origin ? u.pathname + u.search : u.host + u.pathname + u.search, 100)}`;
-        }
-      } catch (e) {}
-    }
-    return line;
+    // Where a link goes is returned beside the text, not in it: addresses were 30-56% of a
+    // snapshot's characters and, cut to fit, could not be used in an answer anyway. An answer
+    // names a link by its ref and the agent puts the address in.
+    if (role === 'link' && /^https?:/.test(el.href || '')) links[ref] = el.href;
+    return [line, name];
   };
 
   // clip: the visible box left by ancestors with overflow hidden/clip (null = none).
@@ -211,7 +234,19 @@
     const sized = rect.width > 0 || rect.height > 0;
     if (s.position === 'fixed') clip = null;
     if (clip && sized && !intersects(rect, clip)) return;
-    if (fromViewport && block && rect.bottom < -20 && s.position !== 'fixed' && s.position !== 'sticky') return;
+    // A site menu (a nav with many links and no field to type in) is listed after the page:
+    // it stood before the content on every page of the site.
+    if (lines === body && (el.tagName === 'NAV' || el.getAttribute('role') === 'navigation') &&
+        el.querySelectorAll('a[href]').length > 12 && !el.querySelector('input:not([type=hidden]),select,textarea')) {
+      flush();
+      lines = menu;
+      lastName = '';
+      for (const child of el.childNodes) walk(child, clip);
+      flush();
+      lines = body;
+      lastName = '';
+      return;
+    }
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
       flush();
       let doc = null;
@@ -250,7 +285,7 @@
         recentLinks.push({href: el.href, name: nameOf(el)[0]});
         if (recentLinks.length > 4) recentLinks.shift();
       }
-      push(describe(el, role));
+      push(...describe(el, role));
       // A card-sized link or clickable container can hold real buttons: keep walking it.
       if ((role === 'link' || role === 'clickable') && el.querySelector(NESTED)) {
         for (const child of el.childNodes) walk(child, clip);
@@ -286,11 +321,19 @@
   }
   if (document.body) walk(document.body, null);
   flush();
+  if (menu.length) {
+    lastName = '';
+    push('Site menu:');
+    for (const line of menu) lines.push(line);
+  }
   const scroller = document.scrollingElement || document.documentElement;
   return {
     url: location.href,
     title: document.title,
     text: lines.join('\n'),
+    doc: state.doc,
+    lastRef: state.next,
+    links,
     elements: count,
     truncated,
     scrollY: Math.round(window.scrollY),

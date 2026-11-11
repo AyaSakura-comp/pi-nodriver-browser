@@ -34,8 +34,10 @@ class FakeTab:
     async def http_status(self):
         return self.chrome.status
 
-    async def snapshot(self, *, from_viewport=False):
-        return {'url': self.url, 'title': 'T', 'text': f'page {self.url}', 'elements': 0}
+    async def snapshot(self, *, base=0):
+        self.chrome.bases.append(base)
+        return {'url': self.url, 'title': 'T', 'text': f'page {self.url}', 'elements': 0, 'doc': 'd' + self.url[8],
+                'lastRef': base + 5, 'links': {f'e{base + 1}': self.url}}
 
     async def back(self):
         return False  # the tab's first page
@@ -54,6 +56,7 @@ class FakeChrome:
 
     def __init__(self, profile, log_path):
         self.conn = FakeConn()
+        self.bases = []
         self.targets = {}
         self.closed = []
         self.probe_ok = True
@@ -281,6 +284,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.chrome.targets.clear()  # e.g. browser restart or the page closed itself
         result = await self.service.execute('snapshot', 's1')
         self.assertIn('https://a.example/', result['text'])
+
+    async def test_refs_go_on_counting_over_a_sessions_pages_and_the_result_has_the_parts(self):
+        first = await self.service.execute('open https://a.example/', 's1')
+        second = await self.service.execute('open https://b.example/', 's1')
+        other = await self.service.execute('open https://c.example/', 's2')
+        self.assertEqual(self.chrome.bases, [0, 5, 0], 'a ref never names two elements in one session')
+        self.assertEqual(first['body'], 'page https://a.example/')
+        self.assertEqual(first['links'], {'e1': 'https://a.example/'})
+        self.assertNotEqual(first['doc'], second['doc'])
+        self.assertEqual(second['links'], {'e6': 'https://b.example/'})
+        self.assertEqual(other['notes'], [])
+        self.assertIn('---\npage https://a.example/', first['snapshot'])
 
     async def test_back_on_a_popups_first_page_closes_it_and_returns_to_its_opener(self):
         await self.service.execute('open https://a.example/', 's1')

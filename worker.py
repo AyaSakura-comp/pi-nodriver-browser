@@ -95,7 +95,7 @@ def format_snapshot(snap, *, status=0, dialogs=(), note=''):
     header += [f'Dialog closed automatically: {dialog}' for dialog in dialogs]
     if note:
         header.append(note)
-    tail = '\n(… snapshot truncated; scroll down for more)' if snap.get('truncated') else ''
+    tail = '\n(… the page goes on past what could be listed)' if snap.get('truncated') else ''
     return '\n'.join(header) + '\n---\n' + (snap.get('text') or '(no visible text)') + tail
 
 
@@ -107,6 +107,7 @@ def is_challenge(title, text):
 class SessionState:
     def __init__(self):
         self.stack = []  # tabs; the last one is current (popups stack on their opener)
+        self.ref_base = 0  # the highest element ref used: refs stay unique over the session's pages
         self.last_url = None
         self.last_used = time.monotonic()
 
@@ -297,15 +298,22 @@ class BrowserService:
         await tab.wait_ready(8, quiet=0.6, blank_ok=not note)
         return tab, note
 
-    async def page_result(self, session_id, tab, *, action, note='', from_viewport=False):
+    async def page_result(self, session_id, tab, *, action, note=''):
         status = await tab.http_status()
-        snap = await tab.snapshot(from_viewport=from_viewport)
         state = self.sessions[session_id]
+        snap = await tab.snapshot(base=state.ref_base)
+        state.ref_base = max(state.ref_base, snap.get('lastRef') or 0)
         state.last_url = snap.get('url') or state.last_url
         dialogs, tab.dialogs = tab.dialogs, []
         text = format_snapshot(snap, status=status, dialogs=dialogs, note=note)
+        # 'snapshot' is the page as one text (header, ---, lines). The agent reads the parts:
+        # 'body' (the lines), 'doc' (changes with the document), 'links' (ref -> address) and 'notes'.
+        notes = [f'Dialog closed automatically: {dialog}' for dialog in dialogs] + ([note] if note else [])
         return {'action': action, 'url': snap.get('url'), 'title': snap.get('title'), 'httpStatus': status,
-                'elements': snap.get('elements'), 'text': text, 'snapshot': text}
+                'elements': snap.get('elements'), 'text': text, 'snapshot': text,
+                'body': snap.get('text') or '', 'doc': f"{tab.target_id[:8]}.{snap.get('doc', '')}",
+                'links': snap.get('links') or {}, 'truncated': bool(snap.get('truncated')), 'notes': notes,
+                'scrollY': snap.get('scrollY', 0), 'scrollHeight': snap.get('scrollHeight', 0)}
 
     # ---- commands --------------------------------------------------------
     async def execute(self, command, session_id='default'):
@@ -373,7 +381,7 @@ class BrowserService:
         if action == 'scroll':
             await tab.scroll(args[0] if args else 'down')
             await tab.wait_ready(3, quiet=0.4)
-            return await self.page_result(session_id, tab, action='scroll', from_viewport=True)
+            return await self.page_result(session_id, tab, action='scroll')
         if action == 'click':
             started = time.monotonic()
             method = await tab.click_ref(args[0])
