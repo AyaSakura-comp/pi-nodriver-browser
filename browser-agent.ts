@@ -488,9 +488,9 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     let told = 0;
     const timer = setInterval(() => {
       const waited = Math.round((Date.now() - t) / 1000);
-      if (waited >= (told ? told + 20 : 8)) {
+      if (waited >= (told ? told + 20 : 10)) {
         told = waited;
-        progress(`⏳ waiting for the model (${waited}s)`);
+        progress(`⏳ model: ${waited}s (reading a long page, or busy with another request)`);
       }
     }, 1000);
     try {
