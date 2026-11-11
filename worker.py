@@ -54,10 +54,10 @@ SLOW_PROBE_SECONDS = 20.0
 # How a session page's wait tells "still loading" from noise (measured on 22 sites' load
 # timelines, 2026-11-11): changes under 1% do not restart the quiet period (22 opens took
 # 46-51 s instead of 63-65 s and the same pages came out whole), and a page with almost no
-# text waits longer (an app shell before its results).
-SETTLE = {'tolerance': 0.01, 'thin': 200}
+# text (under 50 characters: Google Maps' shell has 1) waits longer for its results.
+SETTLE = {'tolerance': 0.01, 'thin': 50}
 LOADING_JS = ("(() => { const t = document.body ? document.body.innerText : ''; "
-              "return /載入中|讀取中|加载中|請稍候|请稍候|loading\\s?(\\.\\.\\.|…)|読み込み中/i.test(t.length > 30000 ? t.slice(0, 30000) : t); })()")
+              "return /載入中|讀取中|加载中|loading\\s?(\\.\\.\\.|…)|読み込み中/i.test(t.length > 30000 ? t.slice(0, 30000) : t); })()")
 POPUP_URL = re.compile(r'(https?:|about:blank)')
 JS_DIR = HERE / 'pibrowser' / 'js'
 GOOGLE_RESULTS_JS = (JS_DIR / 'google_results.js').read_text()
@@ -378,8 +378,8 @@ class BrowserService:
             await tab.send('Page.bringToFront', timeout=3)
             await tab.goto(url)
             await tab.wait_ready(10, quiet=0.6, **SETTLE)
-            await self.wait_out_challenge(tab)
-            await self.wait_out_loading(tab)
+            if not await self.wait_out_challenge(tab):
+                await self.wait_out_loading(tab)
             return await self.page_result(session_id, tab, action='open')
         tab = await self.session_tab(session_id)
         note = ''
@@ -452,16 +452,18 @@ class BrowserService:
 
     async def wait_out_challenge(self, tab, limit=8.0):
         """A Cloudflare-style interstitial usually lets a real browser through by itself within
-        seconds. Wait for that (never reload: repeated loads escalate the block)."""
+        seconds. Wait for that (never reload: repeated loads escalate the block). True when the
+        interstitial is still there at the end."""
         deadline = time.monotonic() + limit
         waited = False
         while time.monotonic() < deadline:
             if not CHALLENGE_TITLE.search(str(await tab.eval('document.title', timeout=3) or '')):
                 if waited:
                     await tab.wait_ready(8, quiet=0.6, **SETTLE)
-                return
+                return False
             waited = True
             await asyncio.sleep(1.0)
+        return True
 
     async def browser_health(self):
         if self.browser is None:
