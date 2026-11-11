@@ -21,6 +21,8 @@
     <button id="nothing">沒有反應的按鈕</button>
     <button id="later" onclick="document.getElementById('out').textContent = '查詢中…'; setTimeout(() => { document.getElementById('out').textContent = '15:11 發車 0837 次'; }, 700)">查詢時刻</button>
     <div id="out"></div>
+    <button id="stock" onclick="document.getElementById('out2').textContent = ''; fetch('/slow-report.html').then(() => { document.getElementById('out2').textContent = '庫存 12 件'; })">查庫存</button>
+    <div id="out2">尚未查詢</div>
     <a id="slowlink" href="/slow-report.html">慢的報表</a>
   </article>
 </main>

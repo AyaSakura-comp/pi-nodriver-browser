@@ -25,6 +25,9 @@ class FakeTab:
         self.url = url
         await self.chrome.navigate_hook(self, url)
 
+    async def watch_network(self):
+        pass
+
     async def ready_state(self, timeout=3.0):
         return ['complete', 0, 0, self.url]
 

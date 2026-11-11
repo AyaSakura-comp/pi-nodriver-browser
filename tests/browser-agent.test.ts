@@ -279,7 +279,7 @@ function session(replies: string[], pages: Record<string, { doc: string; body: s
   }) as typeof fetch;
   const run = (goal: string, extra: Record<string, unknown> = {}) =>
     runBrowserTask({ goal, session: "t", worker, llm: { endpoint: "http://llm/v1/chat/completions", model: "m", local: true },
-      url: "https://shop.example/list", ...extra }).finally(() => { globalThis.fetch = realFetch; });
+      url: "https://shop.example/list", lookAgainMs: 0, ...extra }).finally(() => { globalThis.fetch = realFetch; });
   const chats = () => requests.filter((r) => !r.url.endsWith("/hold"));
   return { sent, requests, chats, run };
 }

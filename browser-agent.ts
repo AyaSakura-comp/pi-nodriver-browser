@@ -41,6 +41,8 @@ export interface TaskOptions {
   fallbackLlm?: LlmConfig;
   signal?: AbortSignal;
   onProgress?: (line: string) => void;
+  /** Milliseconds between looks at a page on which "more" found nothing new (tests pass 0). */
+  lookAgainMs?: number;
 }
 
 export type TaskStatus = "TASK_DONE" | "TASK_UNVERIFIED" | "TASK_STOPPED" | "TASK_FAILED"
@@ -131,6 +133,7 @@ const MAX_BATCH = 6;             // actions in one reply
 const OWN_BUDGET_MS = 150_000;   // browser time + the model's reading and writing; time queued behind other requests is not counted
 const WALL_LIMIT_MS = 300_000;   // however long the queue: the task ends here
 const REBASE_CHARS = 160_000;    // conversation size at which earlier pages are dropped
+const LOOK_AGAIN_MS = 500;       // between looks at a page "more" found nothing new on (7 looks)
 const HOLD_SECONDS = 20;         // how long the engine waits for this task's next step (a slow page load)
 
 /** Escape raw newlines/tabs inside JSON strings: models often write a multi-line answer literally. */
@@ -826,11 +829,18 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         if (kind === "more") {
           // Nothing left to show: look at the page again first. What a click started may have
           // arrived since (a timetable's results came in after the page had gone quiet).
+          // The planner expects more than the page shows: give a late result up to 3 s (the THSR
+          // timetable came over 2 s after its page; with nothing new the planner searched again).
           let fresh = false;
           if (view.open && !view.pending()) {
-            try {
-              fresh = adopt(await browser("snapshot", "look again")).changed;
-            } catch {}
+            for (let look = 0; look < 7 && !fresh; look++) {
+              if (look) await new Promise((resolve) => setTimeout(resolve, options.lookAgainMs ?? LOOK_AGAIN_MS));
+              try {
+                fresh = adopt(await browser("snapshot", "look again")).changed;
+              } catch {
+                break;
+              }
+            }
           }
           const text = block(fresh ? "update" : "more");
           shownAs = "more";

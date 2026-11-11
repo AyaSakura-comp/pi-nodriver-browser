@@ -256,6 +256,8 @@ class BrowserService:
         await self._evict_session_tabs(keep=session_id)
         tab = await self.browser.new_tab(new_window=True)
         state.stack.append(tab)
+        with contextlib.suppress(CDPError):
+            await tab.watch_network()
         return tab
 
     async def _evict_session_tabs(self, keep):
@@ -295,11 +297,13 @@ class BrowserService:
         state = self.sessions[session_id]
         note = ''
         popup = lambda: self._new_popup(tab.target_id, started)
-        await tab.wait_ready(8, quiet=0.5, react=(before, 1.0), stop=popup, **SETTLE)
+        await tab.wait_ready(8, quiet=0.5, react=(before, 1.0), stop=popup, data_since=started, **SETTLE)
         opened = popup()
         if opened is not None:
             tab = await Tab.attach(self.browser, opened['targetId'])
             state.stack.append(tab)
+            with contextlib.suppress(CDPError):
+                await tab.watch_network()
             if len(state.stack) > 3:
                 await state.stack.pop(0).close()
             await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
@@ -411,8 +415,9 @@ class BrowserService:
                 # A suggestion list may open: wait for it to stand, or 0.4 s when nothing shows.
                 await tab.wait_ready(2, quiet=0.2, react=(before, 0.4))
         elif action == 'select':
+            started = time.monotonic()
             note = f'Selected: {await tab.select_ref(args[0], args[1])}'
-            await tab.wait_ready(5, quiet=0.4, react=(before, 0.3), **SETTLE)
+            await tab.wait_ready(5, quiet=0.4, react=(before, 0.3), data_since=started, **SETTLE)
         elif action == 'press':
             started = time.monotonic()
             await tab.press(args[0])

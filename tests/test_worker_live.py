@@ -211,6 +211,10 @@ class WorkerLiveTests(unittest.TestCase):
         # A click whose result comes 0.7 s after a "loading" line: the result is in the snapshot.
         later = self.ok(f"click {self.ref(body, 'button \"查詢時刻\"')}", session='chrome')
         self.assertIn('15:11 發車 0837 次', later['body'])
+        # A click that empties a line at once and fills it when its request returns 1.5 s later
+        # (momo's page 2 said "no such product" meanwhile): the wait is for the request.
+        stock = self.ok(f"click {self.ref(body, 'button \\"查庫存\\"')}", session='chrome')
+        self.assertIn('庫存 12 件', stock['body'])
         # A link whose server takes 1.5 s to answer: the wait is for the new page, not the old one.
         slow = self.ok(f"click {self.ref(body, 'link \"慢的報表\"')}", session='chrome')
         self.assertIn('slow-report.html', slow['url'])

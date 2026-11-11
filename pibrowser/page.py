@@ -9,6 +9,7 @@ import contextlib
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .cdp import CDPClosed, CDPError, CDPTimeout
 
@@ -145,6 +146,13 @@ KEYS = {
 }
 
 
+def site_of(url):
+    """The site a URL belongs to: its last two host labels, three under com.tw/gov.tw/co.jp and the like."""
+    parts = (urlsplit(url or '').hostname or '').split('.')
+    wide = len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ('com', 'gov', 'net', 'org', 'edu', 'co', 'idv', 'ne', 'or', 'ac')
+    return '.'.join(parts[-3 if wide else -2:])
+
+
 class PageError(Exception):
     pass
 
@@ -163,6 +171,7 @@ class Tab:
         self.created = time.monotonic()
         self.main_frame = target_id
         self.nav_pending = False   # a navigation of the main frame has started and not yet shown its document
+        self.requests = {}         # the page's own XHR/fetch requests in flight: id -> start (after watch_network())
 
     @classmethod
     async def attach(cls, chrome, target_id, *, timeout=5.0):
@@ -201,6 +210,35 @@ class Tab:
     def _on_frame_stopped(self, params):
         if params.get('frameId') == self.main_frame:
             self.nav_pending = False
+
+    async def watch_network(self):
+        """Follow the page's XHR/fetch requests to its own site, for the wait after an action:
+        momo's page 2 stood as "no such product" for a second while its request was out, and
+        the THSR timetable came 2 s after its page. (Other sites' requests are ads and
+        trackers; they never end on some pages.)"""
+        conn = self.chrome.conn
+        conn.on('Network.requestWillBeSent', self._on_request, session=self.session)
+        conn.on('Network.loadingFinished', self._on_request_done, session=self.session)
+        conn.on('Network.loadingFailed', self._on_request_done, session=self.session)
+        await self.send('Network.enable', timeout=5)
+
+    def _on_request(self, params):
+        if params.get('type') not in ('XHR', 'Fetch'):
+            return
+        url = (params.get('request') or {}).get('url', '')
+        if site_of(url) == site_of(params.get('documentURL', '')):
+            if len(self.requests) > 300:
+                self.requests.clear()
+            self.requests[params.get('requestId')] = time.monotonic()
+
+    def _on_request_done(self, params):
+        self.requests.pop(params.get('requestId'), None)
+
+    def data_pending(self, since, max_age=3.0):
+        """Is a request of the page's own that started after `since` still out? One out for
+        longer than max_age is not counted (a long poll, a log call that never ends)."""
+        now = time.monotonic()
+        return any(at >= since and now - at < max_age for at in self.requests.values())
 
     async def _answer_dialog(self, accept):
         with contextlib.suppress(CDPError):
@@ -261,7 +299,7 @@ class Tab:
             return None
 
     async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True,
-                         tolerance=0.0, thin=0, react=None, stop=None):
+                         tolerance=0.0, thin=0, react=None, stop=None, data_since=None):
         """Wait until the document is parsed and its text and element count stop changing
         for `quiet` seconds. Returns False at the deadline (the page may still be usable).
         blank_ok=False: a tab still on about:blank is not ready (a popup that has not
@@ -276,7 +314,9 @@ class Tab:
         within `seconds`, the action changed nothing and the wait ends. A page that did react
         without leaving its document is also given those `seconds` at least: a result often
         comes a moment after the first sign of it (a pressed button, a "searching" line).
-        stop: called at every look; a true result ends the wait (a popup has opened)."""
+        stop: called at every look; a true result ends the wait (a popup has opened).
+        data_since: a quiet page is waited for a little longer (3.5 s in all) while a request
+        of its own that started after this time is still out (needs watch_network())."""
         started = time.monotonic()
         deadline = started + timeout
         base = None
@@ -308,7 +348,8 @@ class Tab:
                         and abs(state[2] - base[1]) <= (max(10, tolerance * base[1]) if tolerance else 0))
                 if same:
                     if now - since >= (quiet * 2.5 if state[1] < thin else quiet) and (navigated or now >= floor):
-                        return True
+                        if data_since is None or now - started >= 3.5 or not self.data_pending(data_since):
+                            return True
                 else:
                     base, since = (state[1], state[2], state[3]), now
             elif reacted:
