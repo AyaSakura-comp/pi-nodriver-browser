@@ -53,13 +53,35 @@ Events (start, probe failures, restarts, timeouts) go to stderr (the unit's jour
 ## browser_intent
 
 `{url?, goal, confirm?}`. One LLM (the conversation's model, or local `qwen3.8-flash`)
-reads a page snapshot and answers with one JSON action per step (click, type, select,
-press, scroll, back, google, open, done, stop) until the goal is met. The snapshot lists
-visible text in page order with interactive elements inline as `[eN] role "name"`, so a
-price sits next to its product link; item links show where they go (`→ /path`). Results
-are `TASK_DONE` (evidence found on the page), `TASK_UNVERIFIED`, `TASK_NEEDS_INPUT`,
-`TASK_NEEDS_CONFIRM` (irreversible steps need `confirm=true`), `TASK_BLOCKED`,
-`TASK_STOPPED` or `TASK_FAILED`, with a final screenshot.
+drives the browser with JSON actions (click, type, select, press, more, scroll, back,
+google, open, done, stop) until the goal is met. Results are `TASK_DONE` (evidence found
+on the pages seen), `TASK_UNVERIFIED`, `TASK_NEEDS_INPUT`, `TASK_NEEDS_CONFIRM`
+(irreversible steps need `confirm=true`), `TASK_BLOCKED`, `TASK_STOPPED` or `TASK_FAILED`,
+with a final screenshot and a trace of every model call and browser command.
+
+It is built for an inference engine with one slot whose state cannot be cut back (Strata):
+
+- **One growing conversation.** Each model call repeats what was sent before and adds the
+  result of the last action, so the engine reads only the new tokens. Nothing that changes
+  per step stands before the page text.
+- **Whole pages, read in parts.** A snapshot lists the page's text from top to end, not one
+  screen of it, with interactive elements inline as `[eN] role "name"` (a price sits next to
+  its product link). The model gets 10,000 characters at a time; `more` shows the next part.
+  `scroll` only makes a page load more items.
+- **Updates, not repeats.** An element keeps its ref for as long as its document lives, and
+  refs keep counting over the pages of a session. After an action on the same page the
+  model gets only the new or changed lines.
+- **The conversation is the memory.** Earlier pages stay in it; `done` evidence may come
+  from any page of the task. A link is given by its ref (`[e12]` in the answer becomes the
+  address): addresses are not in the page text.
+- **Several actions in one reply** for a form (an array); it stops at the first action that
+  fails or leaves the page.
+- **No loops.** An action already done on the same page state is not run again; the third
+  time it is chosen the task stops.
+- **The engine is held for the task.** Requests carry Strata's `"hold": {key, seconds,
+  keep: false}`: other clients wait between the task's steps instead of each step waiting
+  behind them, and no session file is written for the task. `POST /v1/hold` lets go at the
+  end. The time budget (150 s) counts the task's own work, not time queued (300 s at most).
 
 ## research
 
