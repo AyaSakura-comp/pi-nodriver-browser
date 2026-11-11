@@ -85,7 +85,9 @@ It is built for an inference engine with one slot whose state cannot be cut back
   page that shows no reaction within a second is taken as is. Changes under 1% (ad slots,
   tickers) do not restart the quiet period, a page with almost no text waits longer (an app
   shell before its results), and a page that says it is loading ("載入中") is waited for up
-  to 3 s.
+  to 3 s. After an action, a quiet page is waited for up to 3.5 s while an XHR/fetch to its
+  own site that the action started is still out (other sites' requests are ads and
+  trackers). `more` on a page with nothing new looks at it again for 1.5 s.
 - **Walls.** A login or verification wall is pointed out to the model; when it is there
   again after the task tried another way in, the task ends (`TASK_NEEDS_INPUT` or
   `TASK_BLOCKED`) without another model call.
