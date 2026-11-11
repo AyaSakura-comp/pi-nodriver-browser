@@ -322,8 +322,9 @@ test("an answer may use a page seen earlier in the task", async () => {
 });
 
 test("a long page is read in parts with more, without scrolling", async () => {
-  const lines = Array.from({ length: 250 }, (_v, i) => `row ${i} ${"x".repeat(60)}`);
-  const h = session(['{"action":"more"}', '{"action":"more"}', '{"action":"done","answer":"row 249","evidence":["row 249"]}'], {
+  // 220 rows are about 15,000 characters: a first part of 6,000 and one more of up to 10,000.
+  const lines = Array.from({ length: 220 }, (_v, i) => `row ${i} ${"x".repeat(60)}`);
+  const h = session(['{"action":"more"}', '{"action":"more"}', '{"action":"done","answer":"row 219","evidence":["row 219"]}'], {
     'open "https://shop.example/list"': { doc: "d1", body: lines.join("\n") },
   });
   const result = await h.run("最後一列");
@@ -331,9 +332,10 @@ test("a long page is read in parts with more, without scrolling", async () => {
   assert.ok(!h.sent.some((c) => c.startsWith("scroll")));
   const chats = h.chats();
   assert.match(chats[0].messages[1].content, /first part \(\d+ more lines: \{"action":"more"\}/);
-  assert.ok(chats[0].messages[1].content.includes("row 0 ") && !chats[0].messages[1].content.includes("row 249 "));
+  assert.ok(chats[0].messages[1].content.includes("row 0 ") && !chats[0].messages[1].content.includes("row 100 "));
+  assert.ok(chats[0].messages[1].content.length < 7500);
   assert.match(chats[1].messages.at(-1).content, /^Next part of the page \(this is its end\)/);
-  assert.ok(chats[1].messages.at(-1).content.includes("row 249 "));
+  assert.ok(chats[1].messages.at(-1).content.includes("row 219 "));
   assert.match(chats[2].messages.at(-1).content, /^There is no more text on this page\./);
 });
 
@@ -386,23 +388,118 @@ test("a ref in the answer becomes the link's address", async () => {
   assert.equal(both.answer, "中文書 https://search.books.com.tw/redirect/move/item/1 ；有聲書版 https://search.books.com.tw/redirect/move/item/2 。");
 });
 
-test("going back and forth between two pages is stopped at the second round", async () => {
+test("a login wall that is back after another way in ends the task without another model call", async () => {
   // A login wall that prints the time and a request id is the same wall each time.
   const wall = (n: number) => `請登入\n看起來您尚未登入。請登入以繼續，或返回首頁。\n日期時間: 2026-11-11T02:49:0${n}Z\nID: 66340f1caf${n}-6a61-479f-881b-c8860f7016a2\n[e5] button "返回首頁"`;
   const home = '[e14] searchbox "搜尋"';
-  let visits = 0;
   const h = session(['{"action":"click","ref":"e5"}', '{"action":"type","ref":"e14","text":"手機散熱器","submit":true}',
-    '{"action":"click","ref":"e5"}', '{"action":"stop","status":"needs_input","reason":"需要登入"}'], {
-    'open "https://shop.example/list"': { doc: "w", body: wall(1) },
+    '{"action":"click","ref":"e5"}'], {
+    'open "https://shop.example/list"': { doc: "w", body: wall(1), url: "https://shop.example/verify/error" },
     "click e5": { doc: "h", body: home, url: "https://shop.example/" },
-    'type e14 "手機散熱器" --submit': { get doc() { return "w"; }, get body() { return wall(++visits + 1); } } as any,
+    'type e14 "手機散熱器" --submit': { doc: "w2", body: wall(2), url: "https://shop.example/verify/error" },
   });
   const result = await h.run("列出手機散熱器");
   assert.equal(result.status, "TASK_NEEDS_INPUT");
-  assert.equal(h.sent.filter((c) => c === "click e5").length, 1);
+  assert.match(result.reason ?? "", /login wall again/);
+  assert.match(result.reason ?? "", /看起來您尚未登入/);
+  assert.equal(result.model_calls, 2);
   const chats = h.chats();
-  assert.match(chats[0].messages[1].content, /looks like a login or verification wall/);
-  assert.match(chats[3].messages.at(-1).content, /Not done again: "click button "返回首頁"" was already done on this same page/);
+  assert.match(chats[0].messages[1].content, /This is a login or verification wall \(the site sent shop\.example\/list here\)/);
+});
+
+test("opening the walled address again also ends the task; a CAPTCHA wall is 'blocked'", async () => {
+  const wall = "Please verify you are human\n[e1] checkbox \"I am not a robot\" unchecked";
+  let n = 0;
+  const h = session(['{"action":"open","url":"https://shop.example/list"}', '{"action":"done","answer":"x","evidence":["x"]}'], {
+    'open "https://shop.example/list"': { get doc() { return `w${++n}`; }, body: wall } as any,
+  });
+  const result = await h.run("列出手機散熱器");
+  assert.equal(result.status, "TASK_BLOCKED");
+  assert.equal(result.model_calls, 1);
+});
+
+test("typing what the goal gives into a login page is not 'the wall is back'", async () => {
+  const step1 = '請登入\n[e1] textbox "帳號"\n[e2] button "下一步"';
+  const step2 = '請登入\n輸入密碼\n[e3] textbox "密碼" type=password\n[e4] button "登入"';
+  const h = session(['[{"action":"type","ref":"e1","text":"amy"},{"action":"click","ref":"e2"}]',
+    '{"action":"stop","status":"needs_input","reason":"需要密碼"}'], {
+    'open "https://shop.example/list"': { doc: "l1", body: step1 },
+    'type e1 "amy"': { doc: "l1", body: step1.replace('"帳號"', '"帳號" value="amy"') },
+    "click e2": { doc: "l2", body: step2 },
+  });
+  const result = await h.run("用帳號 amy 登入");
+  assert.equal(result.model_calls, 2);
+  assert.match(result.reason ?? "", /需要密碼/);
+});
+
+test("the same action on the same page state is not done twice", async () => {
+  const a = '[e1] link "下一頁"\n第一頁';
+  const b = '[e2] link "上一頁"\n第二頁';
+  const h = session(['{"action":"click","ref":"e1"}', '{"action":"click","ref":"e2"}', '{"action":"click","ref":"e1"}',
+    '{"action":"stop","status":"failed","reason":"x"}'], {
+    'open "https://shop.example/list"': { doc: "a", body: a },
+    "click e1": { doc: "b", body: b },
+    "click e2": { doc: "a", body: a },
+  });
+  await h.run("看第二頁");
+  assert.equal(h.sent.filter((c) => c === "click e1").length, 1);
+  assert.match(h.chats()[3].messages.at(-1).content, /Not done again: "click link "下一頁"" was already done on this same page/);
+});
+
+test("each action of a reply shows what it changed, not only the last one", async () => {
+  const list = '[e1] link "麵屋武藏"\n[e2] link "屯京拉麵"';
+  const h = session(['[{"action":"click","ref":"e1"},{"action":"back"},{"action":"click","ref":"e2"}]',
+    '{"action":"done","answer":"36號B1 / 38號B1","evidence":["地址: 忠孝西路一段36號B1","地址: 忠孝西路一段38號B1"]}'], {
+    'open "https://shop.example/list"': { doc: "m", body: list },
+    "click e1": { doc: "m", body: `${list}\n地址: 忠孝西路一段36號B1`, url: "https://shop.example/place/1" },
+    back: { doc: "m", body: list },
+    "click e2": { doc: "m", body: `${list}\n地址: 忠孝西路一段38號B1`, url: "https://shop.example/place/2" },
+  });
+  const result = await h.run("兩家店的地址");
+  assert.equal(result.status, "TASK_DONE");
+  const shown = h.chats()[1].messages.at(-1).content;
+  assert.ok(shown.includes("地址: 忠孝西路一段36號B1") && shown.includes("地址: 忠孝西路一段38號B1"), shown);
+});
+
+test("a guessed address beside a real link to the same page opens the real link", async () => {
+  const h = session(['{"action":"open","url":"https://rate.bot.com.tw/xrt?Lang=zh_TW"}', '{"action":"done","answer":"33.155","evidence":["33.155"]}'], {
+    'open "https://shop.example/list"': { doc: "g", body: '[e3] link "臺灣銀行牌告匯率 rate.bot.com.tw › xrt"', links: { e3: "https://rate.bot.com.tw/xrt?Lang=zh-TW" } },
+    'open "https://rate.bot.com.tw/xrt?Lang=zh-TW"': { doc: "r", body: "美金 (USD) 32.485 33.155", url: "https://rate.bot.com.tw/xrt?Lang=zh-TW" },
+  });
+  const result = await h.run("台銀美金現金賣出匯率");
+  assert.equal(result.status, "TASK_DONE");
+  assert.ok(!h.sent.some((c) => c.includes("zh_TW")));
+  assert.match(h.chats()[1].messages.at(-1).content, /Opened the page's own link https:\/\/rate\.bot\.com\.tw\/xrt\?Lang=zh-TW/);
+});
+
+test("after one guessed address on a site was wrong, the next guess there is refused", async () => {
+  const h = session(['{"action":"open","url":"https://shop.example/foreign-exchange"}', '{"action":"open","url":"https://shop.example/rates/usd"}',
+    '{"action":"stop","status":"failed","reason":"x"}'], {
+    'open "https://shop.example/list"': { doc: "a", body: "首頁 shop.example" },
+    'open "https://shop.example/foreign-exchange"': { doc: "b", body: "找不到網頁", url: "https://shop.example/foreign-exchange", httpStatus: 404 } as any,
+  });
+  await h.run("查匯率");
+  const chats = h.chats();
+  assert.match(chats[1].messages.at(-1).content, /That address was a guess and the site does not have it \(HTTP 404\)/);
+  assert.ok(!h.sent.some((c) => c.includes("rates/usd")));
+  assert.match(chats[2].messages.at(-1).content, /an address you guessed on shop\.example was wrong before/);
+});
+
+test("evidence may join an element's name with the lines after it; a quote that is nowhere still fails", async () => {
+  const body = '[e18] link "IPPUDO RAMEN EXPRESS"\n4.2 顆星 2,287 則評論\nラーメン屋 · [img 無障礙入口] · Beiping W Rd, 3號2樓\n[e20] link "屯京拉麵"\n4.1 顆星';
+  const good = session(['{"action":"done","answer":"IPPUDO 4.2","evidence":["IPPUDO RAMEN EXPRESS 4.2 顆星 2,287 則評論 ラーメン屋 ·  · Beiping W Rd, 3號2樓"]}'], {
+    'open "https://shop.example/list"': { doc: "m", body },
+  });
+  assert.equal((await good.run("拉麵店評分")).status, "TASK_DONE");
+  const bad = session(['{"action":"done","answer":"IPPUDO 4.9","evidence":["IPPUDO RAMEN EXPRESS 4.9 顆星"]}'], {
+    'open "https://shop.example/list"': { doc: "m", body },
+  });
+  assert.equal((await bad.run("拉麵店評分")).status, "TASK_UNVERIFIED");
+  // The next shop's rating is not this shop's.
+  const mixed = session(['{"action":"done","answer":"IPPUDO 4.1","evidence":["IPPUDO RAMEN EXPRESS · 4.1 顆星"]}'], {
+    'open "https://shop.example/list"': { doc: "m", body },
+  });
+  assert.equal((await mixed.run("拉麵店評分")).status, "TASK_UNVERIFIED");
 });
 
 test("the task's first page may be any address; later a guessed deep link is refused", async () => {

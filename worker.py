@@ -51,6 +51,13 @@ HEALTH_INTERVAL = 60.0
 IDLE_PROBE_AGE = 300.0
 COMMAND_PROBE_AGE = 30.0
 SLOW_PROBE_SECONDS = 20.0
+# How a session page's wait tells "still loading" from noise (measured on 22 sites' load
+# timelines, 2026-11-11): changes under 1% do not restart the quiet period (22 opens took
+# 46-51 s instead of 63-65 s and the same pages came out whole), and a page with almost no
+# text waits longer (an app shell before its results).
+SETTLE = {'tolerance': 0.01, 'thin': 200}
+LOADING_JS = ("(() => { const t = document.body ? document.body.innerText : ''; "
+              "return /載入中|讀取中|加载中|請稍候|请稍候|loading\\s?(\\.\\.\\.|…)|読み込み中/i.test(t.length > 30000 ? t.slice(0, 30000) : t); })()")
 POPUP_URL = re.compile(r'(https?:|about:blank)')
 JS_DIR = HERE / 'pibrowser' / 'js'
 GOOGLE_RESULTS_JS = (JS_DIR / 'google_results.js').read_text()
@@ -280,22 +287,25 @@ class BrowserService:
         preferred = [info for info in candidates if info.get('openerId') == opener_id]
         return (preferred or candidates or [None])[0]
 
-    async def _settle_after_action(self, session_id, tab, started):
-        """After a click/submit/key: adopt a popup it opened, then wait for the page to settle."""
+    async def _settle_after_action(self, session_id, tab, started, before):
+        """After a click/submit/key: adopt a popup it opened, or wait for what it started on
+        the page. `before` is the page's ready_state() from before the action: a page that
+        shows no difference from it within a second (and opened nothing) is taken as is.
+        (This used to sleep 0.95 s before it looked at the page at all.)"""
         state = self.sessions[session_id]
         note = ''
-        for delay in (0.35, 0.6):
-            await asyncio.sleep(delay)
-            popup = self._new_popup(tab.target_id, started)
-            if popup is not None:
-                tab = await Tab.attach(self.browser, popup['targetId'])
-                state.stack.append(tab)
-                if len(state.stack) > 3:
-                    await state.stack.pop(0).close()
-                await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
-                note = 'The action opened a new tab; you are now on it (back returns to the previous tab).'
-                break
-        await tab.wait_ready(8, quiet=0.6, blank_ok=not note)
+        popup = lambda: self._new_popup(tab.target_id, started)
+        await tab.wait_ready(8, quiet=0.5, react=(before, 1.0), stop=popup, **SETTLE)
+        opened = popup()
+        if opened is not None:
+            tab = await Tab.attach(self.browser, opened['targetId'])
+            state.stack.append(tab)
+            if len(state.stack) > 3:
+                await state.stack.pop(0).close()
+            await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
+            note = 'The action opened a new tab; you are now on it (back returns to the previous tab).'
+            await tab.wait_ready(8, quiet=0.6, blank_ok=False, **SETTLE)
+        await self.wait_out_loading(tab)
         return tab, note
 
     async def page_result(self, session_id, tab, *, action, note=''):
@@ -367,8 +377,9 @@ class BrowserService:
             tab = await self.session_tab(session_id, create=True)
             await tab.send('Page.bringToFront', timeout=3)
             await tab.goto(url)
-            await tab.wait_ready(10, quiet=0.6)
+            await tab.wait_ready(10, quiet=0.6, **SETTLE)
             await self.wait_out_challenge(tab)
+            await self.wait_out_loading(tab)
             return await self.page_result(session_id, tab, action='open')
         tab = await self.session_tab(session_id)
         note = ''
@@ -382,10 +393,11 @@ class BrowserService:
             await tab.scroll(args[0] if args else 'down')
             await tab.wait_ready(3, quiet=0.4)
             return await self.page_result(session_id, tab, action='scroll')
+        before = await tab.ready_state() if action in ('click', 'type', 'select', 'press') else None
         if action == 'click':
             started = time.monotonic()
             method = await tab.click_ref(args[0])
-            tab, note = await self._settle_after_action(session_id, tab, started)
+            tab, note = await self._settle_after_action(session_id, tab, started, before)
             if method == 'js':
                 note = (note + ' ' if note else '') + '(element was covered or hidden; clicked it directly)'
         elif action == 'type':
@@ -394,19 +406,20 @@ class BrowserService:
             started = time.monotonic()
             await tab.type_ref(ref, text, submit=submit)
             if submit:
-                tab, note = await self._settle_after_action(session_id, tab, started)
+                tab, note = await self._settle_after_action(session_id, tab, started, before)
             else:
-                await asyncio.sleep(0.4)
+                # A suggestion list may open: wait for it to stand, or 0.4 s when nothing shows.
+                await tab.wait_ready(2, quiet=0.2, react=(before, 0.4))
         elif action == 'select':
             note = f'Selected: {await tab.select_ref(args[0], args[1])}'
-            await tab.wait_ready(5, quiet=0.5)
+            await tab.wait_ready(5, quiet=0.4, react=(before, 0.3), **SETTLE)
         elif action == 'press':
             started = time.monotonic()
             await tab.press(args[0])
-            tab, note = await self._settle_after_action(session_id, tab, started)
+            tab, note = await self._settle_after_action(session_id, tab, started, before)
         elif action == 'back':
             if await tab.back():
-                await tab.wait_ready(10, quiet=0.6)
+                await tab.wait_ready(10, quiet=0.6, **SETTLE)
             else:
                 # The first page of a popup: close it and return to the tab that opened it.
                 state = self.sessions[session_id]
@@ -418,6 +431,25 @@ class BrowserService:
                 note = 'Closed the tab; back on the previous one.'
         return await self.page_result(session_id, tab, action=action, note=note)
 
+    async def wait_out_loading(self, tab, limit=3.0):
+        """A page that says it is loading is waited for: Ruten's result list stood as "載入中
+        請稍候..." with nameless links for 1-3 s after the page had gone quiet, and the planner
+        took 13 steps to find the products. Once per address: a page that always says so is
+        not waited for again."""
+        try:
+            url = await tab.eval('location.href', timeout=3)
+            if getattr(tab, 'said_loading', None) == url or not await tab.eval(LOADING_JS, timeout=3):
+                return
+            deadline = time.monotonic() + limit
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
+                if not await tab.eval(LOADING_JS, timeout=3):
+                    await tab.wait_ready(3, quiet=0.4, **SETTLE)
+                    return
+            tab.said_loading = url
+        except (CDPError, PageError):
+            pass
+
     async def wait_out_challenge(self, tab, limit=8.0):
         """A Cloudflare-style interstitial usually lets a real browser through by itself within
         seconds. Wait for that (never reload: repeated loads escalate the block)."""
@@ -426,7 +458,7 @@ class BrowserService:
         while time.monotonic() < deadline:
             if not CHALLENGE_TITLE.search(str(await tab.eval('document.title', timeout=3) or '')):
                 if waited:
-                    await tab.wait_ready(8, quiet=0.6)
+                    await tab.wait_ready(8, quiet=0.6, **SETTLE)
                 return
             waited = True
             await asyncio.sleep(1.0)

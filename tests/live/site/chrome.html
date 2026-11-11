@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>Chrome and actions</title>
+</head>
+<body>
+<header>
+  <form action="/results.html"><input type="search" name="q" placeholder="搜尋商品"><button>搜尋</button></form>
+  <div id="cats"></div>
+  <div><a href="/results.html?q=login">登入</a> <a href="/results.html?q=cart">購物車</a></div>
+</header>
+<main>
+  <article>
+    <header><h1>主機比較</h1></header>
+    <div class="shop">
+      <a href="/results.html?q=shop1">一風堂</a>
+      <span role="img" aria-label="4.2 顆星 2,287 則評論"><span aria-hidden="true">4.2</span><span aria-hidden="true">(2,287)</span></span>
+      <span>北平西路3號2樓</span>
+    </div>
+    <button id="nothing">沒有反應的按鈕</button>
+    <button id="later" onclick="document.getElementById('out').textContent = '查詢中…'; setTimeout(() => { document.getElementById('out').textContent = '15:11 發車 0837 次'; }, 700)">查詢時刻</button>
+    <div id="out"></div>
+    <a id="slowlink" href="/slow-report.html">慢的報表</a>
+  </article>
+</main>
+<footer><a href="/a">關於</a> <a href="/b">條款</a> <a href="/c">隱私</a> <a href="/d">徵才</a> <a href="/e">客服</a></footer>
+<script>
+  const cats = document.getElementById('cats');
+  for (let i = 1; i <= 16; i++) cats.insertAdjacentHTML('beforeend', `<a href="/results.html?q=cat${i}">館別 ${i}</a> `);
+</script>
+</body>
+</html>

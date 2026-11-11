@@ -161,6 +161,8 @@ class Tab:
         self.world = None
         self.dialogs = []
         self.created = time.monotonic()
+        self.main_frame = target_id
+        self.nav_pending = False   # a navigation of the main frame has started and not yet shown its document
 
     @classmethod
     async def attach(cls, chrome, target_id, *, timeout=5.0):
@@ -168,6 +170,9 @@ class Tab:
                                         timeout=timeout)
         tab = cls(chrome, target_id, result['sessionId'])
         chrome.conn.on('Page.javascriptDialogOpening', tab._on_dialog, session=tab.session)
+        chrome.conn.on('Page.frameStartedLoading', tab._on_frame_started, session=tab.session)
+        chrome.conn.on('Page.frameNavigated', tab._on_frame_navigated, session=tab.session)
+        chrome.conn.on('Page.frameStoppedLoading', tab._on_frame_stopped, session=tab.session)
         await tab.send('Page.enable', timeout=timeout)
         return tab
 
@@ -179,6 +184,23 @@ class Tab:
         del self.dialogs[:-5]
         accept = kind in ('alert', 'beforeunload')
         asyncio.get_running_loop().create_task(self._answer_dialog(accept))
+
+    # A click on a link changes nothing on the page until the server answers: these events say
+    # that a navigation is under way, so the wait after an action does not take the old page
+    # for the result (seen with servers that take over a second to answer).
+    def _on_frame_started(self, params):
+        if params.get('frameId') == self.main_frame:
+            self.nav_pending = True
+
+    def _on_frame_navigated(self, params):
+        frame = params.get('frame') or {}
+        if not frame.get('parentId'):
+            self.main_frame = frame.get('id') or self.main_frame
+            self.nav_pending = False
+
+    def _on_frame_stopped(self, params):
+        if params.get('frameId') == self.main_frame:
+            self.nav_pending = False
 
     async def _answer_dialog(self, accept):
         with contextlib.suppress(CDPError):
@@ -227,34 +249,64 @@ class Tab:
         if error and error != 'net::ERR_ABORTED':
             raise PageError(f'{error} while loading {url}')
 
-    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True):
+    async def ready_state(self, timeout=3.0):
+        """[readyState, text length, element count, url], or None while the page cannot answer."""
+        try:
+            return await self.eval(READY_JS, timeout=timeout)
+        except CDPTimeout:
+            return None  # busy renderer
+        except (PageError, CDPError):
+            if self.chrome.conn.closed:
+                raise CDPClosed('browser connection closed')
+            return None
+
+    async def wait_ready(self, timeout=10.0, *, quiet=0.5, min_chars=0, blank_ok=True,
+                         tolerance=0.0, thin=0, react=None, stop=None):
         """Wait until the document is parsed and its text and element count stop changing
         for `quiet` seconds. Returns False at the deadline (the page may still be usable).
         blank_ok=False: a tab still on about:blank is not ready (a popup that has not
-        started loading its URL yet looks complete and quiet)."""
-        deadline = time.monotonic() + timeout
-        last = None
-        since = time.monotonic()
+        started loading its URL yet looks complete and quiet).
+        tolerance: a change smaller than this share of the text or of the elements (and than
+        20 characters / 10 elements) does not restart the quiet period. Ad slots and tickers
+        kept news pages "changing" for 2-4 s after their content stood.
+        thin: a page with fewer characters than this gets 2.5x the quiet period: an app's
+        empty shell before its results arrive (Google Maps) is quiet too.
+        react=(state, seconds): for the wait after an action; `state` is ready_state() from
+        before it. When the page shows no difference from it and no navigation has started
+        within `seconds`, the action changed nothing and the wait ends.
+        stop: called at every look; a true result ends the wait (a popup has opened)."""
+        started = time.monotonic()
+        deadline = started + timeout
+        base = None
+        since = started
+        reacted = react is None
+        before = tuple(react[0][1:]) if react and react[0] else None
         while True:
-            remaining = deadline - time.monotonic()
+            if stop is not None and stop():
+                return True
+            now = time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 return False
-            try:
-                state = await self.eval(READY_JS, timeout=max(0.5, min(3.0, remaining)))
-            except CDPTimeout:
-                state = None  # busy renderer; keep waiting until the deadline
-            except (PageError, CDPError):
-                if self.chrome.conn.closed:
-                    raise CDPClosed('browser connection closed')
-                state = None
-            if state and state[0] != 'loading' and state[1] >= min_chars and (blank_ok or state[3] != 'about:blank'):
-                fingerprint = (state[1], state[2], state[3])
-                if fingerprint == last:
-                    if time.monotonic() - since >= quiet:
+            state = None if self.nav_pending else await self.ready_state(max(0.5, min(3.0, remaining)))
+            now = time.monotonic()
+            if not reacted:
+                if self.nav_pending or state is None or state[0] == 'loading' or tuple(state[1:]) != before:
+                    reacted = True
+                elif now - started >= react[1]:
+                    return True
+            if reacted and state and state[0] != 'loading' and state[1] >= min_chars and (blank_ok or state[3] != 'about:blank'):
+                same = (base is not None and state[3] == base[2]
+                        and abs(state[1] - base[0]) <= (max(20, tolerance * base[0]) if tolerance else 0)
+                        and abs(state[2] - base[1]) <= (max(10, tolerance * base[1]) if tolerance else 0))
+                if same:
+                    if now - since >= (quiet * 2.5 if state[1] < thin else quiet):
                         return True
                 else:
-                    last, since = fingerprint, time.monotonic()
-            await asyncio.sleep(0.15)
+                    base, since = (state[1], state[2], state[3]), now
+            elif reacted:
+                base = None
+            await asyncio.sleep(0.1)
 
     async def http_status(self):
         try:

@@ -66,8 +66,12 @@ It is built for an inference engine with one slot whose state cannot be cut back
   per step stands before the page text.
 - **Whole pages, read in parts.** A snapshot lists the page's text from top to end, not one
   screen of it, with interactive elements inline as `[eN] role "name"` (a price sits next to
-  its product link). The model gets 10,000 characters at a time; `more` shows the next part.
-  `scroll` only makes a page load more items.
+  its product link). The model gets the first 6,000 characters of a new page, then 10,000
+  at a time; `more` shows the next part. `scroll` only makes a page load more items.
+- **Content before site chrome.** A nav, a page-level header, footer or aside, and blocks of
+  more than 12 links inside them are listed last, under `Site menu:`; a block with a field
+  to type in (the search box) stays where it is. A drawn value with an `aria-label` (a star
+  rating) is read from the label.
 - **Updates, not repeats.** An element keeps its ref for as long as its document lives, and
   refs keep counting over the pages of a session. After an action on the same page the
   model gets only the new or changed lines.
@@ -75,7 +79,21 @@ It is built for an inference engine with one slot whose state cannot be cut back
   from any page of the task. A link is given by its ref (`[e12]` in the answer becomes the
   address): addresses are not in the page text.
 - **Several actions in one reply** for a form (an array); it stops at the first action that
-  fails or leaves the page.
+  fails or leaves the page, and each action's new lines are shown, not only the last one's.
+- **Waits follow the page.** After an action the worker waits for the page to react (a
+  navigation that has started counts, however slow the server) and then to stand still; a
+  page that shows no reaction within a second is taken as is. Changes under 1% (ad slots,
+  tickers) do not restart the quiet period, a page with almost no text waits longer (an app
+  shell before its results), and a page that says it is loading ("載入中") is waited for up
+  to 3 s.
+- **Walls.** A login or verification wall is pointed out to the model; when it is there
+  again after the task tried another way in, the task ends (`TASK_NEEDS_INPUT` or
+  `TASK_BLOCKED`) without another model call.
+- **Guessed addresses.** `open` with an address the model wrote itself, next to a real link
+  to the same page, opens the real link; after one guess on a site hit an error page or was
+  sent to the home page, further guesses on that site are refused.
+- **Evidence.** A quote counts when it is on a page seen in the task: whole, or as pieces in
+  order with at most 40 characters between them (a quote that joins lines or drops an icon).
 - **No loops.** An action already done on the same page state is not run again; the third
   time it is chosen the task stops.
 - **The engine is held for the task.** Requests carry Strata's `"hold": {key, seconds,

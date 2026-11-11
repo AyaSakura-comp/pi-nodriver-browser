@@ -190,6 +190,33 @@ class WorkerLiveTests(unittest.TestCase):
         self.assertGreater(min(again), max(used))
         self.ok('session-cleanup', session='tall')
 
+    def test_site_chrome_after_content_and_waits_that_follow_the_page(self):
+        first = self.ok(f'open {self.base}/chrome.html', session='chrome')
+        body = first['body']
+        # The header's search box stays on top; its 16 category links, the account links and
+        # the footer come after the content. An article's own header is content.
+        self.assertLess(body.index('placeholder="搜尋商品"'), body.index('主機比較'))
+        self.assertLess(body.index('主機比較'), body.index('Site menu:'))
+        for chrome in ('館別 16', '關於'):
+            self.assertLess(body.index('Site menu:'), body.index(chrome), chrome)
+        # A drawn rating is read from its label (its digits are hidden from assistive tech).
+        self.assertIn('4.2 顆星 2,287 則評論', body)
+        self.assertLess(body.index('一風堂'), body.index('4.2 顆星'))
+        self.assertLess(body.index('4.2 顆星'), body.index('北平西路3號2樓'))
+        # A click that changes nothing is over in about a second (it used to take 1.6 s at least).
+        started = time.monotonic()
+        same = self.ok(f"click {self.ref(body, 'button \"沒有反應的按鈕\"')}", session='chrome')
+        self.assertLess(time.monotonic() - started, 1.45)
+        self.assertEqual(same['body'], body)
+        # A click whose result comes 0.7 s after a "loading" line: the result is in the snapshot.
+        later = self.ok(f"click {self.ref(body, 'button \"查詢時刻\"')}", session='chrome')
+        self.assertIn('15:11 發車 0837 次', later['body'])
+        # A link whose server takes 1.5 s to answer: the wait is for the new page, not the old one.
+        slow = self.ok(f"click {self.ref(body, 'link \"慢的報表\"')}", session='chrome')
+        self.assertIn('slow-report.html', slow['url'])
+        self.assertNotEqual(slow['doc'], first['doc'])
+        self.ok('session-cleanup', session='chrome')
+
     def test_open_dialog_is_listed_first(self):
         snap = self.ok(f'open {self.base}/modal.html', session='modal')['snapshot']
         snap = self.ok(f'click {self.ref(snap, r"button \"地區\"")}', session='modal')['snapshot']

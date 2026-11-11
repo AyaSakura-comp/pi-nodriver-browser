@@ -208,6 +208,19 @@
   }
   const listed = new Set(dialogs);
 
+  const FIELDS = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]),select,textarea,[contenteditable=true],[role=searchbox],[role=combobox],[role=textbox]';
+  const chromeOf = (el) => {
+    const tag = el.tagName;
+    const role = el.getAttribute('role') || '';
+    if (tag === 'NAV' || role === 'navigation') return 'nav';
+    if (tag === 'HEADER' || tag === 'FOOTER' || tag === 'ASIDE' || role === 'banner' || role === 'contentinfo' || role === 'complementary') {
+      // An article's own header (title, byline) or footer is content.
+      return el.parentElement && el.parentElement.closest('article,main,[role=main]') ? '' : 'side';
+    }
+    return '';
+  };
+  let inChrome = 0;
+  let descend;
   const walk = (node, clip) => {
     if (truncated) return;
     if (listed.has(node)) return;
@@ -234,19 +247,37 @@
     const sized = rect.width > 0 || rect.height > 0;
     if (s.position === 'fixed') clip = null;
     if (clip && sized && !intersects(rect, clip)) return;
-    // A site menu (a nav with many links and no field to type in) is listed after the page:
-    // it stood before the content on every page of the site.
-    if (lines === body && (el.tagName === 'NAV' || el.getAttribute('role') === 'navigation') &&
-        el.querySelectorAll('a[href]').length > 12 && !el.querySelector('input:not([type=hidden]),select,textarea')) {
-      flush();
-      lines = menu;
-      lastName = '';
-      for (const child of el.childNodes) walk(child, clip);
-      flush();
-      lines = body;
-      lastName = '';
-      return;
+    // Site chrome is listed after the page's content: it stood before the content on every
+    // page of a site (591: 2,600 characters before the first listing). Chrome is a nav, or a
+    // page-level header, footer or aside, or a block of more than 12 links inside one of
+    // those; a block with a field to type in (the search box) stays where it is.
+    if (lines === body && el.firstElementChild) {
+      const landmark = chromeOf(el);
+      if (landmark) inChrome++;
+      const links = landmark || inChrome ? el.querySelectorAll('a[href]').length : 0;
+      if (links > (landmark === 'nav' || !landmark ? 12 : 4) && !el.querySelector(FIELDS)) {
+        flush();
+        lines = menu;
+        lastName = '';
+        for (const child of el.childNodes) walk(child, clip);
+        flush();
+        lines = body;
+        lastName = '';
+        if (landmark) inChrome--;
+        return;
+      }
+      if (landmark) {
+        const rest = descend(el, s, rect, clip, block);
+        inChrome--;
+        return rest;
+      }
     }
+    return descend(el, s, rect, clip, block);
+  };
+
+  // The rest of walk(): an element that is not skipped and not moved to the menu.
+  descend = (el, s, rect, clip, block) => {
+    const sized = rect.width > 0 || rect.height > 0;
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
       flush();
       let doc = null;
@@ -260,6 +291,12 @@
       const alt = clean(el.alt, 80);
       if (alt && rect.width > 24 && rect.height > 24) buffer.push(`[img ${alt}]`);
       return;
+    }
+    // A drawn value (a star rating, an icon that means something): its label is its text.
+    // Google Maps writes "4.3 stars 2,548 reviews" there and hides the digits it draws.
+    if (el.getAttribute('role') === 'img') {
+      const label = clean(el.getAttribute('aria-label'), 80);
+      if (label) { buffer.push(label); return; }
     }
     let role = count < MAX_ELEMENTS ? roleOf(el, s) : null;
     if (role && !NATIVE.has(el.tagName) && el.querySelector('input:not([type=hidden]),select,textarea')) role = null;

@@ -86,6 +86,7 @@ How pages are shown:
 - A page is listed as text from its top to its end, not only the part on screen: you never scroll to read. Interactive elements appear as [eN] role "name"; the other lines are the page's text in page order (a price usually follows its product).
 - A long page comes in parts: {"action":"more"} shows the next part.
 - After an action that stays on the same page you get only the lines that are new or changed; what was listed before still holds unless the message says lines are gone.
+- A site's menus (header and footer links, navigation, sidebars) come last, under "Site menu:", after the page's content.
 - Pages you saw earlier stay above in this conversation: use them, do not go back to read them again. A ref works only on the page it was listed for.
 
 Reply with JSON only, no other text: one action object, or an array of actions to run in order when you fill one form (select, type, type, click). An array stops at the first action that fails or opens another page.
@@ -97,7 +98,7 @@ Reply with JSON only, no other text: one action object, or an array of actions t
 {"action":"scroll","direction":"down"}  (only to make a page load more items; it never shows text that "more" does not)
 {"action":"back"}
 {"action":"google","query":"keywords"}  (Google search: only to find a site, or when this site is wrong or broken)
-{"action":"open","url":"https://..."}  (a URL from the goal, a site's home page, or a page on a site shown on a page; never a guessed deep link)
+{"action":"open","url":"https://..."}  (a URL from the goal or a site's home page; for a page that a listed link leads to, click the link instead of writing its address)
 {"action":"done","answer":"the result the goal asks for, with exact names, prices, dates, numbers","evidence":["short quote copied exactly from a page"]}
 {"action":"stop","status":"needs_input|needs_confirm|blocked|failed","reason":"why, and what is needed"}
 
@@ -108,13 +109,13 @@ Rules:
 - To find an item on a site, type into the site's search box with "submit":true in one step.
 - Among similar options (suggestions, stations, products), choose the one whose name equals what the goal names; an option with extra words ("-環島", "Pro", "2入組") is a different item.
 - Reply done as soon as the pages you have seen show what the goal asks for; do not keep browsing. For a list, give the top items with their prices or key facts. When the goal covers several pages, read each once and answer from all of them.
-- If a list does not show a detail the goal asks for (a wattage, a spec), open at most three of the most likely items to read it, then answer with what you found and say what the list does not show.
+- If a list does not show a detail the goal asks for (a wattage, a spec), open at most three of the most likely items to read it, then answer with what you found and say what the list does not show. A shorter form of a detail in the list (an address without its city, a price range) is that detail: answer with it, do not open the items for a longer form.
 - evidence: 1-3 short quotes copied character for character from pages listed in this conversation.
 - To give a link in the answer, write the ref of its link in square brackets, like [e12]: it is replaced with the real address. Never write a URL you did not see.
 - Never type passwords, OTP/verification codes, card numbers or personal data unless the goal gives them. At a login or verification wall the goal cannot pass, stop with needs_input and list the fields the page asks for.
 - Never buy, pay, check out, place or submit an order, delete, unsubscribe or log out unless the goal asks for it and says it is confirmed; otherwise stop with needs_confirm. Add to cart only when the goal asks for it.
 - CAPTCHA, "unusual traffic" or app-only pages: stop with blocked.
-- If an action leads to a login, verification or error page, do not go back and retry it: stop (needs_input or blocked) and say what the page shows.
+- If a page is a login or verification wall, do not go back, reload or search the site again: the site shows the wall again. Stop (needs_input or blocked) and say what the page shows.
 - If the page is an error page or the wrong site, use google.
 - Do not repeat an action that did not change the page; try something else.
 - Write answer and reason in the language of the goal.`;
@@ -123,7 +124,8 @@ const IRREVERSIBLE = /結帳|立即購買|直接購買|馬上購買|確認購買
 const ADD_TO_CART = /加入購物車|放入購物車|加入購物籃|add to (cart|bag|basket)|\(icon: cart\)/i;
 const SECRET_FIELD = /type=password|密碼|password|passcode|驗證碼|otp|one-time|一次性|卡號|card number|cvv|cvc|安全碼/i;
 const WALL = /請(先)?登入|登入以繼續|登入後才|sign in to continue|log ?in to continue|please (log|sign) ?in|驗證您是人類|確認您的連線|我不是機器人|unusual traffic|captcha|are you a robot|verify (that )?you are (a )?human/i;
-const PART_CHARS = 10000;        // one part of a page, as shown to the model
+const FIRST_PART_CHARS = 6000;   // the first part of a new page (the answers of 22 measured tasks stood in its first 3,100 characters)
+const PART_CHARS = 10000;        // a later part, or an update of the same page
 const MAX_STEPS = 20;            // model replies
 const MAX_BATCH = 6;             // actions in one reply
 const OWN_BUDGET_MS = 150_000;   // browser time + the model's reading and writing; time queued behind other requests is not counted
@@ -225,6 +227,47 @@ function openAllowed(url: string, goal: string, start: string | undefined, seen:
   if (u.pathname === "/" && !u.search) return true;
   const host = u.hostname.toLowerCase().replace(/^www\./, "");
   return [goal, start ?? "", seen].some((text) => text.toLowerCase().includes(host));
+}
+
+/** Page lines as the text a reader sees: no "[e12] link" before an element's name, no quotes around it. */
+function plainText(text: string): string {
+  return text.replace(/^\[e\d+\] [a-z]+ "(.*?)"(?: [a-z]+(?:=\S+|="[^"]*")?)*$/gm, "$1")
+    .replace(/^\[e\d+\] [a-z]+ /gm, "").replace(/\[img ([^\]]*)\]/g, "$1");
+}
+
+/** Is the quote on a page? Whole, or - a quote that joins lines, or leaves out an icon or
+ * a separator between them - as its pieces in order with next to nothing between them
+ * (40 characters: more would let a quote pair one item's name with the next item's price). */
+function quoteFound(quote: string, pages: string[]): boolean {
+  const bare = quote.replace(/^["'「『]|["'」』]$/g, "");
+  const whole = normalize(plainText(bare));
+  if (!whole) return false;
+  const pieces = plainText(bare).split(/\n|\s[·•|｜/]\s|\s{2,}/).map(normalize).filter((piece) => piece.length >= 2);
+  for (const page of pages) {
+    if (page.includes(whole)) return true;
+    if (pieces.length < 2) continue;
+    for (let at = page.indexOf(pieces[0]); at >= 0; at = page.indexOf(pieces[0], at + 1)) {
+      let cursor = at + pieces[0].length;
+      const inOrder = pieces.slice(1).every((piece) => {
+        const next = page.indexOf(piece, cursor);
+        if (next < 0 || next - cursor > 40) return false;
+        cursor = next + piece.length;
+        return true;
+      });
+      if (inOrder) return true;
+    }
+  }
+  return false;
+}
+
+/** host + path of an address, for "the same page but for its query" (a guess next to a real link). */
+function pathKey(url: string): string {
+  try {
+    const u = new URL(url);
+    return (u.hostname.replace(/^www\./, "") + u.pathname.replace(/\/$/, "")).toLowerCase();
+  } catch {
+    return "";
+  }
 }
 
 function fingerprint(text: string): string {
@@ -408,6 +451,10 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
   const view = new PageView();
   const corpus: string[] = [];              // every page text seen in the task: done evidence is checked against it
   const links = new Map<string, string>();  // ref -> address, over the whole task (refs are never reused)
+  let pageLinks: string[] = [];             // the addresses of the current page's links
+  const noGuess = new Set<string>();        // hosts on which a guessed address turned out wrong
+  let wallSeen = false;                     // a login or verification wall was shown to the model
+  let offWall = false;                      // ...and the task has moved off it since
   const tried = new Map<string, { count: number; step: number; outcome: string }>();
   let finalUrl: string | undefined;
 
@@ -428,6 +475,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     if (change.changed && view.lines.length) corpus.push(view.lines.join("\n"));
     if (result.links && typeof result.links === "object") {
       for (const [ref, href] of Object.entries(result.links)) links.set(ref, String(href));
+      pageLinks = Object.values(result.links).map(String);
     }
     finalUrl = view.url || finalUrl;
     return change;
@@ -435,11 +483,11 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
 
   /** The page as a block of a user message. kind: a page not shown before, an update of the same page, or its next part. */
   const block = (kind: "page" | "update" | "more"): string => {
-    const part = view.take(PART_CHARS);
+    const part = view.take(kind === "page" ? FIRST_PART_CHARS : PART_CHARS);
     const notes = view.notes.splice(0);
     const end = !part.left && view.truncated ? "\n(The page goes on past what could be listed.)" : "";
-    const wall = view.refLine.size <= 30 && WALL.test(view.lines.join("\n").slice(0, 3000))
-      ? "\nThis looks like a login or verification wall. If what the goal asks for is behind it, stop now (needs_input for a login, blocked for a CAPTCHA or bot check); do not go back and try again." : "";
+    const wall = onWall()
+      ? `\nThis is a login or verification wall${sentFrom()}. Going back, opening the address again or searching the site again leads back to it. Unless the goal gives what it asks for, stop now: needs_input for a login, blocked for a CAPTCHA or bot check.` : "";
     if (kind === "page" || part.first) {
       const head = [`Page: ${view.title}`, `URL: ${view.url.length > 200 ? view.url.slice(0, 199) + "…" : view.url}`];
       if (view.status >= 400) head.push(`HTTP status: ${view.status} (error page)`);
@@ -459,6 +507,15 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     const more = part.left ? `; ${part.left} more new lines: {"action":"more"} shows them` : "";
     return `${head}Same page, ${part.shown} new or changed lines${gone ? `, ${gone}` : ""}${more}:\n${part.text}${end}${wall}`;
   };
+
+  /** The page is a login or verification wall: little on it, and it says so. */
+  function onWall(): boolean {
+    return view.open && view.refLine.size <= 30 && WALL.test(view.lines.join("\n").slice(0, 3000));
+  }
+  let asked = options.url ?? "";            // the address the last open asked for
+  function sentFrom(): string {
+    return asked && pathKey(asked) !== pathKey(view.url) ? ` (the site sent ${shortUrl(asked)} here)` : "";
+  }
 
   const finish = async (status: TaskStatus, extra: Partial<TaskResult>): Promise<TaskResult> => {
     let screenshot: string | undefined;
@@ -534,6 +591,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
       } catch {}
     }
     messages.push({ role: "user", content: `${head}${first}\n\nStep 1 of at most ${MAX_STEPS}. Reply with JSON.` });
+    wallSeen = onWall();
 
     for (let step = 1; step <= MAX_STEPS; step++) {
       signal?.throwIfAborted();
@@ -621,8 +679,8 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
               pageText += "\n" + String((await browser("get text", "read page text")).text ?? "");
             } catch {}
           }
-          const haystack = normalize(pageText);
-          const missing = evidence.filter((e: string) => !haystack.includes(normalize(e.replace(/^["'「『]|["'」』]$/g, ""))));
+          const pages = [...corpus, pageText].flatMap((text) => [normalize(text), normalize(plainText(text))]);
+          const missing = evidence.filter((e: string) => !quoteFound(e, pages));
           // A URL in the answer must be a link seen in the task (or a page of it, or one the goal
           // gave): asked for 104 job links, the planner made up addresses. Query strings and
           // fragments may be dropped (a link's tracking parameters).
@@ -660,6 +718,8 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         };
         let command = "";
         let label = "";
+        let guessed = false;
+        let openNote = "";
         const name = describeElement(line, ref);
         if (kind === "click" || kind === "type" || kind === "select") {
           if (!line) {
@@ -704,6 +764,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         } else if (kind === "google") {
           const query = String(action.query ?? "").trim();
           if (!query) { fail("google needs a query."); break; }
+          asked = "";
           command = `open ${quote(`https://www.google.com/search?hl=zh-TW&gl=tw&q=${encodeURIComponent(query)}`)}`;
           label = `🔎 google ${quote(query)}`;
         } else if (kind === "open") {
@@ -713,8 +774,30 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
               `open ${url} → refused (guessed link)`);
             break;
           }
-          command = `open ${quote(url)}`;
-          label = `🌐 open ${shortUrl(url)}`;
+          // A deep link the planner wrote itself (not one a page listed, not from the goal):
+          // next to a real link to the same page it is that link with a wrong query
+          // ("?Lang=zh_TW" for "?Lang=zh-TW" opened a maintenance page), so the real one is opened;
+          // and after one guess on a site turned out wrong, no more guesses there.
+          let target = url;
+          const listed = (address: string) => [...links.values()].some((known) => known.replace(/\/$/, "") === address.replace(/\/$/, ""));
+          guessed = view.open && !goal.includes(url) && url !== options.url && !listed(url)
+            && !/^https?:\/\/[^/]+\/?$/.test(url) && !/^https?:\/\/www\.google\.[a-z.]+\/search\?/.test(url);
+          if (guessed) {
+            const real = [...new Set(pageLinks.filter((address) => pathKey(address) === pathKey(url)))];
+            const host = pathKey(url).split("/")[0];
+            if (real.length) {
+              target = real[0];
+              guessed = false;
+              openNote = `(Opened the page's own link ${target}: the address you wrote is not on the page.)`;
+            } else if (noGuess.has(host)) {
+              fail(`open was not done: an address you guessed on ${host} was wrong before. Click a link listed on a page, or use the site's search box.`,
+                `open ${url} → refused (guessed link)`);
+              break;
+            }
+          }
+          asked = target;
+          command = `open ${quote(target)}`;
+          label = `🌐 open ${shortUrl(target)}`;
         } else {
           fail(`unknown action ${kind}.`);
           break;
@@ -773,11 +856,23 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
           }
           steps.push(`${plain} → ${outcome}`);
           results.push(`${plain} → ${outcome}`);
+          if (openNote) results.push(openNote);
+          if (guessed && (view.status >= 400 || (pathKey(view.url) !== pathKey(asked) && !pathKey(view.url).includes("/")))) {
+            // The guess was wrong: an error page, or the site sent it to its home page.
+            noGuess.add(pathKey(asked).split("/")[0]);
+            results.push(`That address was a guess and the site does not have it${view.status >= 400 ? ` (HTTP ${view.status})` : " (it was sent to the home page)"}. Do not write addresses on this site yourself again: click links listed on pages, or use its search box.`);
+          }
           tried.set(key, { count: 1, step, outcome });
           if (leftDocument) {
             const rest = actions.length - index - 1;
             if (rest > 0) results.push(`The other ${rest} action${rest > 1 ? "s were" : " was"} not run: the page changed.`);
             break;
+          }
+          // More actions follow in this reply: say now what this one showed. (A reply of
+          // click, back, click, back on Google Maps never saw the panels it opened.)
+          if (index < actions.length - 1 && change.changed && view.pending() > 0) {
+            results.push(block("update"));
+            pageTouched = false;
           }
         } catch (error) {
           const message = String((error as Error).message || error).replace(/^\w+Error: /, "");
@@ -795,6 +890,21 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         }
       }
 
+      // A wall the model has been told about is there again after the task had moved off it
+      // (home page, search again, the address again: Shopee took 4 model calls to give up):
+      // stop here, as the model was told to.
+      const wallNow = onWall();
+      if (wallNow && wallSeen && (offWall || /"action":"(open|back|google)"/.test(messages[messages.length - 1].content))) {
+        const says = view.lines.filter((l) => !/^\[e\d+\]/.test(l)).join(" ").slice(0, 200);
+        const check = /驗證您是人類|確認您的連線|我不是機器人|unusual traffic|captcha|are you a robot|verify (that )?you are (a )?human/i.test(view.lines.join("\n"));
+        steps.push(`the ${check ? "verification" : "login"} wall is back → stopped`);
+        progress(`🛑 ${check ? "verification" : "login"} wall again`);
+        return await finish(check ? "TASK_BLOCKED" : "TASK_NEEDS_INPUT", {
+          reason: `the site shows its ${check ? "verification" : "login"} wall again after another way in was tried${sentFrom()}. The page says: ${says}`,
+        });
+      }
+      if (wallNow) wallSeen = true;
+      else if (wallSeen && view.open) offWall = true;
       // What the page shows now: a new page whole, the same page as its new lines only.
       if (shownAs !== "more" && pageTouched && view.open) results.push(block(leftDocument ? "page" : "update"));
       const left = MAX_STEPS - step;
