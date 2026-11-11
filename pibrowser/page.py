@@ -273,7 +273,9 @@ class Tab:
         empty shell before its results arrive (Google Maps) is quiet too.
         react=(state, seconds): for the wait after an action; `state` is ready_state() from
         before it. When the page shows no difference from it and no navigation has started
-        within `seconds`, the action changed nothing and the wait ends.
+        within `seconds`, the action changed nothing and the wait ends. A page that did react
+        without leaving its document is also given those `seconds` at least: a result often
+        comes a moment after the first sign of it (a pressed button, a "searching" line).
         stop: called at every look; a true result ends the wait (a popup has opened)."""
         started = time.monotonic()
         deadline = started + timeout
@@ -281,6 +283,8 @@ class Tab:
         since = started
         reacted = react is None
         before = tuple(react[0][1:]) if react and react[0] else None
+        floor = started + react[1] if react else started
+        navigated = False
         while True:
             if stop is not None and stop():
                 return True
@@ -288,8 +292,11 @@ class Tab:
             remaining = deadline - now
             if remaining <= 0:
                 return False
+            navigated = navigated or self.nav_pending
             state = None if self.nav_pending else await self.ready_state(max(0.5, min(3.0, remaining)))
             now = time.monotonic()
+            if state is None or state[0] == 'loading':
+                navigated = True
             if not reacted:
                 if self.nav_pending or state is None or state[0] == 'loading' or tuple(state[1:]) != before:
                     reacted = True
@@ -300,7 +307,7 @@ class Tab:
                         and abs(state[1] - base[0]) <= (max(20, tolerance * base[0]) if tolerance else 0)
                         and abs(state[2] - base[1]) <= (max(10, tolerance * base[1]) if tolerance else 0))
                 if same:
-                    if now - since >= (quiet * 2.5 if state[1] < thin else quiet):
+                    if now - since >= (quiet * 2.5 if state[1] < thin else quiet) and (navigated or now >= floor):
                         return True
                 else:
                     base, since = (state[1], state[2], state[3]), now

@@ -57,7 +57,7 @@ SLOW_PROBE_SECONDS = 20.0
 # text (under 50 characters: Google Maps' shell has 1) waits longer for its results.
 SETTLE = {'tolerance': 0.01, 'thin': 50}
 LOADING_JS = ("(() => { const t = document.body ? document.body.innerText : ''; "
-              "return /載入中|讀取中|加载中|loading\\s?(\\.\\.\\.|…)|読み込み中/i.test(t.length > 30000 ? t.slice(0, 30000) : t); })()")
+              "return /載入中|讀取中|加载中|查詢中|搜尋中|loading\\s?(\\.\\.\\.|…)|読み込み中/i.test(t.length > 30000 ? t.slice(0, 30000) : t); })()")
 POPUP_URL = re.compile(r'(https?:|about:blank)')
 JS_DIR = HERE / 'pibrowser' / 'js'
 GOOGLE_RESULTS_JS = (JS_DIR / 'google_results.js').read_text()
