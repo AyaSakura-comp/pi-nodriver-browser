@@ -607,9 +607,12 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
             steps.push(`stop ${status}: ${reason}`);
             return await finish(mapped, { reason });
           }
-          // [e12] in the answer is that link's address.
-          const answer = String(action.answer ?? "").trim()
-            .replace(/\s*\[(e\d+)\]/gi, (_all, r: string) => links.has(r.toLowerCase()) ? ` ${links.get(r.toLowerCase())}` : "");
+          // [e12] in the answer is that link's address (put in after the check below: those
+          // addresses are real; the check is for the ones the planner wrote itself).
+          const written = String(action.answer ?? "").trim();
+          const answer = written
+            .replace(/\s*\[(e\d+)\]/gi, (_all, r: string) => links.has(r.toLowerCase()) ? ` ${links.get(r.toLowerCase())} ` : "")
+            .replace(/ +\n/g, "\n").replace(/ {2,}/g, " ").trim();
           const evidence = (Array.isArray(action.evidence) ? action.evidence : [action.evidence])
             .map((e: unknown) => String(e ?? "").trim()).filter(Boolean).slice(0, 5);
           let pageText = corpus.join("\n");
@@ -623,7 +626,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
           // A URL in the answer must be a link seen in the task (or a page of it, or one the goal
           // gave): asked for 104 job links, the planner made up addresses. Query strings and
           // fragments may be dropped (a link's tracking parameters).
-          const urls = [...new Set(answer.match(/https?:\/\/[^\s"'<>()（）\]｜|，、]+/g) ?? [])].map((u) => u.replace(/[.,;:!?。]+$/, ""));
+          const urls = [...new Set(written.match(/https?:\/\/[^\s"'<>()（）\]｜|，、；：。！？「」『』]+/g) ?? [])].map((u) => u.replace(/[.,;:!?]+$/, ""));
           if (urls.length) {
             let pageLinks = "";
             if (view.open) {

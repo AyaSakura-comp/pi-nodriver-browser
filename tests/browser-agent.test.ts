@@ -376,6 +376,14 @@ test("a ref in the answer becomes the link's address", async () => {
   const result = await h.run("Python 職缺和連結");
   assert.equal(result.status, "TASK_DONE", JSON.stringify(result.missing_evidence));
   assert.equal(result.answer, "Python 工程師 https://www.104.com.tw/job/89657754?jobsource=x");
+  // Text right after a ref is not part of its address (seen: "…spell/3；有聲書版" failed the link check).
+  const two = session(['{"action":"done","answer":"中文書 [e5]；有聲書版 [e6]。","evidence":["百商數位"]}'], {
+    'open "https://shop.example/list"': { doc: "d1", body: '[e5] link "A"\n[e6] link "B"\n百商數位',
+      links: { e5: "https://search.books.com.tw/redirect/move/item/1", e6: "https://search.books.com.tw/redirect/move/item/2" } },
+  });
+  const both = await two.run("兩個版本的連結");
+  assert.equal(both.status, "TASK_DONE", JSON.stringify(both.missing_evidence));
+  assert.equal(both.answer, "中文書 https://search.books.com.tw/redirect/move/item/1 ；有聲書版 https://search.books.com.tw/redirect/move/item/2 。");
 });
 
 test("going back and forth between two pages is stopped at the second round", async () => {
