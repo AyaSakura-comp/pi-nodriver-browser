@@ -98,6 +98,14 @@ It is built for an inference engine with one slot whose state cannot be cut back
   order with at most 40 characters between them (a quote that joins lines or drops an icon).
 - **No loops.** An action already done on the same page state is not run again; the third
   time it is chosen the task stops.
+- **Login details as names.** piweb (🔑) gives login details as names
+  (`$PIWEB_SECRET_GITHUB_PASS`) and its Pi extension puts the values in this process's
+  environment. The model types the name; only the command sent to Chrome carries the value,
+  every page read back (a filled field's `value=`, a "Hi <account>" greeting, an error
+  message) has the values turned into their names, and the worker's events log leaves out
+  what a `type` command typed. So the planner, its engine's cache and the result Pi stores
+  hold names only. A name the goal does not give is not typed. The final screenshot can
+  still show an account typed into a page (password fields show dots).
 - **The engine is held for the task.** Requests carry Strata's `"hold": {key, seconds,
   keep: false}`: other clients wait between the task's steps instead of each step waiting
   behind them, and no session file is written for the task. `POST /v1/hold` lets go at the

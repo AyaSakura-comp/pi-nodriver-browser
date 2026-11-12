@@ -17,10 +17,73 @@
  * prompt rules: irreversible clicks (buy, pay, delete, log out) need confirm=true, secrets
  * (passwords, OTP, card numbers) are typed only when the goal itself contains them, and an
  * action already tried on the same page state is not run again.
+ *
+ * Login details from piweb (🔑) arrive as names, never values: the goal says
+ * "$PIWEB_SECRET_GITHUB_PASS" and piweb's Pi extension (piweb-secrets) has put the value
+ * in this process's environment. The planner types the name; the value replaces it only
+ * in the command sent to the browser, and every page read back has the values turned
+ * into their names again, so neither the planner (and its engine's cache) nor the
+ * result Pi stores ever holds one.
  */
 
 export interface WorkerLike {
   request(command: string, sessionId: string, signal?: AbortSignal): Promise<Record<string, any>>;
+}
+
+const LOGIN_DETAIL = /\$\{(PIWEB_SECRET_[A-Z0-9_]+)\}|\$(PIWEB_SECRET_[A-Z0-9_]+)/g;
+/** Shorter values are not hidden in page text: a 3-letter account is too common a word. */
+const MIN_HIDDEN_CHARS = 4;
+
+/** piweb's login details (🔑) this process was given: name → value. */
+function loginDetails(): Array<[string, string]> {
+  return Object.entries(process.env).filter((entry): entry is [string, string] =>
+    entry[0].startsWith("PIWEB_SECRET_") && typeof entry[1] === "string" && entry[1] !== "");
+}
+
+/** What to type for `text`: login-detail names replaced by their values; unknown names reported. */
+export function typedText(text: string): { text: string; unknown: string[] } {
+  const values = new Map(loginDetails());
+  const unknown: string[] = [];
+  const out = text.replace(LOGIN_DETAIL, (whole, braced?: string, bare?: string) => {
+    const name = braced ?? bare ?? "";
+    const value = values.get(name);
+    if (value === undefined) unknown.push(name);
+    return value ?? whole;
+  });
+  return { text: out, unknown };
+}
+
+/** ${NAME} and $NAME are the same login detail: compare texts with one spelling. */
+function sameNames(text: string): string {
+  return text.replace(LOGIN_DETAIL, (_whole, braced?: string, bare?: string) => `$${braced ?? bare}`);
+}
+
+/** A copy of what the browser returned with every login-detail value turned into its name. */
+export function hideLoginDetails<T>(value: T): T {
+  const pairs = loginDetails().filter(([, v]) => v.length >= MIN_HIDDEN_CHARS).sort((a, b) => b[1].length - a[1].length);
+  if (!pairs.length) return value;
+  const hide = (text: string) => pairs.reduce((out, [name, v]) => (out.includes(v) ? out.split(v).join(`$${name}`) : out), text);
+  const walk = (node: unknown, depth: number): unknown => {
+    if (typeof node === "string") return hide(node);
+    if (depth > 32 || node === null || typeof node !== "object") return node;
+    if (Array.isArray(node)) return node.map((item) => walk(item, depth + 1));
+    return Object.fromEntries(Object.entries(node as Record<string, unknown>).map(([k, v]) => [k, walk(v, depth + 1)]));
+  };
+  return walk(value, 0) as T;
+}
+
+/** The worker as the task sees it: pages (and errors) come back with login details hidden. */
+function hidingWorker(worker: WorkerLike): WorkerLike {
+  return {
+    async request(command, sessionId, signal) {
+      try {
+        return hideLoginDetails(await worker.request(command, sessionId, signal));
+      } catch (error) {
+        if (error instanceof Error) error.message = hideLoginDetails(error.message);
+        throw error;
+      }
+    },
+  };
 }
 
 export interface LlmConfig {
@@ -114,6 +177,7 @@ Rules:
 - If a list does not show a detail the goal asks for (a wattage, a spec), open at most three of the most likely items to read it, then answer with what you found and say what the list does not show. A shorter form of a detail in the list (an address without its city, a price range) is that detail: answer with it, do not open the items for a longer form.
 - evidence: 1-3 short quotes copied character for character from pages listed in this conversation.
 - To give a link in the answer, write the ref of its link in square brackets, like [e12]: it is replaced with the real address. Never write a URL you did not see.
+- The goal may give login details as names like $PIWEB_SECRET_GITHUB_PASS: that counts as giving them. Type the name exactly as written (it becomes the real value as it is typed); pages show such values back as the name.
 - Never type passwords, OTP/verification codes, card numbers or personal data unless the goal gives them. At a login or verification wall the goal cannot pass, stop with needs_input and list the fields the page asks for.
 - Never buy, pay, check out, place or submit an order, delete, unsubscribe or log out unless the goal asks for it and says it is confirmed; otherwise stop with needs_confirm. Add to cart only when the goal asks for it.
 - CAPTCHA, "unusual traffic" or app-only pages: stop with blocked.
@@ -437,7 +501,8 @@ async function releaseHold(llm: LlmConfig, holdKey: string): Promise<void> {
 }
 
 export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> {
-  const { goal, worker, session, signal } = options;
+  const { goal, session, signal } = options;
+  const worker = hidingWorker(options.worker);
   let llm = options.llm;
   let switched: string | undefined;
   const started = Date.now();
@@ -743,11 +808,19 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
           label = `🖱️ click ${name}`;
         } else if (kind === "type") {
           const text = String(action.text ?? action.value ?? "");
-          if (SECRET_FIELD.test(line!) && text && !goal.includes(text)) {
+          const typed = typedText(text);
+          if (typed.unknown.length) {
+            fail(`${typed.unknown.map((n) => `$${n}`).join(", ")} is not a login detail the goal gives; type only names the goal lists.`,
+              `type into ${name} → not taken (unknown login detail)`);
+            break;
+          }
+          if (SECRET_FIELD.test(line!) && text && !sameNames(goal).includes(sameNames(text))) {
             steps.push(`type into ${name} → not taken (secret not given in the goal)`);
             return await finish("TASK_NEEDS_INPUT", { reason: `the page asks for ${name}; the goal does not give that value. Ask the user for it.` });
           }
-          command = `type ${ref} ${quote(text)}${action.submit ? " --submit" : ""}`;
+          // The value goes only into the command for the browser; the label, steps and the
+          // conversation keep the name.
+          command = `type ${ref} ${quote(typed.text)}${action.submit ? " --submit" : ""}`;
           label = `⌨️ type ${quote(text)} into ${name}${action.submit ? " + Enter" : ""}`;
         } else if (kind === "select") {
           command = `select ${ref} ${quote(String(action.option ?? action.value ?? ""))}`;

@@ -65,6 +65,7 @@ const GUIDELINES = [
   "browser_intent takes {url?, goal}: put what to find or do and every constraint in the goal (e.g. \"price of the single unit, not a bundle; do not add to cart\"). The autopilot does the clicking; one call per user goal.",
   "url can be any start page: the exact page when you have it, otherwise the site's home page or a Google search URL. Omit url to continue on the page this conversation's last browser task ended on (follow-ups, screenshots).",
   "When the user gives login details or a one-time code for a page the previous call stopped at, call again without url and put them in the goal; they are typed only into the fields that ask for them.",
+  "Login details from piweb (🔑) are names like $PIWEB_SECRET_GITHUB_USER / $PIWEB_SECRET_GITHUB_PASS: put the names in the goal as they are; the autopilot types the real values. Never ask the user to type them in chat.",
   "TASK_DONE answers are already checked against the page: answer from them right away instead of calling again to re-check.",
   "To send the final screenshot to the user, include the returned [[image: <path>]] marker in your reply.",
 ];

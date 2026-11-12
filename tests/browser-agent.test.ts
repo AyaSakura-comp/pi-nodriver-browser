@@ -548,3 +548,52 @@ test("time spent queued behind other requests is not the task's own time", async
     globalThis.fetch = realFetch;
   }
 });
+
+// piweb login details (🔑), 2026-11-12: the goal names them ($PIWEB_SECRET_*), piweb's Pi
+// extension put the values in this process's environment. Made-up values only.
+test("login details given as names are typed as their values, and the planner and the result see only names", async () => {
+  const user = "octo-user-7731";
+  const pass = `pa$$ w0rd"q'x-9182`;
+  process.env.PIWEB_SECRET_GITHUB_USER = user;
+  process.env.PIWEB_SECRET_GITHUB_PASS = pass;
+  try {
+    const login = '請登入\n[e1] textbox "帳號"\n[e2] textbox "密碼" type=password\n[e3] button "登入"';
+    const filled = login.replace('"帳號"', `"帳號" value="${user}"`).replace("type=password", "type=password value=(filled)");
+    const home = `Hi ${user}, welcome back\n[e9] link "訂單"`;
+    const h = session([
+      '[{"action":"type","ref":"e1","text":"$PIWEB_SECRET_GITHUB_USER"},{"action":"type","ref":"e2","text":"${PIWEB_SECRET_GITHUB_PASS}"},{"action":"click","ref":"e3"}]',
+      `{"action":"done","answer":"已登入為 $PIWEB_SECRET_GITHUB_USER","evidence":["Hi $PIWEB_SECRET_GITHUB_USER, welcome back"]}`,
+    ], {
+      'open "https://shop.example/list"': { doc: "l1", body: login },
+      [`type e1 ${JSON.stringify(user)}`]: { doc: "l1", body: login.replace('"帳號"', `"帳號" value="${user}"`) },
+      [`type e2 ${JSON.stringify(pass)}`]: { doc: "l1", body: filled },
+      "click e3": { doc: "h1", body: home, title: `${user} - Home` },
+    });
+    const result = await h.run("用 $PIWEB_SECRET_GITHUB_USER / $PIWEB_SECRET_GITHUB_PASS 登入");
+    // The browser got the values...
+    assert.ok(h.sent.includes(`type e1 ${JSON.stringify(user)}`), h.sent.join("\n"));
+    assert.ok(h.sent.includes(`type e2 ${JSON.stringify(pass)}`), h.sent.join("\n"));
+    assert.equal(result.status, "TASK_DONE");
+    // ...the planner never saw one, though the page showed the account back...
+    const chats = JSON.stringify(h.chats());
+    assert.ok(!chats.includes(user) && !chats.includes("w0rd"), "a value reached the planner");
+    assert.ok(chats.includes('value=\\"$PIWEB_SECRET_GITHUB_USER\\"'), "the filled field reads as the name");
+    // ...and nothing the tool returns (Pi stores it) has one.
+    const kept = JSON.stringify(result);
+    assert.ok(!kept.includes(user) && !kept.includes("w0rd"), kept);
+    assert.match(result.steps.join("\n"), /type "\$PIWEB_SECRET_GITHUB_USER"/);
+  } finally {
+    delete process.env.PIWEB_SECRET_GITHUB_USER;
+    delete process.env.PIWEB_SECRET_GITHUB_PASS;
+  }
+});
+
+test("a login-detail name the user did not give is not typed", async () => {
+  const login = '請登入\n[e1] textbox "帳號"';
+  const h = session(['{"action":"type","ref":"e1","text":"$PIWEB_SECRET_BANK_USER"}', '{"action":"stop","status":"needs_input","reason":"沒有帳號"}'],
+    { 'open "https://shop.example/list"': { doc: "l1", body: login } });
+  const result = await h.run("用 $PIWEB_SECRET_BANK_USER 登入");
+  assert.ok(!h.sent.some((c) => c.startsWith("type")), h.sent.join("\n"));
+  assert.match(JSON.stringify(h.chats()), /not a login detail the goal gives/);
+  assert.equal(result.status, "TASK_NEEDS_INPUT");
+});

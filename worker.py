@@ -80,6 +80,15 @@ GET_SCRIPTS = {
 }
 
 
+def loggable(command):
+    """A command as the events log may keep it: what a `type` command types is left out
+    (it can be a password the planner was given only as a name)."""
+    parts = command.split(' ', 2)
+    if parts and parts[0] == 'type' and len(parts) == 3:
+        return f"type {parts[1]} (text not logged){' --submit' if command.endswith(' --submit') else ''}"
+    return command
+
+
 def log_event(event, **fields):
     record = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': event, **fields}
     print(json.dumps(record, ensure_ascii=False), file=sys.stderr, flush=True)
@@ -656,7 +665,7 @@ async def execute_request(service, request):
         return {**base, 'ok': False, 'error': f'STALE_REF: {error}'}
     except Exception as error:
         if isinstance(error, TimeoutError) and deadline.expired():
-            log_event('command_timeout', command=command[:200], session=session_id)
+            log_event('command_timeout', command=loggable(command)[:200], session=session_id)
             return {**base, 'ok': False, 'error': f'Browser command timed out after {COMMAND_TIMEOUT:g} seconds'}
         return {**base, 'ok': False, 'error': f'{type(error).__name__}: {error}'}
 
