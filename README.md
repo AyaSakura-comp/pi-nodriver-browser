@@ -186,6 +186,36 @@ cp ops/browser-agent-watchdog.{service,timer} ~/.config/systemd/user/
 systemctl --user enable --now browser-agent-watchdog.timer
 ```
 
+### macOS
+
+`./install.sh` also runs on macOS (Google Chrome in `/Applications`, Python 3.13+: it uses
+`python3.13` or installs one with `uv`). macOS has no Xvfb, so the worker hides its own headful
+Chrome instead (`pibrowser/macos.py`); everything else is the same worker. Only the Mac takes
+these paths; on Linux nothing changes.
+
+- **Never the user's Chrome.** The worker runs `~/.pi/agent/nodriver-chrome/Pi Agent Chrome.app`:
+  an APFS clone of the installed Chrome with its own bundle id and no URL handlers, rebuilt when
+  Chrome updates (~7 s). With the same bundle id as the user's Chrome, macOS would route links
+  opened from other apps into the hidden worker Chrome. Pages still see Google Chrome.
+  `--use-mock-keychain` keeps it away from the login keychain.
+- **Hidden, without taking focus.** The app is hidden (`NSRunningApplication.hide`, no
+  Accessibility permission), Chrome starts without a window (`--no-startup-window`), sessions
+  get background tabs instead of windows, and `Page.bringToFront`/`Target.activateTarget` are
+  skipped: each of those activates the app. CDP focus emulation keeps every tab `visible` with
+  `requestAnimationFrame` running, as on Xvfb. A thread re-hides Chrome and gives focus back if
+  a page's popup brings it forward. Screenshots are 1x (`--force-device-scale-factor=1`).
+- **No other programs.** Chrome opens `mailto:`/`news:` in their app without asking, and macOS
+  really starts Mail; the worker cancels such navigations in the page and reports them as on
+  Linux ("tried to open another program").
+- The worker runs as a plain child (no systemd, no `xvfb-run`). The X-display checks (system
+  dialogs, clipboard) and the systemd watchdog are Linux-only.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PI_NODRIVER_MACOS_WINDOW` | `hidden` | `visible` shows the worker's Chrome (debugging) |
+| `PI_NODRIVER_MACOS_CLONE` | on | `0` runs the installed Chrome app itself (shares its bundle id) |
+| `PI_NODRIVER_PYTHON` | | Python 3.13+ for the venv |
+
 ## Tests
 
 ```bash

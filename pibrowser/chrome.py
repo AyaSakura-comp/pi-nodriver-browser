@@ -16,6 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from . import macos
 from .cdp import CDPError, Connection
 from .page import Tab
 
@@ -35,6 +36,8 @@ FLAGS = [
 
 
 def find_chrome():
+    if macos.IS_MACOS and (found := macos.find_chrome()):
+        return found
     for candidate in ('/opt/google/chrome/chrome',
                       *map(shutil.which, ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'))):
         if candidate and os.access(candidate, os.X_OK):
@@ -50,6 +53,8 @@ def free_port():
 
 def profile_pids(profile):
     """PIDs of any process (any Chrome helper too) running with this profile."""
+    if macos.IS_MACOS:
+        return macos.profile_pids(profile)
     marker = f'--user-data-dir={profile}'.encode()
     pids = []
     for entry in Path('/proc').iterdir():
@@ -68,6 +73,8 @@ def profile_pids(profile):
 
 
 def pid_alive(pid):
+    if macos.IS_MACOS:
+        return macos.pid_alive(pid)
     try:
         with open(f'/proc/{pid}/stat') as handle:
             return handle.read().split(') ', 1)[1][0] not in 'ZX'
@@ -112,9 +119,14 @@ class Chrome:
             with contextlib.suppress(OSError):
                 (self.profile / name).unlink()
         self.port = free_port()
+        flags = FLAGS
+        if macos.IS_MACOS:
+            # macOS has no Xvfb: the worker's own headful Chrome is hidden instead (pibrowser/macos.py).
+            flags = [flag for flag in FLAGS if flag != '--ozone-platform=x11'] + macos.FLAGS
+            previous_front = macos.frontmost_pid()
         with open(self.log_path, 'wb') as log:
             self.proc = await asyncio.create_subprocess_exec(
-                binary, *FLAGS, f'--user-data-dir={self.profile}', f'--remote-debugging-port={self.port}',
+                binary, *flags, f'--user-data-dir={self.profile}', f'--remote-debugging-port={self.port}',
                 'about:blank', stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         deadline = time.monotonic() + timeout
         while True:
@@ -128,6 +140,8 @@ class Chrome:
                     await self.stop()
                     raise RuntimeError(f'Chrome did not open its DevTools port within {timeout:g}s') from None
                 await asyncio.sleep(0.2)
+        if macos.IS_MACOS:
+            await asyncio.to_thread(macos.adopt, self.proc.pid, previous_front)
         self.conn = Connection()
         await self.conn.connect(ws_url)
         self.conn.on('Target.targetCreated', self._on_target)
@@ -178,6 +192,10 @@ class Chrome:
         window's front tab is visible, and hidden tabs pause requestAnimationFrame, which
         leaves virtual lists and lazy content half rendered. Each Pi session therefore gets
         its own window, so every session's page stays visible."""
+        if macos.should_hide():
+            # macOS: a new window activates the hidden Chrome (it flashes in front of the user's
+            # app). Focus emulation (Tab.attach) keeps background tabs visible and animating.
+            new_window = False
         params = {'url': 'about:blank', 'background': not new_window}
         if new_window:
             params['newWindow'] = True

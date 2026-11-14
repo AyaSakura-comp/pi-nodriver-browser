@@ -102,6 +102,16 @@ test('PI_NODRIVER_SYSTEMD=0 and non-Linux hosts keep the previous child process'
   }
 });
 
+test('macOS runs the worker without xvfb-run (it hides its own Chrome instead)', async () => {
+  const spawned: Array<{ file: string; args: string[] }> = [];
+  await launchWorker(spec, {
+    platform: 'darwin', env: { PATH: '/usr/bin' }, durableManager: async () => true,
+    execFile: async () => { throw new Error('systemd must not run on macOS'); },
+    spawn: (file, args) => { spawned.push({ file, args }); return fakeChild(9) as never; },
+  });
+  assert.deepEqual(spawned, [{ file: spec.python, args: [spec.worker, '--server', spec.socket] }]);
+});
+
 test('a systemd-run that fails after creating the unit is stopped before the fallback starts', async () => {
   const calls: Array<{ file: string; args: string[] }> = [];
   const spawned: string[] = [];
