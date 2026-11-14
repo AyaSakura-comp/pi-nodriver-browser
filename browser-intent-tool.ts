@@ -57,7 +57,9 @@ const DESCRIPTION = `Live browser autopilot on the shared, logged-in Chrome. Giv
 - TASK_NEEDS_INPUT: a login or verification step needs values the goal does not give; reason lists the fields. Ask the user; never invent credentials.
 - TASK_NEEDS_CONFIRM: the next step is irreversible (buy, pay, submit an order, delete, log out, or add to cart when not asked). Ask the user; call again with confirm=true only if they agree.
 - TASK_BLOCKED: CAPTCHA, anti-bot or app-only wall. Tell the user; do not retry it or work around it (no verification clicks, curl, site APIs or proxies).
+- TASK_UNSUPPORTED: a step needs something the autopilot cannot do (a system window, a browser sign-in box, a frame of another site); the site did not refuse. reason says which step is left.
 - TASK_STOPPED / TASK_FAILED: not reached; steps show how far it got.
+It can upload local files (give each file's absolute path in the goal), answer a page's confirm box, and it reports what a click does outside the page: a download or a printed page comes back as a saved file with its path, a copied text as the text.
 The result names a screenshot of where it ended; the image itself is attached when the task did not finish.`;
 
 const GUIDELINES = [
@@ -66,6 +68,8 @@ const GUIDELINES = [
   "url can be any start page: the exact page when you have it, otherwise the site's home page or a Google search URL. Omit url to continue on the page this conversation's last browser task ended on (follow-ups, screenshots).",
   "When the user gives login details or a one-time code for a page the previous call stopped at, call again without url and put them in the goal; they are typed only into the fields that ask for them.",
   "Login details from piweb (🔑) are names like $PIWEB_SECRET_GITHUB_USER / $PIWEB_SECRET_GITHUB_PASS: put the names in the goal as they are; the autopilot types the real values. Never ask the user to type them in chat.",
+  "To upload a file, write its absolute local path in the goal (\"upload /home/me/photo.jpg as the print file\"); only paths written in the goal can be uploaded.",
+  "Files the task downloaded or saved are listed under 檔案 with their paths: to send one to the user include [[file: <path>]].",
   "TASK_DONE answers are already checked against the page: answer from them right away instead of calling again to re-check.",
   "To send the final screenshot to the user, include the returned [[image: <path>]] marker in your reply.",
 ];
@@ -75,6 +79,7 @@ const GUIDELINES = [
 // then tried curl with a browser User-Agent and a reader proxy).
 const NEXT: Record<string, string> = {
   TASK_BLOCKED: "Next: tell the user this site blocks automated browsing. Do not ask to click its verification, call browser_intent on it again, or fetch it another way (curl, its API, proxies or reader services).",
+  TASK_UNSUPPORTED: "Next: tell the user which step the browser autopilot cannot do (this is the tool's limit: the site did not block anything) and how far it got; the page is left open at that step. Offer what remains: the user does that one step by hand, or another route the reason names. Do not call browser_intent for the same step again.",
   TASK_NEEDS_INPUT: "Next: ask the user for the fields above. Never guess or invent credentials or codes.",
   TASK_NEEDS_CONFIRM: "Next: ask the user. Call again with confirm=true only after they agree to this exact step.",
 };
@@ -85,6 +90,7 @@ const HEAD: Record<string, string> = {
   TASK_NEEDS_INPUT: "🔑 需要使用者提供登入或驗證資料",
   TASK_NEEDS_CONFIRM: "⚠️ 下一步是不可逆操作，需要使用者確認",
   TASK_BLOCKED: "🛑 網站擋下自動瀏覽",
+  TASK_UNSUPPORTED: "🧩 自動瀏覽工具做不到這一步（不是網站擋下）",
   TASK_STOPPED: "⏸️ 未完成就停止",
   TASK_FAILED: "❌ 任務失敗",
 };
@@ -95,6 +101,7 @@ function summary(result: TaskResult, goal: string, planner: string): string {
   if (result.reason) lines.push("", `原因：${result.reason}`);
   if (NEXT[result.status]) lines.push("", NEXT[result.status]);
   if (result.steps.length) lines.push("", "步驟：", ...result.steps.map((s, i) => `${i + 1}. ${s}`));
+  if (result.files?.length) lines.push("", "檔案：", ...result.files.map((file) => `- ${file}`));
   if (result.url) lines.push("", `目前頁面：${result.title || ""} ${result.url}`);
   if (result.screenshot) lines.push(`截圖：[[image: ${result.screenshot}]]`);
   const waited = result.wait_ms > 2000 ? `，其中 ${(result.wait_ms / 1000).toFixed(0)}s 在等模型空檔` : "";

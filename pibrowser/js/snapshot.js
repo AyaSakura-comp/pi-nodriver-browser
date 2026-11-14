@@ -188,6 +188,9 @@
     // snapshot's characters and, cut to fit, could not be used in an answer anyway. An answer
     // names a link by its ref and the agent puts the address in.
     if (role === 'link' && /^https?:/.test(el.href || '')) links[ref] = el.href;
+    // A link to another program is not clicked (nothing opens outside the browser): its
+    // address is what it has to give.
+    else if (role === 'link' && /^(mailto|tel|sms):/i.test(el.getAttribute('href') || '')) line += ` (${clean(decodeURIComponent(el.getAttribute('href').split('?')[0]), 80)})`;
     return [line, name];
   };
 
@@ -237,6 +240,15 @@
     const el = node;
     if (SKIP.has(el.tagName)) {
       if (el.tagName === 'DIALOG' && el.open) { flush(); push('[dialog]'); for (const c of el.childNodes) walk(c, null); flush(); }
+      // What a page draws on a canvas (a map, a chart, an app's whole screen) has no text
+      // or elements to list: say that it is there.
+      if (el.tagName === 'CANVAS') {
+        const r = el.getBoundingClientRect();
+        if (r.width >= 200 && r.height >= 120 && style(el).display !== 'none' && style(el).visibility !== 'hidden') {
+          flush();
+          push(`[canvas ${Math.round(r.width)}x${Math.round(r.height)}${el.getAttribute('aria-label') ? ' ' + clean(el.getAttribute('aria-label'), 60) : ''} (drawn content: not readable)]`);
+        }
+      }
       return;
     }
     const s = style(el);

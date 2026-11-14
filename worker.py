@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sys
 import time
@@ -32,7 +33,7 @@ sys.path.insert(0, str(HERE))
 from pibrowser.cdp import CDPClosed, CDPError, CDPTimeout  # noqa: E402
 from pibrowser.chrome import Chrome  # noqa: E402
 from pibrowser.fetch import FetchError, fetch_image, pdf_text, safe_name  # noqa: E402
-from pibrowser.page import PageError, StaleRef, Tab  # noqa: E402
+from pibrowser.page import TARGET_JS, PageError, StaleRef, Tab  # noqa: E402
 from research.capture import research_capture_js  # noqa: E402
 
 MARKER = '__PI_NODRIVER__'
@@ -67,7 +68,9 @@ CHALLENGE_MARKERS = ('just a moment', 'attention required', 'verify you are huma
 CHALLENGE_TITLE = re.compile(r'just a moment|請稍候|attention required|checking your browser|one more step', re.I)
 GOOGLE_BLOCK_MARKERS = ('unusual traffic', 'before you continue to google', 'verify you are human')
 PAGE_COMMANDS = {'open', 'snapshot', 'click', 'type', 'select', 'press', 'scroll', 'back', 'get', 'screenshot',
-                 'crawl', 'google-search'}
+                 'upload', 'crawl', 'google-search'}
+INCOMING = DOWNLOADS / '_incoming'   # downloads land here under their id until an action claims them
+UPLOAD_MAX_BYTES = 2_000_000_000
 # Retried once on a relaunched Chrome: they only read pages.
 RETRY_AFTER_RESTART = {'open', 'snapshot', 'get', 'screenshot', 'crawl', 'google-search'}
 # Not serialized behind the session's page commands.
@@ -87,6 +90,76 @@ def loggable(command):
     if parts and parts[0] == 'type' and len(parts) == 3:
         return f"type {parts[1]} (text not logged){' --submit' if command.endswith(' --submit') else ''}"
     return command
+
+
+# ---- outside the page ---------------------------------------------------------
+# An action's result is not always on the page: a system window (a file chooser in a frame
+# of another site, xdg-open's "Select Application"), the clipboard. Chrome reports neither;
+# the X display the worker's Chrome runs on does. Without the tools or a display these
+# looks return nothing.
+X_TOOLS = {name: shutil.which(name) for name in ('xwininfo', 'xprop', 'xdotool', 'xclip')}
+# Said with everything the tool cannot do: the planner's rules do not speak of tool limits.
+NO_WAY = (' Do not try it again: use another way the page offers, or reply '
+          '{"action":"stop","status":"unsupported","reason":"<which step is left for the user to do by hand>"}.')
+TOP_WINDOW = re.compile(r'^     (0x[0-9a-f]+) ', re.M)
+
+
+async def run_tool(*argv, timeout=1.5):
+    if not X_TOOLS.get(argv[0]) or not os.environ.get('DISPLAY'):
+        return ''
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            X_TOOLS[argv[0]], *argv[1:], stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        return out.decode('utf-8', 'replace')
+    except (OSError, asyncio.TimeoutError):
+        if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        return ''
+
+
+async def x_windows():
+    """Ids of the display's top-level windows."""
+    return set(TOP_WINDOW.findall(await run_tool('xwininfo', '-root', '-tree')))
+
+
+async def x_dialog_title(window):
+    """The title of a top-level window when it is a system dialog on screen, else None.
+    (A plain click opens none; Chrome's own menus and pickers are override-redirect popups.)"""
+    props = await run_tool('xprop', '-id', window, '_NET_WM_WINDOW_TYPE', '_NET_WM_NAME', 'WM_NAME')
+    if '_NET_WM_WINDOW_TYPE_DIALOG' not in props:
+        return None
+    if 'IsViewable' not in await run_tool('xwininfo', '-id', window):
+        return None
+    name = re.search(r'^_NET_WM_NAME\(UTF8_STRING\) = "(.*)"$', props, re.M) or re.search(r'^WM_NAME\(\w+\) = "(.*)"$', props, re.M)
+    title = name.group(1) if name else ''
+    if re.search(r'\\\d{3}', title):   # xprop in a non-UTF-8 locale writes bytes as \351\226\213
+        with contextlib.suppress(ValueError, UnicodeError):
+            title = title.encode('latin-1').decode('unicode_escape').encode('latin-1').decode('utf-8')
+    return title or 'untitled'
+
+
+async def clipboard_text():
+    return (await run_tool('xclip', '-o', '-selection', 'clipboard', timeout=1.0))[:2000]
+
+
+def file_name(name):
+    name = re.sub(r'[\\/\x00-\x1f]+', '_', str(name)).strip('. ')[:150]
+    return name or 'download'
+
+
+def free_path(directory, name):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    stem, suffix = path.stem, path.suffix
+    for n in range(2, 1000):
+        if not path.exists():
+            break
+        path = directory / f'{stem}-{n}{suffix}'
+    return path
 
 
 def log_event(event, **fields):
@@ -182,7 +255,7 @@ class BrowserService:
         for state in self.sessions.values():
             state.stack.clear()
         self.temp_tabs.clear()
-        chrome = Chrome(PROFILE, CHROME_LOG)
+        chrome = Chrome(PROFILE, CHROME_LOG, downloads=INCOMING)
         await chrome.start()
         if not await chrome.probe(timeout=10):
             await chrome.stop()
@@ -267,6 +340,8 @@ class BrowserService:
         state.stack.append(tab)
         with contextlib.suppress(CDPError):
             await tab.watch_network()
+        with contextlib.suppress(CDPError):
+            await tab.watch_outside()
         return tab
 
     async def _evict_session_tabs(self, keep):
@@ -298,6 +373,138 @@ class BrowserService:
         preferred = [info for info in candidates if info.get('openerId') == opener_id]
         return (preferred or candidates or [None])[0]
 
+    async def _outside_before(self):
+        """The display's windows and the clipboard before an action, to tell what it changed."""
+        windows, clip = await asyncio.gather(x_windows(), clipboard_text())
+        return {'windows': windows, 'clip': clip}
+
+    async def _outside_after(self, session_id, tab, started, outside, *, ref=''):
+        """What the action did outside the page: (notes for the reader, files it produced).
+        Every line says what happened and, where the tool has an answer, how to go on; where it
+        has none it says so, so the task can end as a tool limit and not as a blocked site."""
+        notes, files = [], []
+        chooser = tab.chooser
+        if chooser and chooser['at'] >= started and not chooser.get('told'):
+            chooser['told'] = True
+            chooser['ref'] = ref
+            if 'backendNodeId' in chooser:
+                many = 'several files' if chooser.get('mode') == 'selectMultiple' else 'one file'
+                notes.append(f'The action opened a file chooser (for {many}); nothing was chosen. To give it a file: '
+                             '{"action":"upload","ref":"%s","path":"<a file path the goal gives>"}' % (ref or 'the same ref'))
+            else:
+                tab.chooser = None
+                notes.append('TOOL LIMIT: the page asked for a file through the File System Access picker, '
+                             'which this tool cannot fill.' + NO_WAY)
+        apps, tab.other_apps = tab.other_apps, []
+        for address in apps:
+            notes.append(f'The page tried to open another program ({address}); nothing outside the browser opens here.')
+        # Downloads this tab started (or one no other session's tab did).
+        others = {t.target_id for sid, st in self.sessions.items() if sid != session_id for t in st.stack}
+        mine = [(guid, d) for guid, d in self.browser.downloads.items()
+                if not d.get('claimed') and d['at'] >= started - 0.2 and d['frame'] not in others]
+        if mine:
+            deadline = time.monotonic() + 8
+            while any(d['state'] == 'inProgress' for _, d in mine) and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            for guid, d in mine:
+                d['claimed'] = True
+                source = INCOMING / guid
+                if d['state'] == 'completed' and source.exists():
+                    path = free_path(DOWNLOADS / safe_name(session_id, 80), file_name(d['name']))
+                    source.replace(path)
+                    files.append(str(path))
+                    notes.append(f"The action downloaded a file: {d['name']} ({path.stat().st_size} bytes), saved as {path}")
+                elif d['state'] == 'canceled':
+                    notes.append(f"A download of {d['name']} started and was cancelled.")
+                else:
+                    notes.append(f"A download of {d['name']} is still running ({d['bytes']} bytes so far); it is being saved as {source}")
+        asked, tab.auth_asked = tab.auth_asked, None
+        if asked and asked[1] >= started:
+            notes.append(f'TOOL LIMIT: {asked[0]} asks for a user name and password in the browser\'s own sign-in box '
+                         '(HTTP authentication), not on a page; this tool cannot type into that box.' + NO_WAY)
+        # A window that prints as it loads (a ticket, a receipt opened in a new tab) shows Chrome's
+        # print preview before the tab is watched: close the preview, the page is saved below.
+        current = self.sessions[session_id].stack[-1] if self.sessions[session_id].stack else tab
+        preview = lambda: [i for i in self.browser.targets.values()
+                           if str(i.get('url') or '').startswith('chrome://print') and i.get('_seen', 0) >= started - 0.2]
+        printed = bool(preview())
+        if printed:
+            await run_tool('xdotool', 'key', 'Escape')
+            deadline = time.monotonic() + 2
+            while preview() and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            if preview():
+                printed = False
+                notes.append('TOOL LIMIT: the page opened the browser\'s print dialog, which this tool cannot operate; it is still open.' + NO_WAY)
+        if self._live(tab) and await tab.print_calls():
+            printed, current = True, tab
+        if printed and self._live(current):
+            tab = current
+            try:
+                path = await tab.save_pdf(free_path(DOWNLOADS / safe_name(session_id, 80), f'print-{int(time.time())}.pdf'))
+                files.append(str(path))
+                notes.append(f'The page asked to print. There is no printer here: the page was saved as a PDF instead: {path}')
+            except (CDPError, OSError) as error:
+                notes.append(f'The page asked to print. There is no printer here, and saving it as a PDF failed ({error}).')
+        if outside is not None:
+            clip = await clipboard_text()
+            if clip and clip != outside['clip']:
+                notes.append('The action copied to the clipboard: ' + json.dumps(clip[:400], ensure_ascii=False))
+            for window in sorted(await x_windows() - outside['windows']):
+                title = await x_dialog_title(window)
+                if title is None:
+                    continue
+                # A real Escape to the window: GTK ignores a key event that is only sent to it.
+                await run_tool('xdotool', 'windowfocus', str(int(window, 16)), 'key', 'Escape')
+                await asyncio.sleep(0.2)
+                closed = await x_dialog_title(window) is None
+                log_event('system_dialog', title=title, closed=closed, session=session_id)
+                notes.append(f'TOOL LIMIT: the action opened a system window ("{title}") outside the page, '
+                             f"which this tool cannot operate; it {'was closed' if closed else 'is still open'}." + NO_WAY)
+        return notes, files
+
+    async def _upload(self, tab, ref, paths):
+        """Give files to the page through `ref`: the file field itself, or what opens the file
+        chooser (a button, a box). Returns (done, what happened). Without a chooser the files go
+        to the file field found for the ref, or are dropped onto it."""
+        names = ', '.join(Path(p).name for p in paths)
+        pending, tab.chooser = tab.chooser, None
+        if pending and pending.get('ref') == ref and 'backendNodeId' in pending and time.monotonic() - pending['at'] < 300:
+            with contextlib.suppress(CDPError):
+                if pending.get('mode') == 'selectSingle' and len(paths) > 1:
+                    raise PageError('this file chooser takes one file')
+                await tab.set_files(paths, backend_node=pending['backendNodeId'])
+                return True, f'Gave {names} to the file chooser.'
+        target = await tab.call(TARGET_JS, ref)
+        if not target or target.get('error'):
+            raise StaleRef(f'{ref} is not on the page any more; take a new snapshot')
+        if target.get('tag') == 'input' and target.get('type') == 'file':
+            await tab.set_files(paths, ref=ref)
+            return True, f'Put {names} into the file field.'
+        state = await tab.ready_state()
+        await tab.click_ref(ref)
+        deadline = time.monotonic() + 1.5
+        while tab.chooser is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        chooser, tab.chooser = tab.chooser, None
+        if chooser is not None:
+            if 'backendNodeId' not in chooser:
+                return False, ('TOOL LIMIT: the page asks for the file through the File System Access picker, '
+                               'which this tool cannot fill; nothing was uploaded.' + NO_WAY)
+            if chooser.get('mode') == 'selectSingle' and len(paths) > 1:
+                raise PageError('this file chooser takes one file; upload one path')
+            await tab.set_files(paths, backend_node=chooser['backendNodeId'])
+            return True, f'Gave {names} to the file chooser it opened.'
+        now = await tab.ready_state()
+        if tab.nav_pending or now is None or state is None or tuple(now[1:]) != tuple(state[1:]):
+            return False, ('Clicking it opened no file chooser and changed the page instead; nothing was uploaded. '
+                           'Give upload the element that takes the file.')
+        if await tab.set_files(paths, ref=ref):
+            return True, f'It opened no file chooser; put {names} into the file field next to it.'
+        await tab.drop_files(ref, paths)
+        return True, (f'It opened no file chooser and the page has no file field; dropped {names} onto it. '
+                      'Check that the page shows the file.')
+
     async def _settle_after_action(self, session_id, tab, started, before):
         """After a click/submit/key: adopt a popup it opened, or wait for what it started on
         the page. `before` is the page's ready_state() from before the action: a page that
@@ -313,6 +520,8 @@ class BrowserService:
             state.stack.append(tab)
             with contextlib.suppress(CDPError):
                 await tab.watch_network()
+            with contextlib.suppress(CDPError):
+                await tab.watch_outside()
             if len(state.stack) > 3:
                 await state.stack.pop(0).close()
             await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
@@ -321,18 +530,22 @@ class BrowserService:
         await self.wait_out_loading(tab)
         return tab, note
 
-    async def page_result(self, session_id, tab, *, action, note=''):
+    async def page_result(self, session_id, tab, *, action, note='', notes=(), files=()):
         status = await tab.http_status()
         state = self.sessions[session_id]
         snap = await tab.snapshot(base=state.ref_base)
         state.ref_base = max(state.ref_base, snap.get('lastRef') or 0)
         state.last_url = snap.get('url') or state.last_url
         dialogs, tab.dialogs = tab.dialogs, []
+        dialogs = [dialog + (' (to answer OK, do the action again with "dialog":"ok")' if dialog.endswith('answered Cancel') else '')
+                   for dialog in dialogs]
+        note = ' '.join(filter(None, [note, *notes]))
         text = format_snapshot(snap, status=status, dialogs=dialogs, note=note)
         # 'snapshot' is the page as one text (header, ---, lines). The agent reads the parts:
         # 'body' (the lines), 'doc' (changes with the document), 'links' (ref -> address) and 'notes'.
         notes = [f'Dialog closed automatically: {dialog}' for dialog in dialogs] + ([note] if note else [])
         return {'action': action, 'url': snap.get('url'), 'title': snap.get('title'), 'httpStatus': status,
+                'files': list(files),
                 'elements': snap.get('elements'), 'text': text, 'snapshot': text,
                 'body': snap.get('text') or '', 'doc': f"{tab.target_id[:8]}.{snap.get('doc', '')}",
                 'links': snap.get('links') or {}, 'truncated': bool(snap.get('truncated')), 'notes': notes,
@@ -389,11 +602,14 @@ class BrowserService:
                 url = 'https://' + url
             tab = await self.session_tab(session_id, create=True)
             await tab.send('Page.bringToFront', timeout=3)
+            outside = await self._outside_before()
+            started = time.monotonic()
             await tab.goto(url)
             await tab.wait_ready(10, quiet=0.6, **SETTLE)
             if not await self.wait_out_challenge(tab):
                 await self.wait_out_loading(tab)
-            return await self.page_result(session_id, tab, action='open')
+            notes, files = await self._outside_after(session_id, tab, started, outside)
+            return await self.page_result(session_id, tab, action='open', notes=notes, files=files)
         tab = await self.session_tab(session_id)
         note = ''
         if action == 'get':
@@ -406,17 +622,34 @@ class BrowserService:
             await tab.scroll(args[0] if args else 'down')
             await tab.wait_ready(3, quiet=0.4)
             return await self.page_result(session_id, tab, action='scroll')
-        before = await tab.ready_state() if action in ('click', 'type', 'select', 'press') else None
+        before = await tab.ready_state() if action in ('click', 'type', 'select', 'press', 'upload') else None
+        # --ok: a confirm box this action opens is answered OK (otherwise Cancel).
+        acts = action in ('click', 'press', 'upload') or (action == 'type' and '--submit' in args)
+        tab.accept_dialogs = acts and '--ok' in args
+        args = [arg for arg in args if arg != '--ok'] if acts else args
+        outside = await self._outside_before() if acts else None
+        first, started, notes, files = tab, time.monotonic(), [], []
         if action == 'click':
-            started = time.monotonic()
             method = await tab.click_ref(args[0])
             tab, note = await self._settle_after_action(session_id, tab, started, before)
             if method == 'js':
                 note = (note + ' ' if note else '') + '(element was covered or hidden; clicked it directly)'
+        elif action == 'upload':
+            ref, paths = args[0], [str(Path(path).expanduser()) for path in args[1:]]
+            if not paths:
+                raise PageError('upload needs a file path')
+            for path in paths:
+                if not Path(path).is_file():
+                    raise PageError(f'no such file: {path}')
+                if Path(path).stat().st_size > UPLOAD_MAX_BYTES:
+                    raise PageError(f'{path} is larger than 2 GB')
+            done, note = await self._upload(tab, ref, paths)
+            log_event('upload', done=done, files=len(paths), session=session_id)
+            tab, more = await self._settle_after_action(session_id, tab, started, before)
+            note = ' '.join(filter(None, [note, more]))
         elif action == 'type':
             submit = '--submit' in args
             ref, text = [arg for arg in args if arg != '--submit']
-            started = time.monotonic()
             await tab.type_ref(ref, text, submit=submit)
             if submit:
                 tab, note = await self._settle_after_action(session_id, tab, started, before)
@@ -428,7 +661,6 @@ class BrowserService:
             note = f'Selected: {await tab.select_ref(args[0], args[1])}'
             await tab.wait_ready(5, quiet=0.4, react=(before, 0.3), data_since=started, **SETTLE)
         elif action == 'press':
-            started = time.monotonic()
             await tab.press(args[0])
             tab, note = await self._settle_after_action(session_id, tab, started, before)
         elif action == 'back':
@@ -443,7 +675,11 @@ class BrowserService:
                 tab = state.stack[-1]
                 await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
                 note = 'Closed the tab; back on the previous one.'
-        return await self.page_result(session_id, tab, action=action, note=note)
+        first.accept_dialogs = False
+        if acts:
+            notes, files = await self._outside_after(session_id, first, started, outside,
+                                                     ref=args[0] if action in ('click', 'upload') else '')
+        return await self.page_result(session_id, tab, action=action, note=note, notes=notes, files=files)
 
     async def wait_out_loading(self, tab, limit=3.0):
         """A page that says it is loading is waited for: Ruten's result list stood as "載入中

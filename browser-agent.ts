@@ -30,6 +30,9 @@ export interface WorkerLike {
   request(command: string, sessionId: string, signal?: AbortSignal): Promise<Record<string, any>>;
 }
 
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+
 const LOGIN_DETAIL = /\$\{(PIWEB_SECRET_[A-Z0-9_]+)\}|\$(PIWEB_SECRET_[A-Z0-9_]+)/g;
 /** Shorter values are not hidden in page text: a 3-letter account is too common a word. */
 const MIN_HIDDEN_CHARS = 4;
@@ -109,7 +112,7 @@ export interface TaskOptions {
 }
 
 export type TaskStatus = "TASK_DONE" | "TASK_UNVERIFIED" | "TASK_STOPPED" | "TASK_FAILED"
-  | "TASK_NEEDS_CONFIRM" | "TASK_NEEDS_INPUT" | "TASK_BLOCKED";
+  | "TASK_NEEDS_CONFIRM" | "TASK_NEEDS_INPUT" | "TASK_BLOCKED" | "TASK_UNSUPPORTED";
 
 /** One span of the task's time: a model call (with the server's own figures) or a browser command. */
 export interface TraceSpan {
@@ -135,6 +138,8 @@ export interface TaskResult {
   title?: string;
   steps: string[];
   screenshot?: string;
+  /** Files the task's actions produced: downloads, a page saved as PDF when it asked to print. */
+  files?: string[];
   page_excerpt?: string;
   elapsed_ms: number;
   llm_ms: number;              // model calls, wall time (includes wait_ms)
@@ -263,6 +268,18 @@ export function parseActions(text: string): Record<string, any>[] {
 
 export function parseAction(text: string): Record<string, any> | undefined {
   return parseActions(text)[0];
+}
+
+/** Paths of existing local files written in the goal ("/home/me/photo.jpg", "~/a.pdf"). */
+export function localFiles(goal: string): string[] {
+  const found = goal.match(/(?<![\w/.:~-])(?:~|\/)[^\s"'`「」『』（）()，。；！？<>|]*[^\s"'`「」『』（）()，。；！？<>|.,;:]/g) ?? [];
+  return [...new Set(found)].filter((path) => {
+    try {
+      return statSync(path.startsWith("~") ? homedir() + path.slice(1) : path).isFile();
+    } catch {
+      return false;
+    }
+  });
 }
 
 function normalize(text: string): string {
@@ -525,6 +542,11 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
   let offWall = false;                      // ...and the task has moved off it since
   const tried = new Map<string, { count: number; step: number; outcome: string }>();
   let finalUrl: string | undefined;
+  const files: string[] = [];               // files the actions produced (downloads, a printed page as PDF)
+  let toolLimit = "";                        // the last thing a result said this tool cannot do
+  let limitStep = -1;                        // ...and the step whose action it was
+  let stepNow = 0;
+  let confirmBox: { ref: string; state: string; question: string } | undefined;  // a confirm box that was answered Cancel
 
   const browser = async (command: string, label: string) => {
     const t = Date.now();
@@ -541,6 +563,11 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
   const adopt = (result: Record<string, any>) => {
     const change = view.adopt(result);
     if (change.changed && view.lines.length) corpus.push(view.lines.join("\n"));
+    // What an action did outside the page counts as seen, like a page: an answer may quote it.
+    const notes: string[] = Array.isArray(result.notes) ? result.notes.map(String) : [];
+    if (notes.length) corpus.push(notes.join("\n"));
+    for (const note of notes) if (note.includes("TOOL LIMIT") && (limitStep = stepNow) >= 0) toolLimit = note.slice(note.indexOf("TOOL LIMIT") + 12).split(" Do not try it again")[0].trim();
+    if (Array.isArray(result.files)) for (const file of result.files) if (!files.includes(String(file))) files.push(String(file));
     if (result.links && typeof result.links === "object") {
       for (const [ref, href] of Object.entries(result.links)) links.set(ref, String(href));
       pageLinks = Object.values(result.links).map(String);
@@ -597,6 +624,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     }
     return {
       status, answer: "", evidence: [], steps, url: finalUrl, title: view.title || undefined, screenshot,
+      ...(files.length ? { files } : {}),
       ...(switched ? { planner_switched: switched } : {}),
       page_excerpt: view.lines.join("\n").slice(0, 1500), elapsed_ms: Date.now() - started,
       llm_ms: llmMs, browser_ms: browserMs, wait_ms: waitMs, model_calls: modelCalls, trace,
@@ -604,7 +632,14 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
     };
   };
 
-  const head = `Goal: ${goal}\nIrreversible steps confirmed by the user: ${options.confirm ? "yes" : "no"}\n\n`;
+  // The planner's rules stay as they are for every task: three more rule lines about uploads,
+  // confirm boxes and tool limits made it act more on tasks that have none of them (THSR took
+  // 20 model calls instead of 5, measured back to back). What an action does outside the page
+  // is explained in that action's result, when it happens; a goal that names a local file
+  // gets the upload action with it.
+  const given = localFiles(goal);
+  const head = `Goal: ${goal}\nIrreversible steps confirmed by the user: ${options.confirm ? "yes" : "no"}\n`
+    + (given.length ? `Local files the goal gives: ${given.join(", ")}. To give one to a page: {"action":"upload","ref":"eN","path":"<that path>"}, where eN is the file field, or the button or box that takes the file.\n` : "") + "\n";
   const messages: { role: string; content: string }[] = [{ role: "system", content: SYSTEM_PROMPT }];
 
   /** One model reply. While it waits (another client's request is running on the one-slot engine), say so. */
@@ -663,6 +698,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
 
     for (let step = 1; step <= MAX_STEPS; step++) {
       signal?.throwIfAborted();
+      stepNow = step;
       if (ownMs > OWN_BUDGET_MS || Date.now() - started > WALL_LIMIT_MS) break;
       // Too long a conversation: go on with the goal, the steps so far and the current page.
       if (messages.reduce((n, m) => n + m.content.length, 0) > REBASE_CHARS) {
@@ -726,12 +762,19 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
           if (kind === "stop") {
             const status = String(action.status ?? "failed").toLowerCase();
             const reason = String(action.reason ?? "").trim();
-            const mapped: TaskStatus = status.includes("input") ? "TASK_NEEDS_INPUT"
+            // A stop after the tool said what it cannot do is a tool limit, whatever the planner
+            // calls it: "blocked" made Pi tell the user that ibon refuses automation, when the
+            // tool had no way to choose a file (2026-11-14).
+            // (The planner's rules name no such status: after a limit it says needs_input, blocked or failed.)
+            const limit = !onWall() && toolLimit && limitStep === step - 1 && !status.includes("confirm");
+            const mapped: TaskStatus = status.includes("unsupported") || limit ? "TASK_UNSUPPORTED"
+              : status.includes("input") ? "TASK_NEEDS_INPUT"
               : status.includes("confirm") ? "TASK_NEEDS_CONFIRM"
               : status.includes("block") ? "TASK_BLOCKED" : "TASK_FAILED";
             progress(`🛑 ${mapped}: ${reason}`);
             steps.push(`stop ${status}: ${reason}`);
-            return await finish(mapped, { reason });
+            return await finish(mapped, { reason: mapped === "TASK_UNSUPPORTED" && toolLimit && !reason.includes(toolLimit.slice(0, 40))
+              ? `${reason}${reason ? " " : ""}(tool limit: ${toolLimit})` : reason });
           }
           // [e12] in the answer is that link's address (put in after the check below: those
           // addresses are real; the check is for the ones the planner wrote itself).
@@ -789,7 +832,10 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         let guessed = false;
         let openNote = "";
         const name = describeElement(line, ref);
-        if (kind === "click" || kind === "type" || kind === "select") {
+        // "dialog":"ok" is taken only for the action a confirm box was just answered Cancel for.
+        const okDialog = /^(ok|accept|yes|true)$/i.test(String(action.dialog ?? "")) && !!confirmBox
+          && confirmBox.ref === ref && confirmBox.state === view.state();
+        if (kind === "click" || kind === "type" || kind === "select" || kind === "upload") {
           if (!line) {
             fail(`${ref || "(no ref)"} is not on the current page (a ref works only on the page it was listed for).`, `${kind} ${ref} → not on the page`);
             break;
@@ -804,8 +850,23 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
             steps.push(`click ${name} → not taken (adds to cart)`);
             return await finish("TASK_NEEDS_CONFIRM", { reason: `the next step adds an item to the cart (${name}), which the goal did not ask for.` });
           }
-          command = `click ${ref}`;
-          label = `🖱️ click ${name}`;
+          if (okDialog && IRREVERSIBLE.test(`${confirmBox!.question} ${line}`) && !options.confirm) {
+            steps.push(`click ${name}, OK to "${confirmBox!.question}" → not taken (irreversible)`);
+            return await finish("TASK_NEEDS_CONFIRM", { reason: `${name} asks "${confirmBox!.question}"; answering OK is an irreversible action. Ask the user; call again with confirm=true only if they agree.` });
+          }
+          command = `click ${ref}${okDialog ? " --ok" : ""}`;
+          label = `🖱️ click ${name}${okDialog ? " (OK to its confirm box)" : ""}`;
+        } else if (kind === "upload") {
+          const paths = (Array.isArray(action.paths) ? action.paths : [action.path ?? action.file]).map((p: unknown) => String(p ?? "").trim()).filter(Boolean);
+          // Only files the goal names: a page (or the planner) cannot pick a file of the user's.
+          const unknown = paths.filter((p: string) => !goal.includes(p));
+          if (!paths.length || unknown.length) {
+            fail(`upload was not done: ${paths.length ? `${unknown.join(", ")} is not a file path written in the goal` : "it needs a path"}. upload takes only file paths the goal gives, copied exactly.`,
+              `upload into ${name} → not taken (file not named in the goal)`);
+            break;
+          }
+          command = `upload ${ref} ${paths.map(quote).join(" ")}`;
+          label = `📎 upload ${paths.map((p: string) => p.split("/").pop()).join(", ")} via ${name}`;
         } else if (kind === "type") {
           const text = String(action.text ?? action.value ?? "");
           const typed = typedText(text);
@@ -884,7 +945,7 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         // (scrolling up and down a page, a login wall and its "back to home" button); the
         // third time the planner picks it, the task stops.
         // ("more" moves through a page that stays the same: its state is also how much is left to read.)
-        const key = `${kind}|${name}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? action.option ?? ""}|${view.state()}${kind === "more" ? `|${view.pending()}` : ""}`;
+        const key = `${kind}|${name}|${action.text ?? action.query ?? action.url ?? action.direction ?? action.key ?? action.option ?? action.path ?? ""}${okDialog ? "|ok" : ""}|${view.state()}${kind === "more" ? `|${view.pending()}` : ""}`;
         const before = tried.get(key);
         if (before) {
           before.count++;
@@ -931,7 +992,11 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
         }
         try {
           const url = view.url;
-          const change = adopt(await browser(command, plain.slice(0, 60)));
+          const result = await browser(command, plain.slice(0, 60));
+          const change = adopt(result);
+          const said: string[] = Array.isArray(result.notes) ? result.notes.map(String) : [];
+          const box = said.join(" ").match(/confirm: (.*?) → answered Cancel/);
+          confirmBox = box && ref ? { ref, state: view.state(), question: box[1].slice(0, 200) } : undefined;
           pageTouched = true;
           shownAs = "update";
           if (change.newDoc) {
@@ -942,7 +1007,9 @@ export async function runBrowserTask(options: TaskOptions): Promise<TaskResult> 
           } else {
             outcome = change.changed ? "page updated" : kind === "scroll" ? "nothing new loaded" : "no visible change";
           }
-          steps.push(`${plain} → ${outcome}`);
+          // The step line a person reads says what happened outside the page too (not the hint for the planner).
+          const outside = said.map((note) => note.replace(/ To give it a file: .*$| \(to answer OK, .*?\)| Do not try it again: .*$/, "")).join(" ");
+          steps.push(`${plain} → ${outcome}${outside ? ` — ${outside.length > 260 ? outside.slice(0, 259) + "…" : outside}` : ""}`);
           results.push(`${plain} → ${outcome}`);
           if (openNote) results.push(openNote);
           if (guessed && (view.status >= 400 || (pathKey(view.url) !== pathKey(asked) && !pathKey(view.url).includes("/")))) {

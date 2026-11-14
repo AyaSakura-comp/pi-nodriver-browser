@@ -53,11 +53,13 @@ Events (start, probe failures, restarts, timeouts) go to stderr (the unit's jour
 ## browser_intent
 
 `{url?, goal, confirm?}`. One LLM (the conversation's model, or local `qwen3.8-flash`)
-drives the browser with JSON actions (click, type, select, press, more, scroll, back,
-google, open, done, stop) until the goal is met. Results are `TASK_DONE` (evidence found
-on the pages seen), `TASK_UNVERIFIED`, `TASK_NEEDS_INPUT`, `TASK_NEEDS_CONFIRM`
-(irreversible steps need `confirm=true`), `TASK_BLOCKED`, `TASK_STOPPED` or `TASK_FAILED`,
-with a final screenshot and a trace of every model call and browser command.
+drives the browser with JSON actions (click, type, select, press, upload, more, scroll,
+back, google, open, done, stop) until the goal is met. Results are `TASK_DONE` (evidence
+found on the pages seen), `TASK_UNVERIFIED`, `TASK_NEEDS_INPUT`, `TASK_NEEDS_CONFIRM`
+(irreversible steps need `confirm=true`), `TASK_BLOCKED` (the site refuses),
+`TASK_UNSUPPORTED` (the tool cannot do a step), `TASK_STOPPED` or `TASK_FAILED`, with a
+final screenshot, the files the task produced and a trace of every model call and browser
+command.
 
 It is built for an inference engine with one slot whose state cannot be cut back (Strata):
 
@@ -98,6 +100,40 @@ It is built for an inference engine with one slot whose state cannot be cut back
   order with at most 40 characters between them (a quote that joins lines or drops an icon).
 - **No loops.** An action already done on the same page state is not run again; the third
   time it is chosen the task stops.
+- **Outside the page.** What a click does is not always on the page, and a snapshot shows
+  only the page: a click on ibon's "新增檔案" opened Chrome's file chooser, the planner saw
+  "no visible change", and the task ended as "the site blocks automation" with the chooser
+  left open (2026-11-14). The worker now follows every way an action leaves the page, and
+  each one is either done or said in the action's result:
+
+  | what the action did | how the worker knows | what happens |
+  |---|---|---|
+  | opened a file chooser (`<input type=file>`, hidden or made by script) | `Page.fileChooserOpened`; the chooser is intercepted, so no system window opens | `upload` gives it the files; a plain `click` is told how to go on |
+  | a box that only takes a dropped file | no chooser and no file field after the click | `upload` drops the file onto it (`Input.dispatchDragEvent`) |
+  | started a download | `Browser.downloadWillBegin/Progress` | saved under `nodriver-downloads/<session>/`, path in the result |
+  | called `print()` | `print` is replaced before the page's scripts run (Chrome's preview holds the click until a person closes it: 10 s timeout measured) | the page is saved as a PDF, path in the result |
+  | opened a confirm box | `Page.javascriptDialogOpening` | answered Cancel and shown; the same action with `"dialog":"ok"` answers OK |
+  | a link or script to another program (`mailto:`, `tel:`, `line://`) | the link's address; `Page.frameRequestedNavigation` | the link is not clicked and its address is given; a script's try is reported |
+  | copied to the clipboard | the display's clipboard before and after | the copied text is in the result |
+  | opened a new tab | `Target.targetCreated` | the session moves to it |
+  | a server's HTTP sign-in box | a 401 with `WWW-Authenticate` on the main document | `TOOL LIMIT`: named as what it is |
+  | the File System Access picker | a chooser event without an input | `TOOL LIMIT` |
+  | any other system window | a new dialog-type window on the worker's X display (a plain click opens none) | `TOOL LIMIT`: its title is reported and it is closed |
+
+  A stop right after a `TOOL LIMIT` line ends the task as `TASK_UNSUPPORTED`, whatever the
+  planner calls it: Pi tells the user which step is left to do by hand instead of saying
+  that the site refuses automation. `upload` takes only file paths written in the goal, so
+  neither a page nor the planner can pick a file.
+  None of this is in the planner's rules. Three rule lines about uploads, confirm boxes and
+  tool limits made the planner act more on tasks that have none of them (THSR: 20 model
+  calls instead of 5; UDN: 2 instead of 1; with the rules as before, 5 and 1 again, run back
+  to back). Each result line says how to go on when it happens, and a goal that names an
+  existing local file gets the upload action in its first message. A canvas and a frame of another site are listed as
+  lines that say their content cannot be read. The looks at the display cost 8-10 ms per
+  action (15 clicks each way against main).
+  Not handled: content inside a frame of another site or a closed shadow root, anything
+  drawn on a canvas, menus that open only on hover, drag gestures, double-click and
+  right-click.
 - **Login details as names.** piweb (🔑) gives login details as names
   (`$PIWEB_SECRET_GITHUB_PASS`) and its Pi extension puts the values in this process's
   environment. The model types the name; only the command sent to Chrome carries the value,
@@ -125,7 +161,9 @@ per request `{"id", "command", "sessionId", "research"?}`; replies are
 
 Page commands (they return the new snapshot): `open <url>`, `snapshot`, `click <ref>`,
 `type <ref> <text> [--submit]`, `select <ref> <option>`, `press <key>`,
-`scroll down|up|top|bottom`, `back`. Others: `get text|links`, `screenshot`,
+`upload <ref> <path>...`, `scroll down|up|top|bottom`, `back`. `--ok` on click, press,
+upload or a submitting type answers OK to a confirm box the action opens. A result's
+`notes` say what the action did outside the page and `files` list what it saved. Others: `get text|links`, `screenshot`,
 `session-cleanup`, `crawl <urls>`, `google-search <json>`, `fetch-image <url>`,
 `browser-health`, `shutdown`, `research` and `research-add-query`.
 

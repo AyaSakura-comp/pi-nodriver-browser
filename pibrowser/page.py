@@ -7,6 +7,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -40,8 +41,39 @@ TARGET_JS = r'''((ref) => {
     hit = true;
   }
   const tag = el.tagName.toLowerCase();
-  return {x, y, hit, tag, type: (el.type || '').toLowerCase(), editable: el.isContentEditable};
+  const anchor = el.closest ? el.closest('a[href]') : null;
+  return {x, y, hit, tag, type: (el.type || '').toLowerCase(), editable: el.isContentEditable,
+          href: anchor ? anchor.getAttribute('href') || '' : ''};
 })'''
+
+# Where a file for `ref` can go when clicking it opened no file chooser: the ref's own file
+# input, one inside it or in its form or label, else the document's only one.
+FILE_INPUT_JS = r'''((ref) => {
+  const el = window.__pi?.refs?.get(ref);
+  if (!el || !el.isConnected) return null;
+  const isFile = (e) => e && e.tagName === 'INPUT' && (e.type || '').toLowerCase() === 'file';
+  const inputs = (root) => Array.from(root.querySelectorAll('input[type=file]'));
+  let found = isFile(el) ? el : null;
+  if (!found && el.tagName === 'LABEL' && isFile(el.control)) found = el.control;
+  if (!found) found = inputs(el)[0] || null;
+  for (let up = el.parentElement, depth = 0; up && !found && depth < 4; up = up.parentElement, depth++) {
+    const near = inputs(up);
+    if (near.length === 1) found = near[0];
+    if (up.tagName === 'FORM') break;
+  }
+  if (!found) { const all = inputs(el.ownerDocument); if (all.length === 1) found = all[0]; }
+  return found;
+})'''
+
+# window.print() opens Chrome's print preview and does not return until a person closes it:
+# the click that called it never answers (measured: the mouse release timed out after 10 s).
+# In its place the call is counted, and the worker saves the page as a PDF.
+PRINT_GUARD_JS = ("(() => { const k = Symbol.for('pi.print'); const f = function print() { window[k] = (window[k] | 0) + 1; };"
+                  " try { Object.defineProperty(window, 'print', {value: f, writable: true, configurable: true, enumerable: true}); }"
+                  " catch (e) {} })();")
+PRINT_COUNT_JS = "(() => { const k = Symbol.for('pi.print'); const n = window[k] | 0; if (n) window[k] = 0; return n; })()"
+# An address that leaves the browser for another program (mailto:, tel:, line://, intent://).
+OTHER_APP = re.compile(r'^(?!(?:https?|about|blob|data|javascript|file|chrome|chrome-error|view-source|ws|wss):)[a-z][a-z0-9+.\-]*:', re.I)
 
 JS_CLICK = r'''((ref) => {
   const el = window.__pi?.refs?.get(ref);
@@ -172,6 +204,11 @@ class Tab:
         self.main_frame = target_id
         self.nav_pending = False   # a navigation of the main frame has started and not yet shown its document
         self.requests = {}         # the page's own XHR/fetch requests in flight: id -> start (after watch_network())
+        # What an action did outside the page's own content (after watch_outside()):
+        self.chooser = None        # the file chooser the page last opened: Page.fileChooserOpened + 'at', 'ref'
+        self.other_apps = []       # addresses of other programs the page tried to open
+        self.accept_dialogs = False  # answer OK to confirm boxes (one action, when the planner asks for it)
+        self.auth_asked = None     # (address, time): the server answered 401 and the browser shows its own sign-in box
 
     @classmethod
     async def attach(cls, chrome, target_id, *, timeout=5.0):
@@ -185,13 +222,34 @@ class Tab:
         await tab.send('Page.enable', timeout=timeout)
         return tab
 
+    async def watch_outside(self):
+        """Follow what a page does outside its own content, for a session's tab. The file
+        chooser is intercepted: Chrome's own is a system window no page tool can reach, and it
+        stays open (ibon's upload, 2026-11-14). print() is counted instead of opening the preview."""
+        conn = self.chrome.conn
+        conn.on('Page.fileChooserOpened', self._on_chooser, session=self.session)
+        conn.on('Page.frameRequestedNavigation', self._on_requested, session=self.session)
+        await self.send('Page.setInterceptFileChooserDialog', {'enabled': True}, timeout=5)
+        await self.send('Page.addScriptToEvaluateOnNewDocument', {'source': PRINT_GUARD_JS}, timeout=5)
+
+    def _on_chooser(self, params):
+        self.chooser = {**params, 'at': time.monotonic()}
+
+    def _on_requested(self, params):
+        url = str(params.get('url') or '')
+        if OTHER_APP.match(url):
+            self.other_apps.append(url[:300])
+            del self.other_apps[:-3]
+
     def _on_dialog(self, params):
         # An open alert/confirm blocks the renderer and every later call would hang.
         # Alerts and leave-page prompts are accepted; confirm/prompt are dismissed (safe default).
         kind = params.get('type', 'alert')
         self.dialogs.append(f"{kind}: {str(params.get('message', ''))[:300]}")
         del self.dialogs[:-5]
-        accept = kind in ('alert', 'beforeunload')
+        accept = kind in ('alert', 'beforeunload') or (kind == 'confirm' and self.accept_dialogs)
+        if kind == 'confirm':
+            self.dialogs[-1] += ' → answered OK' if accept else ' → answered Cancel'
         asyncio.get_running_loop().create_task(self._answer_dialog(accept))
 
     # A click on a link changes nothing on the page until the server answers: these events say
@@ -220,6 +278,7 @@ class Tab:
         conn.on('Network.requestWillBeSent', self._on_request, session=self.session)
         conn.on('Network.loadingFinished', self._on_request_done, session=self.session)
         conn.on('Network.loadingFailed', self._on_request_done, session=self.session)
+        conn.on('Network.responseReceived', self._on_response, session=self.session)
         await self.send('Network.enable', timeout=5)
 
     def _on_request(self, params):
@@ -230,6 +289,13 @@ class Tab:
             if len(self.requests) > 300:
                 self.requests.clear()
             self.requests[params.get('requestId')] = time.monotonic()
+
+    def _on_response(self, params):
+        response = params.get('response') or {}
+        if params.get('type') == 'Document' and response.get('status') == 401 and params.get('frameId') == self.main_frame:
+            headers = {str(k).lower() for k in (response.get('headers') or {})}
+            if 'www-authenticate' in headers:
+                self.auth_asked = (str(response.get('url') or '')[:200], time.monotonic())
 
     def _on_request_done(self, params):
         self.requests.pop(params.get('requestId'), None)
@@ -371,6 +437,9 @@ class Tab:
         target = await self.call(TARGET_JS, ref)
         if not target or target.get('error'):
             raise StaleRef(f'{ref} is not on the page any more; take a new snapshot')
+        if OTHER_APP.match(target.get('href') or ''):
+            # Chrome hands these to xdg-open, which opens a system window ("Select Application").
+            raise PageError(f"not clicked: this link opens another program, not a page ({target['href'][:200]})")
         if target['hit']:
             x, y = target['x'], target['y']
             await self.send('Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': x, 'y': y}, timeout=5)
@@ -399,6 +468,46 @@ class Tab:
             await self.call(SET_VALUE_JS, ref, text)
         if submit:
             await self.press('Enter')
+
+    async def set_files(self, paths, *, backend_node=None, ref=None):
+        """Put files into a file input: the one a chooser was opened for, or the one found for a ref.
+        False when the ref has no file input to take them."""
+        if backend_node is not None:
+            await self.send('DOM.setFileInputFiles', {'files': paths, 'backendNodeId': backend_node}, timeout=20)
+            return True
+        if self.world is None:
+            self.world = await self._new_world(10)
+        found = await self.send('Runtime.evaluate', {
+            'expression': f'({FILE_INPUT_JS})({json.dumps(ref)})', 'contextId': self.world, 'returnByValue': False}, timeout=10)
+        handle = (found.get('result') or {}).get('objectId')
+        if not handle:
+            return False
+        await self.send('DOM.setFileInputFiles', {'files': paths, 'objectId': handle}, timeout=20)
+        return True
+
+    async def drop_files(self, ref, paths):
+        """Drop files onto an element, as a drag from the desktop does."""
+        target = await self.call(TARGET_JS, ref)
+        if not target or target.get('error'):
+            raise StaleRef(f'{ref} is not on the page any more; take a new snapshot')
+        data = {'items': [], 'files': paths, 'dragOperationsMask': 1}
+        for kind in ('dragEnter', 'dragOver', 'drop'):
+            await self.send('Input.dispatchDragEvent', {'type': kind, 'x': target['x'], 'y': target['y'], 'data': data}, timeout=10)
+
+    async def print_calls(self):
+        """How many times the page called print() since the last look (the page's own world)."""
+        try:
+            result = await self.send('Runtime.evaluate', {'expression': PRINT_COUNT_JS, 'returnByValue': True}, timeout=3)
+            return int((result.get('result') or {}).get('value') or 0)
+        except (CDPError, ValueError, TypeError):
+            return 0
+
+    async def save_pdf(self, path):
+        result = await self.send('Page.printToPDF', {'printBackground': True}, timeout=30)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(base64.b64decode(result['data']))
+        return path
 
     async def select_ref(self, ref, option):
         result = await self.call(SELECT_JS, ref, option)

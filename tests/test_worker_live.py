@@ -33,10 +33,31 @@ class WorkerLiveTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
+            def page(self, body, status=200, kind='text/html; charset=utf-8', headers=()):
+                data = body.encode()
+                self.send_response(status)
+                for name, value in (('Content-Type', kind), ('Content-Length', str(len(data))), *headers):
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(data)
+
             def do_GET(self):
                 if self.path.startswith('/slow'):
                     time.sleep(1.5)  # a popup stays on about:blank until this answers
+                if self.path == '/dl':
+                    return self.page('name,price\napple,30\n', kind='text/csv',
+                                     headers=[('Content-Disposition', 'attachment; filename="report-2026.csv"')])
+                if self.path == '/auth':
+                    return self.page('<h1>401</h1>', 401, headers=[('WWW-Authenticate', 'Basic realm="members"')])
                 return super().do_GET()
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                name = re.search(rb'filename="([^"]*)"', body)
+                cls.uploads.append((name.group(1).decode() if name else '', len(body)))
+                self.page(f'<title>Upload received</title><p>Pickup code: A{len(cls.uploads)}77 for {cls.uploads[-1][0]}</p>')
+
+        cls.uploads = []
 
         cls.http = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=str(SITE)))
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
@@ -230,6 +251,93 @@ class WorkerLiveTests(unittest.TestCase):
         self.ref(dialog, r'checkbox "新北市"')  # named after its row: the text is a sibling
         self.ref(dialog, r'button "確定"')
         self.ok('session-cleanup', session='modal')
+
+    def test_what_an_action_does_outside_the_page(self):
+        """A file chooser, a download, a print, a confirm box, another program, the clipboard: none
+        of them is on the page. Each is done or reported, and none leaves a system window open."""
+        photo = Path(self.tmp.name) / 'photo.jpg'
+        photo.write_bytes(b'\xff\xd8\xff\xe0' + b'made-up test file' * 40)
+        notes = Path(self.tmp.name) / 'notes.txt'
+        notes.write_text('made-up test file\n')
+
+        def page():
+            return self.ok(f'open {self.base}/outside.html', session='outside')['snapshot']
+
+        def act(command):
+            result = self.ok(command, session='outside')
+            return result, ' '.join(result['notes']), result['snapshot']
+
+        # A click that opens the chooser says so and how to go on; upload gives it the file.
+        snap = page()
+        self.assertIn('[canvas 400x200 Sales chart (drawn content: not readable)]', snap)
+        self.assertIn('link "Email us" (mailto:service@example.com)', snap)
+        made = self.ref(snap, r'button "Create file"')
+        _, said, _ = act(f'click {made}')
+        self.assertIn('opened a file chooser (for one file)', said)
+        self.assertIn(f'"action":"upload","ref":"{made}"', said)
+        _, said, snap = act(f'upload {made} {photo}')
+        self.assertIn('Gave photo.jpg to the file chooser', said)
+        self.assertIn(f'received photo.jpg ({photo.stat().st_size} bytes)', snap)
+        self.assertEqual(self.uploads[-1][0], 'photo.jpg')
+        # A hidden input behind a button, then the form's own submit.
+        snap = page()
+        _, said, snap = act(f'upload {self.ref(snap, r"button \"Pick file\"")} {photo}')
+        self.assertIn('picked photo.jpg', snap)
+        _, _, snap = act(f'click {self.ref(snap, r"button \"Send form\"")}')
+        self.assertIn('Pickup code: A277 for photo.jpg', snap)
+        # A file field itself takes several files; a box that only takes a drop gets one.
+        snap = page()
+        _, said, snap = act(f'upload {self.ref(snap, r"file \"Photos\"")} {photo} {notes}')
+        self.assertIn('photo.jpg, notes.txt', snap)
+        _, said, snap = act(f'upload {self.ref(snap, r"clickable \"Drop a file here\"")} {notes}')
+        self.assertIn('dropped notes.txt onto it', said)
+        self.assertIn('received notes.txt', snap)
+        missing = self.request(f'upload {self.ref(snap, r"button \"Create file\"")} {self.tmp.name}/none.jpg', session='outside')
+        self.assertIn('no such file', missing['error'])
+        _, said, _ = act(f'upload {self.ref(snap, r"button \"Open with picker\"")} {photo}')
+        self.assertIn('TOOL LIMIT', said)
+        self.assertIn('File System Access picker', said)
+
+        # A download and a print come back as files.
+        snap = page()
+        result, said, _ = act(f'click {self.ref(snap, r"link \"Download report\"")}')
+        self.assertIn('downloaded a file: report-2026.csv (20 bytes)', said)
+        self.assertEqual(Path(result['files'][0]).read_text(), 'name,price\napple,30\n')
+        started = time.monotonic()
+        result, said, snap = act(f'click {self.ref(snap, r"button \"Print ticket\"")}')
+        self.assertLess(time.monotonic() - started, 6, 'print() must not hold the click (it took the 10 s timeout)')
+        self.assertIn('status: print returned', snap)
+        self.assertIn('saved as a PDF', said)
+        self.assertEqual(Path(result['files'][0]).read_bytes()[:5], b'%PDF-')
+
+        # A confirm box is answered Cancel unless the action is done again with --ok.
+        snap = page()
+        box = self.ref(snap, r'button "Cancel reservation"')
+        _, said, snap = act(f'click {box}')
+        self.assertIn('confirm: Cancel the reservation for 2 people? → answered Cancel (to answer OK', said)
+        self.assertIn('status: reservation kept', snap)
+        _, said, snap = act(f'click {box} --ok')
+        self.assertIn('answered OK', said)
+        self.assertIn('status: reservation cancelled', snap)
+
+        # A link to another program is not clicked; a script that hands off to one is reported,
+        # and the system window it opens is closed.
+        refused = self.request(f'click {self.ref(snap, r"link \"Email us\"")}', session='outside')
+        self.assertIn('opens another program, not a page (mailto:service@example.com', refused['error'])
+        _, said, _ = act(f'click {self.ref(snap, r"button \"Email via script\"")}')
+        self.assertIn('tried to open another program (mailto:help@example.com)', said)
+        if all(shutil.which(tool) for tool in ('xwininfo', 'xprop', 'xdotool', 'xdg-open')) and 'system window' in said:
+            self.assertIn('it was closed', said)
+        if shutil.which('xclip'):
+            snap = page()
+            _, said, _ = act(f'click {self.ref(snap, r"button \"Copy coupon code\"")}')
+            self.assertIn('copied to the clipboard: "SAVE-2026-XK9"', said)
+        # The browser's own sign-in box is named as what it is.
+        snap = page()
+        _, said, _ = act(f'click {self.ref(snap, r"link \"Members area\"")}')
+        self.assertIn('TOOL LIMIT', said)
+        self.assertIn("browser's own sign-in box", said)
+        self.ok('session-cleanup', session='outside')
 
     def test_crawl_and_health(self):
         result = self.ok(f'crawl {self.base}/results.html?q=abc {self.base}/missing-page.html')

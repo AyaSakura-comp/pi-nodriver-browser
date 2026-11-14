@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseAction, parseActions, runBrowserTask } from "../browser-agent.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { localFiles, parseAction, parseActions, runBrowserTask } from "../browser-agent.ts";
 
 const PAGE = (body: string) => `URL: https://shop.example/item\nTitle: Item\n---\n${body}`;
 
@@ -596,4 +599,78 @@ test("a login-detail name the user did not give is not typed", async () => {
   assert.ok(!h.sent.some((c) => c.startsWith("type")), h.sent.join("\n"));
   assert.match(JSON.stringify(h.chats()), /not a login detail the goal gives/);
   assert.equal(result.status, "TASK_NEEDS_INPUT");
+});
+
+test("upload sends only a file path the goal gives", async () => {
+  const page = { doc: "u", body: '[e3] button "新增檔案"\n尚未選擇檔案' };
+  const h = session(['{"action":"upload","ref":"e3","path":"/home/me/.ssh/id_rsa"}', '{"action":"upload","ref":"e3","path":"/home/me/photo.jpg"}',
+    '{"action":"done","answer":"已上傳 photo.jpg","evidence":["已選擇 photo.jpg"]}'], {
+    'open "https://shop.example/list"': page,
+    'upload e3 "/home/me/photo.jpg"': { doc: "u", body: '[e3] button "新增檔案"\n已選擇 photo.jpg', notes: ["Gave photo.jpg to the file chooser it opened."] } as any,
+  });
+  const result = await h.run("把 /home/me/photo.jpg 上傳到列印網");
+  assert.equal(result.status, "TASK_DONE");
+  assert.ok(!h.sent.some((c) => c.includes("id_rsa")), "a path the goal does not give is never sent");
+  assert.match(h.chats()[1].messages.at(-1).content, /id_rsa is not a file path written in the goal/);
+  assert.ok(result.steps.some((s) => /upload photo\.jpg via button "新增檔案" → page updated — Gave photo\.jpg/.test(s)));
+});
+
+test("a stop after the tool said what it cannot do is a tool limit, not a blocked site", async () => {
+  const h = session(['{"action":"click","ref":"e3"}', '{"action":"stop","status":"blocked","reason":"按了沒有反應"}'], {
+    'open "https://shop.example/list"': { doc: "u", body: '[e3] button "選擇檔案"' },
+    "click e3": { doc: "u", body: '[e3] button "選擇檔案"',
+      notes: ['TOOL LIMIT: the action opened a system window ("開啟檔案") outside the page, which this tool cannot operate; it was closed.'] } as any,
+  });
+  const result = await h.run("上傳檔案");
+  assert.equal(result.status, "TASK_UNSUPPORTED");
+  assert.match(result.reason!, /tool limit: the action opened a system window/);
+  assert.match(h.chats()[1].messages.at(-1).content, /TOOL LIMIT: the action opened a system window/);
+});
+
+test("a confirm box is answered OK only on asking again, and never for an irreversible question without confirm", async () => {
+  const asked = (question: string) => ({ doc: "c", body: '[e3] button "取消預約"\n預約 2 位',
+    notes: [`Dialog closed automatically: confirm: ${question} → answered Cancel (to answer OK, do the action again with "dialog":"ok")`] } as any);
+  const first = session(['{"action":"click","ref":"e3","dialog":"ok"}', '{"action":"click","ref":"e3","dialog":"ok"}',
+    '{"action":"done","answer":"已取消","evidence":["預約已取消"]}'], {
+    'open "https://shop.example/list"': { doc: "c", body: '[e3] button "取消預約"\n預約 2 位' },
+    "click e3": asked("確定要取消 2 位的預約嗎？"),
+    "click e3 --ok": { doc: "c", body: "預約已取消" },
+  });
+  const result = await first.run("取消預約");
+  assert.equal(result.status, "TASK_DONE");
+  assert.deepEqual(first.sent.filter((c) => c.startsWith("click")), ["click e3", "click e3 --ok"], "OK is not given before the box was seen");
+  const second = session(['{"action":"click","ref":"e3"}', '{"action":"click","ref":"e3","dialog":"ok"}'], {
+    'open "https://shop.example/list"': { doc: "c", body: '[e3] button "下一步"' },
+    "click e3": { ...asked("確定要送出訂單並付款嗎？"), body: '[e3] button "下一步"' },
+  });
+  const stopped = await second.run("看訂單內容");
+  assert.equal(stopped.status, "TASK_NEEDS_CONFIRM");
+  assert.ok(!second.sent.includes("click e3 --ok"));
+});
+
+test("files an action produced are in the result, and an answer may quote what the action reported", async () => {
+  const h = session(['{"action":"click","ref":"e3"}', '{"action":"done","answer":"報表存在 /dl/report.csv","evidence":["report.csv (30 bytes)"]}'], {
+    'open "https://shop.example/list"': { doc: "d", body: '[e3] link "下載報表"' },
+    "click e3": { doc: "d", body: '[e3] link "下載報表"', files: ["/dl/report.csv"],
+      notes: ["The action downloaded a file: report.csv (30 bytes), saved as /dl/report.csv"] } as any,
+  });
+  const result = await h.run("下載報表");
+  assert.equal(result.status, "TASK_DONE");
+  assert.deepEqual(result.files, ["/dl/report.csv"]);
+});
+
+test("a goal that names an existing local file gets the upload action with it; other goals read as before", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-upload-"));
+  const photo = join(dir, "photo.jpg");
+  writeFileSync(photo, "made-up test file");
+  assert.deepEqual(localFiles(`把 ${photo} 上傳到 https://print.example/upload，不要傳 ${dir}/none.jpg。`), [photo]);
+  assert.deepEqual(localFiles("查 https://shop.example/a/b.html 的價格 / 規格"), []);
+  const stop = '{"action":"stop","status":"failed","reason":"x"}';
+  const withFile = session([stop], { 'open "https://shop.example/list"': { doc: "a", body: "首頁" } });
+  await withFile.run(`上傳 ${photo}`);
+  assert.match(withFile.chats()[0].messages[1].content, new RegExp(`Local files the goal gives: ${photo.replace(/[.]/g, "\\.")}\\. To give one to a page: \\{"action":"upload"`));
+  const without = session([stop], { 'open "https://shop.example/list"': { doc: "a", body: "首頁" } });
+  await without.run("查價格");
+  assert.ok(!without.chats()[0].messages[1].content.includes("upload"));
+  assert.ok(!without.chats()[0].messages[0].content.includes("upload"), "the planner's rules do not grow for tasks without files");
 });

@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Outside the page</title>
+<p id="out">status: idle</p>
+<form action="/upload" method="post" enctype="multipart/form-data">
+  <input type="file" name="f" id="hidden-input" style="display:none">
+  <button type="button" id="pick">Pick file</button> <span id="picked">no file</span>
+  <button type="submit">Send form</button>
+</form>
+<button type="button" id="made">Create file</button> <span id="sent">nothing sent</span>
+<input type="file" aria-label="Photos" multiple id="many"> <span id="names">no photos</span>
+<div id="zone" style="cursor:pointer;border:2px dashed #7a7;padding:16px;width:300px">Drop a file here</div> <span id="dropped">nothing dropped</span>
+<p><a href="/dl">Download report</a> <button type="button" id="print">Print ticket</button></p>
+<p><a href="mailto:service@example.com?subject=hi">Email us</a> <button type="button" id="mail">Email via script</button></p>
+<p><button type="button" id="confirm">Cancel reservation</button> <button type="button" id="copy">Copy coupon code</button></p>
+<p><button type="button" id="picker">Open with picker</button> <a href="/auth">Members area</a></p>
+<canvas width="400" height="200" aria-label="Sales chart"></canvas>
+<script>
+const $ = (id) => document.getElementById(id);
+const out = (t) => { $('out').textContent = 'status: ' + t; };
+const post = async (file, where) => {
+  const data = new FormData(); data.append('f', file);
+  const r = await fetch('/upload', {method: 'POST', body: data});
+  $(where).textContent = r.ok ? `received ${file.name} (${file.size} bytes)` : 'failed';
+};
+$('pick').onclick = () => $('hidden-input').click();
+$('hidden-input').onchange = (e) => { $('picked').textContent = 'picked ' + e.target.files[0].name; };
+$('made').onclick = () => {  // an input that is never in the page (ibon's upload button)
+  const input = document.createElement('input'); input.type = 'file';
+  input.onchange = () => post(input.files[0], 'sent'); input.click();
+};
+$('many').onchange = (e) => { $('names').textContent = [...e.target.files].map((f) => f.name).join(', '); };
+$('zone').ondragover = (e) => e.preventDefault();
+$('zone').ondrop = (e) => { e.preventDefault(); post(e.dataTransfer.files[0], 'dropped'); };
+$('print').onclick = () => { window.print(); out('print returned'); };
+$('mail').onclick = () => { location.href = 'mailto:help@example.com'; };
+$('confirm').onclick = () => out(confirm('Cancel the reservation for 2 people?') ? 'reservation cancelled' : 'reservation kept');
+$('copy').onclick = () => navigator.clipboard.writeText('SAVE-2026-XK9');
+$('picker').onclick = async () => { try { await window.showOpenFilePicker(); } catch (e) { out('picker ' + e.name); } };
+</script>

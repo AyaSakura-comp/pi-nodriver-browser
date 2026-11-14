@@ -17,6 +17,16 @@ class FakeTab:
         self.dialogs = []
         self.world = None
         self.url = 'about:blank'
+        self.chooser = None
+        self.other_apps = []
+        self.auth_asked = None
+        self.accept_dialogs = False
+
+    async def watch_outside(self):
+        pass
+
+    async def print_calls(self):
+        return 0
 
     async def send(self, method, params=None, *, timeout=10.0):
         return {}
@@ -60,8 +70,9 @@ class FakeConn:
 class FakeChrome:
     made = []
 
-    def __init__(self, profile, log_path):
+    def __init__(self, profile, log_path, downloads=None):
         self.conn = FakeConn()
+        self.downloads = {}
         self.bases = []
         self.targets = {}
         self.closed = []

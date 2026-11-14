@@ -90,9 +90,13 @@ async def kill_pids(pids, grace=3.0):
 
 
 class Chrome:
-    def __init__(self, profile, log_path):
+    def __init__(self, profile, log_path, downloads=None):
         self.profile = Path(profile)
         self.log_path = log_path
+        # Files a page downloads land here under their download id, and are reported
+        # (Browser.downloadWillBegin/Progress) instead of going to ~/Downloads unseen.
+        self.downloads_dir = Path(downloads) if downloads else None
+        self.downloads = {}  # id -> {'name', 'url', 'frame', 'state', 'bytes', 'at'}
         self.proc = None
         self.port = None
         self.conn = None
@@ -130,6 +134,26 @@ class Chrome:
         self.conn.on('Target.targetInfoChanged', self._on_target)
         self.conn.on('Target.targetDestroyed', lambda params: self.targets.pop(params.get('targetId'), None))
         await self.conn.send('Target.setDiscoverTargets', {'discover': True})
+        if self.downloads_dir is not None:
+            self.downloads_dir.mkdir(parents=True, exist_ok=True)
+            self.conn.on('Browser.downloadWillBegin', self._on_download)
+            self.conn.on('Browser.downloadProgress', self._on_download_progress)
+            with contextlib.suppress(CDPError):
+                await self.conn.send('Browser.setDownloadBehavior', {
+                    'behavior': 'allowAndName', 'downloadPath': str(self.downloads_dir), 'eventsEnabled': True})
+
+    def _on_download(self, params):
+        if len(self.downloads) > 200:
+            self.downloads.clear()
+        self.downloads[params.get('guid')] = {
+            'name': str(params.get('suggestedFilename') or 'download'), 'url': str(params.get('url') or ''),
+            'frame': params.get('frameId'), 'state': 'inProgress', 'bytes': 0, 'at': time.monotonic()}
+
+    def _on_download_progress(self, params):
+        entry = self.downloads.get(params.get('guid'))
+        if entry:
+            entry['state'] = params.get('state') or entry['state']
+            entry['bytes'] = int(params.get('receivedBytes') or params.get('totalBytes') or entry['bytes'])
 
     def _version(self):
         with urllib.request.urlopen(f'http://127.0.0.1:{self.port}/json/version', timeout=2) as response:
