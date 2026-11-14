@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import macos
 from .cdp import CDPClosed, CDPError, CDPTimeout
 
 JS_DIR = Path(__file__).with_name('js')
@@ -74,6 +75,15 @@ PRINT_GUARD_JS = ("(() => { const k = Symbol.for('pi.print'); const f = function
 PRINT_COUNT_JS = "(() => { const k = Symbol.for('pi.print'); const n = window[k] | 0; if (n) window[k] = 0; return n; })()"
 # An address that leaves the browser for another program (mailto:, tel:, line://, intent://).
 OTHER_APP = re.compile(r'^(?!(?:https?|about|blob|data|javascript|file|chrome|chrome-error|view-source|ws|wss):)[a-z][a-z0-9+.\-]*:', re.I)
+# macOS only: Chrome hands mailto:/news: to their app without asking, and macOS really starts it
+# (Linux's xdg-open only shows a dialog on the invisible display). The worker's Chrome must not
+# open Mail on the user's Mac, so such navigations are cancelled in the page and kept there for
+# the worker to report (Tab.take_blocked_apps).
+MACOS_APP_GUARD_JS = (r"""(() => { if (!window.navigation) return; const k = Symbol.for('pi.otherApp');
+  navigation.addEventListener('navigate', (e) => { const url = String(e.destination.url || '');
+    if (/^(?!(?:https?|about|blob|data|javascript|file|chrome|chrome-error|view-source|ws|wss):)[a-z][a-z0-9+.\-]*:/i.test(url)) {
+      e.preventDefault(); (window[k] = window[k] || []).push(url.slice(0, 300)); } }); })();""")
+MACOS_APP_TAKE_JS = "(() => { const k = Symbol.for('pi.otherApp'); const v = window[k] || []; window[k] = []; return v; })()"
 
 JS_CLICK = r'''((ref) => {
   const el = window.__pi?.refs?.get(ref);
@@ -220,7 +230,25 @@ class Tab:
         chrome.conn.on('Page.frameNavigated', tab._on_frame_navigated, session=tab.session)
         chrome.conn.on('Page.frameStoppedLoading', tab._on_frame_stopped, session=tab.session)
         await tab.send('Page.enable', timeout=timeout)
+        if macos.should_hide():
+            # The hidden macOS Chrome's pages would report hidden and pause requestAnimationFrame.
+            with contextlib.suppress(CDPError):
+                await tab.send('Emulation.setFocusEmulationEnabled', {'enabled': True}, timeout=timeout)
+        if macos.IS_MACOS:
+            with contextlib.suppress(CDPError):
+                await tab.send('Page.addScriptToEvaluateOnNewDocument', {'source': MACOS_APP_GUARD_JS}, timeout=timeout)
         return tab
+
+    async def take_blocked_apps(self):
+        """macOS: other programs the page tried to open and MACOS_APP_GUARD_JS stopped, added to
+        other_apps (where Linux's Page.frameRequestedNavigation puts them)."""
+        with contextlib.suppress(CDPError):
+            # The page's own world, where the guard keeps them (eval runs in an isolated world).
+            result = await self.send('Runtime.evaluate', {'expression': MACOS_APP_TAKE_JS, 'returnByValue': True}, timeout=3)
+            for url in (result.get('result') or {}).get('value') or []:
+                if url not in self.other_apps:
+                    self.other_apps.append(str(url)[:300])
+            del self.other_apps[:-3]
 
     async def watch_outside(self):
         """Follow what a page does outside its own content, for a session's tab. The file
@@ -560,7 +588,8 @@ class Tab:
         return True
 
     async def screenshot(self, path):
-        await self.send('Page.bringToFront', timeout=5)
+        if not macos.should_hide():  # on macOS it would unhide Chrome and take the user's focus
+            await self.send('Page.bringToFront', timeout=5)
         result = await self.send('Page.captureScreenshot', {'format': 'jpeg', 'quality': 70}, timeout=15)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)

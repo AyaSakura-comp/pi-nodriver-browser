@@ -30,6 +30,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+from pibrowser import macos  # noqa: E402
 from pibrowser.cdp import CDPClosed, CDPError, CDPTimeout  # noqa: E402
 from pibrowser.chrome import Chrome  # noqa: E402
 from pibrowser.fetch import FetchError, fetch_image, pdf_text, safe_name  # noqa: E402
@@ -395,6 +396,8 @@ class BrowserService:
                 tab.chooser = None
                 notes.append('TOOL LIMIT: the page asked for a file through the File System Access picker, '
                              'which this tool cannot fill.' + NO_WAY)
+        if macos.IS_MACOS and hasattr(tab, 'take_blocked_apps'):
+            await tab.take_blocked_apps()
         apps, tab.other_apps = tab.other_apps, []
         for address in apps:
             notes.append(f'The page tried to open another program ({address}); nothing outside the browser opens here.')
@@ -524,7 +527,8 @@ class BrowserService:
                 await tab.watch_outside()
             if len(state.stack) > 3:
                 await state.stack.pop(0).close()
-            await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
+            if not macos.should_hide():  # macOS: would unhide Chrome and take the user's focus
+                await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
             note = 'The action opened a new tab; you are now on it (back returns to the previous tab).'
             await tab.wait_ready(8, quiet=0.6, blank_ok=False, **SETTLE)
         await self.wait_out_loading(tab)
@@ -601,7 +605,8 @@ class BrowserService:
             if not re.match(r'^(https?|about|file|data):', url, re.I):
                 url = 'https://' + url
             tab = await self.session_tab(session_id, create=True)
-            await tab.send('Page.bringToFront', timeout=3)
+            if not macos.should_hide():  # macOS: would unhide Chrome and take the user's focus
+                await tab.send('Page.bringToFront', timeout=3)
             outside = await self._outside_before()
             started = time.monotonic()
             await tab.goto(url)
@@ -673,7 +678,8 @@ class BrowserService:
                     raise PageError('no page to go back to')
                 await state.stack.pop().close()
                 tab = state.stack[-1]
-                await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
+                if not macos.should_hide():  # macOS: would unhide Chrome and take the user's focus
+                    await self.browser.conn.send('Target.activateTarget', {'targetId': tab.target_id}, timeout=3)
                 note = 'Closed the tab; back on the previous one.'
         first.accept_dialogs = False
         if acts:

@@ -24,8 +24,8 @@ SITE = ROOT / 'tests' / 'live' / 'site'
 MARKER = b'__PI_NODRIVER__'
 
 
-@unittest.skipUnless(os.environ.get('PI_BROWSER_LIVE') == '1' and shutil.which('xvfb-run'),
-                     'set PI_BROWSER_LIVE=1 (needs Chrome and xvfb-run)')
+@unittest.skipUnless(os.environ.get('PI_BROWSER_LIVE') == '1' and (shutil.which('xvfb-run') or sys.platform == 'darwin'),
+                     'set PI_BROWSER_LIVE=1 (needs Chrome and xvfb-run; on macOS only Chrome)')
 class WorkerLiveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -66,7 +66,9 @@ class WorkerLiveTests(unittest.TestCase):
         cls.sock = os.path.join(cls.tmp.name, 'w.sock')
         env = {**os.environ, 'PI_NODRIVER_PROFILE': os.path.join(cls.tmp.name, 'profile'),
                'PI_AGENT_DIR': cls.tmp.name}
-        cls.proc = subprocess.Popen(['xvfb-run', '-a', '-s', '-screen 0 1366x768x24', sys.executable,
+        # macOS has no Xvfb: the worker hides its own Chrome (pibrowser/macos.py).
+        display = [] if sys.platform == 'darwin' else ['xvfb-run', '-a', '-s', '-screen 0 1366x768x24']
+        cls.proc = subprocess.Popen([*display, sys.executable,
                                      str(ROOT / 'worker.py'), '--server', cls.sock],
                                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True)

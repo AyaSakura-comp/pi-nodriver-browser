@@ -127,6 +127,16 @@ export function systemdRunArgs(spec: WorkerLaunchSpec, unit: string, envNames: s
   ];
 }
 
+/**
+ * The plain child's command: xvfb-run provides the display. macOS has no Xvfb; there the worker
+ * runs directly and hides its own headful Chrome instead (pibrowser/macos.py).
+ */
+export function spawnCommand(spec: WorkerLaunchSpec, platform: NodeJS.Platform): [string, string[]] {
+  const worker = [spec.worker, "--server", spec.socket];
+  if (platform === "darwin") return [spec.python, worker];
+  return ["xvfb-run", ["-a", "-s", `-screen 0 ${spec.screen}`, spec.python, ...worker]];
+}
+
 const execFilePromise = promisify(execFileCallback) as unknown as ExecFile;
 
 const defaultDurableManager = (execFile: ExecFile, env: Env) => async () => userManagerOutlivesCaller(
@@ -159,9 +169,9 @@ export async function launchWorker(spec: WorkerLaunchSpec, deps: LaunchDeps = {}
   }
   const childEnv: Env = { ...env };
   delete childEnv.WAYLAND_DISPLAY;
+  const [file, args] = spawnCommand(spec, deps.platform ?? process.platform);
   const child = (deps.spawn ?? spawnProcess)(
-    "xvfb-run",
-    ["-a", "-s", `-screen 0 ${spec.screen}`, spec.python, spec.worker, "--server", spec.socket],
+    file, args,
     { cwd: spec.root, stdio: "ignore", detached: true, env: childEnv },
   );
   // A missing xvfb-run must surface as "did not start", not crash Pi with an unhandled error.
